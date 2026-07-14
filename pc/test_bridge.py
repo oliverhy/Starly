@@ -100,6 +100,40 @@ class BridgeProtocolTests(unittest.TestCase):
 
         self.assertEqual(calls, ["thread/resume", "turn/start"])
 
+    def test_desktop_thread_opens_only_after_turn_completed(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        server.pending_desktop_open = {"thread-1"}
+        broadcasts: list[str] = []
+        opened: list[str] = []
+
+        async def fake_broadcast(message: dict[str, object]) -> None:
+            broadcasts.append(str(message.get("event", "")))
+
+        async def fake_refresh() -> None:
+            return None
+
+        async def fake_open(thread_id: str) -> None:
+            opened.append(thread_id)
+
+        server._broadcast = fake_broadcast
+        server._schedule_codex_refresh = fake_refresh
+        server._open_completed_codex_thread = fake_open
+
+        async def exercise() -> None:
+            await server._handle_codex_event("turn/started", {"threadId": "thread-1"})
+            await asyncio.sleep(0)
+            self.assertEqual(opened, [])
+            self.assertIn("thread-1", server.pending_desktop_open)
+
+            await server._handle_codex_event("turn/completed", {"threadId": "thread-1"})
+            await asyncio.sleep(0)
+
+        asyncio.run(exercise())
+
+        self.assertEqual(opened, ["thread-1"])
+        self.assertNotIn("thread-1", server.pending_desktop_open)
+        self.assertEqual(broadcasts, ["turn/started", "turn/completed"])
+
 
 if __name__ == "__main__":
     unittest.main()

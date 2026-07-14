@@ -209,7 +209,13 @@ struct Index {
         this.codexLoading = false;
       },
       (event: string, threadId: string): void => {
-        if (event === 'turn/started' && threadId.length > 0) {
+        if (event === 'desktop/opened' && threadId === this.selectedCodexTaskId) {
+          this.statusText = '任务已完成，电脑端已打开';
+          this.statusIsError = false;
+        } else if (event === 'desktop/openFailed' && threadId === this.selectedCodexTaskId) {
+          this.statusText = '任务已完成，但电脑端未能自动打开';
+          this.statusIsError = true;
+        } else if (event === 'turn/started' && threadId.length > 0) {
           this.pendingCodexThreadId = threadId;
           this.rememberCodexTaskStatus(threadId, 'active');
           if (threadId === this.selectedCodexTaskId) {

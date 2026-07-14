@@ -262,6 +262,7 @@ class BridgeServer:
         self.connections: set[websockets.ServerConnection] = set()
         self.codex: CodexAppServerClient | None = None
         self.codex_refresh_task: asyncio.Task[None] | None = None
+        self.pending_desktop_open: set[str] = set()
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -421,18 +422,17 @@ class BridgeServer:
     async def _codex_send(self, connection: websockets.ServerConnection, thread_id: str,
                           text: str, message_id: str) -> None:
         assert self.codex is not None
+        self.pending_desktop_open.add(thread_id)
         try:
             await self.codex.send_message(thread_id, text)
-            opened = await asyncio.to_thread(open_codex_thread, thread_id)
-            ack_message = "消息已发送给 Codex"
-            if opened:
-                ack_message += "，已在电脑打开任务"
             await connection.send(json.dumps({
-                "type": "ack", "id": message_id, "message": ack_message,
+                "type": "ack", "id": message_id,
+                "message": "消息已发送给 Codex，完成后将在电脑打开任务",
             }, ensure_ascii=False))
             await self._send_codex_thread(connection, thread_id)
             await self._schedule_codex_refresh()
         except Exception as error:
+            self.pending_desktop_open.discard(thread_id)
             error_text = str(error)
             if "thread not found" in error_text.lower():
                 error_text = "任务暂时无法恢复，请刷新任务列表后重新选择"
@@ -454,7 +454,23 @@ class BridgeServer:
         if method in ("thread/status/changed", "turn/started", "turn/completed",
                       "account/rateLimits/updated"):
             await self._broadcast({"type": "codex_event", "event": method, "params": params})
+            if method == "turn/completed":
+                thread_id = str(params.get("threadId", ""))
+                if thread_id in self.pending_desktop_open:
+                    self.pending_desktop_open.discard(thread_id)
+                    asyncio.create_task(self._open_completed_codex_thread(thread_id))
             await self._schedule_codex_refresh()
+
+    async def _open_completed_codex_thread(self, thread_id: str) -> None:
+        # Let app-server finish persisting and releasing the completed turn
+        # before the desktop client resumes the same thread.
+        await asyncio.sleep(0.65)
+        opened = await asyncio.to_thread(open_codex_thread, thread_id)
+        await self._broadcast({
+            "type": "codex_event",
+            "event": "desktop/opened" if opened else "desktop/openFailed",
+            "params": {"threadId": thread_id},
+        })
 
     async def _schedule_codex_refresh(self) -> None:
         if self.codex_refresh_task and not self.codex_refresh_task.done():
