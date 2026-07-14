@@ -3,6 +3,7 @@ import json
 import queue
 import unittest
 import urllib.parse
+from unittest import mock
 
 from pc.starly_bridge import BridgeConfig, BridgeServer, MAX_TEXT_LENGTH, WindowsInput, find_available_port
 from pc.codex_client import CodexAppServerClient, _item_content, normalize_snapshot, normalize_thread
@@ -57,6 +58,28 @@ class BridgeProtocolTests(unittest.TestCase):
             (WindowsInput.VK_RETURN, WindowsInput.SCAN_RETURN, WindowsInput.KEYEVENTF_KEYUP),
             (WindowsInput.VK_CONTROL, WindowsInput.SCAN_CONTROL, WindowsInput.KEYEVENTF_KEYUP),
         ])
+
+    def test_codex_desktop_send_opens_focuses_types_and_submits(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+
+        class FakeInput:
+            def type_text(self, text: str, submit_mode: str) -> tuple[bool, str]:
+                self.received = (text, submit_mode)
+                return True, "submitted"
+
+        fake_input = FakeInput()
+        server.input = fake_input
+        with mock.patch("pc.starly_bridge.open_codex_thread", return_value=True) as opened, \
+                mock.patch("pc.starly_bridge.focus_codex_composer",
+                           return_value=(True, "focused")) as focused:
+            ok, message = server._send_to_codex_desktop(
+                "thread-1", "指定任务", "继续处理这个要求")
+
+        self.assertTrue(ok)
+        self.assertIn("submitted", message)
+        opened.assert_called_once_with("thread-1")
+        focused.assert_called_once_with("指定任务")
+        self.assertEqual(fake_input.received, ("继续处理这个要求", "enter"))
 
     def test_protocol_rejects_non_object_json(self) -> None:
         server = BridgeServer.__new__(BridgeServer)

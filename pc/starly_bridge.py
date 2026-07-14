@@ -9,6 +9,7 @@ import os
 import queue
 import secrets
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -48,6 +49,127 @@ def open_codex_thread(thread_id: str) -> bool:
         return True
     except OSError:
         return False
+
+
+CODEX_COMPOSER_FOCUS_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class StarlyCodexUi {
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(
+    uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+}
+'@
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$expectedTitle = $env:STARLY_CODEX_THREAD_TITLE
+$deadline = [DateTime]::UtcNow.AddSeconds(27)
+$mainWindow = $null
+while ($null -eq $mainWindow -and [DateTime]::UtcNow -lt $deadline) {
+  $mainArea = 0.0
+  $processes = @(Get-Process ChatGPT -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.Path -like '*OpenAI.Codex_*' } catch { $false }
+  })
+  foreach ($process in $processes) {
+    $condition = New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $process.Id)
+    $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)
+    foreach ($window in $windows) {
+      $rect = $window.Current.BoundingRectangle
+      $area = $rect.Width * $rect.Height
+      if ($window.Current.ClassName -eq 'Chrome_WidgetWin_1' -and $area -gt $mainArea) {
+        $mainWindow = $window
+        $mainArea = $area
+      }
+    }
+  }
+  if ($null -eq $mainWindow) { Start-Sleep -Milliseconds 400 }
+}
+if ($null -eq $mainWindow -or $mainArea -lt 300000) {
+  Write-Output 'WINDOW_NOT_FOUND'
+  exit 2
+}
+$windowRect = $mainWindow.Current.BoundingRectangle
+$handle = [IntPtr]$mainWindow.Current.NativeWindowHandle
+[StarlyCodexUi]::ShowWindow($handle, 9) | Out-Null
+[StarlyCodexUi]::SetForegroundWindow($handle) | Out-Null
+Start-Sleep -Milliseconds 250
+$windowRect = $mainWindow.Current.BoundingRectangle
+
+# Clicking the composer once enables Chromium's full accessibility tree.
+$clickX = [int]($windowRect.X + $windowRect.Width * 0.57)
+$clickY = [int]($windowRect.Bottom - 72)
+[StarlyCodexUi]::SetCursorPos($clickX, $clickY) | Out-Null
+[StarlyCodexUi]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+[StarlyCodexUi]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+
+while ([DateTime]::UtcNow -lt $deadline) {
+  $controls = $mainWindow.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition)
+  $titleLoaded = $false
+  $composer = $null
+  foreach ($control in $controls) {
+    $current = $control.Current
+    $rect = $current.BoundingRectangle
+    if ($current.ControlType -eq [System.Windows.Automation.ControlType]::Text -and
+        $current.Name -eq $expectedTitle -and
+        $rect.Top -ge $windowRect.Top -and
+        $rect.Top -lt ($windowRect.Top + 105) -and
+        $rect.Left -gt ($windowRect.Left + 150)) {
+      $titleLoaded = $true
+    }
+    if ($current.IsEnabled -and $current.ClassName -match '(^| )ProseMirror( |$)') {
+      $composer = $control
+    }
+  }
+  if ($titleLoaded -and $null -ne $composer) {
+    $composer.SetFocus()
+    Start-Sleep -Milliseconds 180
+    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement.Current
+    if ($focused.ProcessId -eq $mainWindow.Current.ProcessId -and
+        $focused.ClassName -match '(^| )ProseMirror( |$)') {
+      Write-Output ('FOCUSED|' + $expectedTitle + '|' + $focused.ClassName)
+      exit 0
+    }
+  }
+  Start-Sleep -Milliseconds 400
+}
+Write-Output ('TASK_NOT_READY|' + $expectedTitle)
+exit 3
+"""
+
+
+def focus_codex_composer(thread_title: str) -> tuple[bool, str]:
+    flags = 0x08000000 if os.name == "nt" else 0
+    environment = os.environ.copy()
+    environment["STARLY_CODEX_THREAD_TITLE"] = thread_title
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", CODEX_COMPOSER_FOCUS_SCRIPT],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=32,
+            creationflags=flags,
+            env=environment,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, f"无法调用 Windows UI Automation：{error}"
+    output = result.stdout.strip()
+    if result.returncode == 0 and output.startswith("FOCUSED|"):
+        return True, output
+    detail = output or result.stderr.strip() or f"退出码 {result.returncode}"
+    return False, f"未找到 Codex 桌面端输入框（{detail}）"
 
 
 def acquire_single_instance() -> bool:
@@ -263,6 +385,7 @@ class BridgeServer:
         self.codex: CodexAppServerClient | None = None
         self.codex_refresh_task: asyncio.Task[None] | None = None
         self.pending_desktop_open: set[str] = set()
+        self.codex_poll_tasks: dict[str, asyncio.Task[None]] = {}
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -422,21 +545,81 @@ class BridgeServer:
     async def _codex_send(self, connection: websockets.ServerConnection, thread_id: str,
                           text: str, message_id: str) -> None:
         assert self.codex is not None
-        self.pending_desktop_open.add(thread_id)
         try:
-            await self.codex.send_message(thread_id, text)
+            before = await self.codex.thread_detail(thread_id)
+            baseline_messages = len(before.get("messages", []))
+            thread_title = str(before.get("title", "")).strip()
+            ok, result = await asyncio.to_thread(
+                self._send_to_codex_desktop, thread_id, thread_title, text)
+            if not ok:
+                raise RuntimeError(result)
             await connection.send(json.dumps({
                 "type": "ack", "id": message_id,
-                "message": "消息已发送给 Codex，完成后将在电脑打开任务",
+                "message": "消息已发送给 Codex，电脑端已提交",
             }, ensure_ascii=False))
-            await self._send_codex_thread(connection, thread_id)
+            await self._broadcast({
+                "type": "codex_event", "event": "turn/started",
+                "params": {"threadId": thread_id},
+            })
+            previous_poll = self.codex_poll_tasks.get(thread_id)
+            if previous_poll and not previous_poll.done():
+                previous_poll.cancel()
+            self.codex_poll_tasks[thread_id] = asyncio.create_task(
+                self._poll_desktop_codex_thread(thread_id, baseline_messages))
             await self._schedule_codex_refresh()
         except Exception as error:
-            self.pending_desktop_open.discard(thread_id)
             error_text = str(error)
             if "thread not found" in error_text.lower():
                 error_text = "任务暂时无法恢复，请刷新任务列表后重新选择"
             await self._send_error(connection, f"发送给 Codex 失败：{error_text}", message_id)
+
+    def _send_to_codex_desktop(self, thread_id: str, thread_title: str,
+                               text: str) -> tuple[bool, str]:
+        if not thread_title:
+            return False, "无法确认 Codex 任务标题"
+        if not open_codex_thread(thread_id):
+            return False, "无法打开电脑端 Codex 任务"
+        focused, focus_result = focus_codex_composer(thread_title)
+        if not focused:
+            return False, focus_result
+        ok, input_result = self.input.type_text(text, "enter")
+        if not ok:
+            return False, input_result
+        return True, f"{focus_result}；{input_result}"
+
+    async def _poll_desktop_codex_thread(self, thread_id: str, baseline_messages: int) -> None:
+        assert self.codex is not None
+        saw_activity = False
+        try:
+            for _ in range(150):
+                await asyncio.sleep(2)
+                detail = await self.codex.thread_detail(thread_id)
+                active_turn_id = str(detail.get("activeTurnId", ""))
+                messages = detail.get("messages")
+                message_count = len(messages) if isinstance(messages, list) else 0
+                if active_turn_id:
+                    saw_activity = True
+                if message_count > baseline_messages:
+                    saw_activity = True
+                await self._broadcast({"type": "codex_thread", "thread": detail})
+                if message_count >= baseline_messages + 2 and not active_turn_id and saw_activity:
+                    await self._broadcast({
+                        "type": "codex_event", "event": "turn/completed",
+                        "params": {"threadId": thread_id},
+                    })
+                    await self._schedule_codex_refresh()
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self._broadcast({
+                "type": "error",
+                "message": f"同步电脑端 Codex 回复失败：{error}",
+            })
+        finally:
+            current = self.codex_poll_tasks.get(thread_id)
+            if current is asyncio.current_task():
+                self.codex_poll_tasks.pop(thread_id, None)
 
     async def _codex_interrupt(self, connection: websockets.ServerConnection, thread_id: str,
                                turn_id: str, message_id: str) -> None:
