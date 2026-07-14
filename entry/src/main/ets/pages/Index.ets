@@ -484,7 +484,7 @@ struct Index {
         .width('100%')
         .height(58)
 
-        Text(this.isVoicePressing ? '向左上滑发送，向右上滑编辑' : '按住说话，松手停止识别')
+        Text('按住说话，松手停止识别')
           .width('100%')
           .textAlign(TextAlign.Center)
           .fontSize(12)
