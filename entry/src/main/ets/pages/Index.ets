@@ -638,18 +638,78 @@ struct Index {
       }
       .width('100%')
       if (!this.areCodexTasksExpanded) {
-        Row() {
-          Text(`已收起 · ${this.codexTasks.length} 个任务`)
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
-          Blank()
-          Text('点击展开')
-            .fontSize(12)
-            .fontColor('#175CD3')
+        if (this.selectedCodexTaskId.length > 0) {
+          Row({ space: 11 }) {
+            Stack({ alignContent: Alignment.Center }) {
+              Text('')
+                .width(18)
+                .height(18)
+                .borderRadius(9)
+                .backgroundColor('#1A175CD3')
+                .border({ width: 1, color: '#52175CD3' })
+              Text('')
+                .width(8)
+                .height(8)
+                .borderRadius(4)
+                .backgroundColor(this.codexStatusColor(this.collapsedSelectedCodexStatus()))
+                .shadow({ radius: 8, color: this.codexStatusColor(this.collapsedSelectedCodexStatus()) })
+            }
+            .width(20)
+            .height(20)
+            Column({ space: 3 }) {
+              Text(this.selectedCodexTitle || '当前任务')
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_primary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text(this.selectedCodexTaskSubtitle())
+                .fontSize(11)
+                .fontColor($r('app.color.text_secondary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Column({ space: 3 }) {
+              Text('当前')
+                .fontSize(11)
+                .fontWeight(FontWeight.Medium)
+                .fontColor('#175CD3')
+                .padding({ left: 9, right: 9, top: 3, bottom: 3 })
+                .backgroundColor('#1A175CD3')
+                .border({ width: 1, color: '#4D175CD3' })
+                .borderRadius(11)
+              Text(this.codexStatusLabel(this.collapsedSelectedCodexStatus()))
+                .fontSize(10)
+                .fontColor(this.codexStatusColor(this.collapsedSelectedCodexStatus()))
+            }
+            .alignItems(HorizontalAlign.End)
+          }
+          .width('98%')
+          .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+          .backgroundColor($r('app.color.glass_surface_strong'))
+          .border({ width: 2, color: '#73175CD3' })
+          .borderRadius(21)
+          .shadow({ radius: 22, color: '#4A175CD3', offsetY: 8 })
+          .translate({ y: -2 })
+          .scale({ x: 1.015, y: 1.015 })
+          .animation({ duration: 260, curve: Curve.EaseOut })
+          .onClick(() => this.toggleCodexTasks())
+        } else {
+          Row() {
+            Text('暂未选择任务')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+            Blank()
+            Text('点击展开')
+              .fontSize(12)
+              .fontColor('#175CD3')
+          }
+          .width('100%')
+          .padding({ top: 10, bottom: 8 })
+          .onClick(() => this.toggleCodexTasks())
         }
-        .width('100%')
-        .padding({ top: 10, bottom: 8 })
-        .onClick(() => this.toggleCodexTasks())
       } else if (this.codexTasks.length === 0) {
         Text(this.codexAvailable ? '暂时没有可显示的 Codex 任务' : '连接电脑后读取 Codex 任务')
           .width('100%')
@@ -1607,6 +1667,24 @@ struct Index {
     }
     const currentStatus = task.id === this.selectedCodexTaskId ? this.selectedCodexStatus : task.status;
     return this.resolvedCodexStatus(task.id, currentStatus);
+  }
+
+  private collapsedSelectedCodexStatus(): string {
+    if (this.selectedCodexTaskId === this.pendingCodexThreadId) {
+      return 'active';
+    }
+    return this.resolvedCodexStatus(this.selectedCodexTaskId, this.selectedCodexStatus);
+  }
+
+  private selectedCodexTaskSubtitle(): string {
+    for (let index = 0; index < this.codexTasks.length; index++) {
+      const task = this.codexTasks[index];
+      if (task.id === this.selectedCodexTaskId) {
+        return task.preview.length > 0 ? task.preview : this.shortPath(task.cwd);
+      }
+    }
+    const cwd = this.shortPath(this.selectedCodexCwd);
+    return cwd.length > 0 ? cwd : '点击展开查看任务';
   }
 
   private resolvedCodexStatus(threadId: string, status: string): string {
