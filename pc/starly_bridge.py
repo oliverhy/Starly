@@ -500,10 +500,12 @@ class BridgeServer:
         elif message_type == "codex_send":
             thread_id = str(message.get("threadId", ""))
             text = str(message.get("text", "")).strip()
-            if not thread_id or not text or len(text) > MAX_TEXT_LENGTH:
+            submit_mode = str(message.get("submitMode", "enter"))
+            if (not thread_id or not text or len(text) > MAX_TEXT_LENGTH or
+                    submit_mode not in ("enter", "ctrl_enter")):
                 await self._send_error(connection, "Codex 任务或消息内容无效", message_id)
                 return
-            await self._codex_send(connection, thread_id, text, message_id)
+            await self._codex_send(connection, thread_id, text, submit_mode, message_id)
             return
         elif message_type == "codex_interrupt":
             thread_id = str(message.get("threadId", ""))
@@ -543,19 +545,20 @@ class BridgeServer:
             await self._send_error(connection, f"读取 Codex 任务失败：{error}", message_id)
 
     async def _codex_send(self, connection: websockets.ServerConnection, thread_id: str,
-                          text: str, message_id: str) -> None:
+                          text: str, submit_mode: str, message_id: str) -> None:
         assert self.codex is not None
         try:
             before = await self.codex.thread_detail(thread_id)
             baseline_messages = len(before.get("messages", []))
             thread_title = str(before.get("title", "")).strip()
             ok, result = await asyncio.to_thread(
-                self._send_to_codex_desktop, thread_id, thread_title, text)
+                self._send_to_codex_desktop, thread_id, thread_title, text, submit_mode)
             if not ok:
                 raise RuntimeError(result)
             await connection.send(json.dumps({
                 "type": "ack", "id": message_id,
-                "message": "消息已发送给 Codex，电脑端已提交",
+                "message": "消息已发送给 Codex，电脑端已按" +
+                           (" Ctrl+回车" if submit_mode == "ctrl_enter" else "回车"),
             }, ensure_ascii=False))
             await self._broadcast({
                 "type": "codex_event", "event": "turn/started",
@@ -574,7 +577,7 @@ class BridgeServer:
             await self._send_error(connection, f"发送给 Codex 失败：{error_text}", message_id)
 
     def _send_to_codex_desktop(self, thread_id: str, thread_title: str,
-                               text: str) -> tuple[bool, str]:
+                               text: str, submit_mode: str) -> tuple[bool, str]:
         if not thread_title:
             return False, "无法确认 Codex 任务标题"
         if not open_codex_thread(thread_id):
@@ -582,7 +585,7 @@ class BridgeServer:
         focused, focus_result = focus_codex_composer(thread_title)
         if not focused:
             return False, focus_result
-        ok, input_result = self.input.type_text(text, "enter")
+        ok, input_result = self.input.type_text(text, submit_mode)
         if not ok:
             return False, input_result
         return True, f"{focus_result}；{input_result}"

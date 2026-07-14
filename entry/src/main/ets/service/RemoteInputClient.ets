@@ -8,6 +8,7 @@ class CodexWireMessage {
   threadId: string = '';
   turnId: string = '';
   text: string = '';
+  submitMode: string = 'enter';
 }
 
 export interface RemoteClientListener {
@@ -119,7 +120,7 @@ class RemoteInputClient {
     return await this.sendObject(message);
   }
 
-  async sendToCodex(threadId: string, text: string): Promise<boolean> {
+  async sendToCodex(threadId: string, text: string, submitMode: string): Promise<boolean> {
     const trimmed = text.trim();
     if (trimmed.length === 0) {
       this.listener?.onError('请输入要发送给 Codex 的内容');
@@ -130,6 +131,7 @@ class RemoteInputClient {
     message.id = `${Date.now()}`;
     message.threadId = threadId;
     message.text = trimmed;
+    message.submitMode = submitMode;
     return await this.sendObject(message);
   }
 

@@ -73,13 +73,13 @@ class BridgeProtocolTests(unittest.TestCase):
                 mock.patch("pc.starly_bridge.focus_codex_composer",
                            return_value=(True, "focused")) as focused:
             ok, message = server._send_to_codex_desktop(
-                "thread-1", "指定任务", "继续处理这个要求")
+                "thread-1", "指定任务", "继续处理这个要求", "ctrl_enter")
 
         self.assertTrue(ok)
         self.assertIn("submitted", message)
         opened.assert_called_once_with("thread-1")
         focused.assert_called_once_with("指定任务")
-        self.assertEqual(fake_input.received, ("继续处理这个要求", "enter"))
+        self.assertEqual(fake_input.received, ("继续处理这个要求", "ctrl_enter"))
 
     def test_protocol_rejects_non_object_json(self) -> None:
         server = BridgeServer.__new__(BridgeServer)

@@ -868,24 +868,35 @@ struct Index {
           this.codexCommand = value;
         })
       Row({ space: 10 }) {
-        Button('发送给 Codex')
+        Button('发送后按回车')
           .layoutWeight(1)
           .height(48)
+          .fontSize(12)
           .fontColor(this.codexCommand.trim().length > 0 ? '#175CD3' : $r('app.color.text_secondary'))
           .backgroundColor($r('app.color.glass_surface_strong'))
           .border({ width: 1, color: $r('app.color.glass_border') })
           .borderRadius(14)
           .enabled(this.codexCommand.trim().length > 0 && this.isConnected)
-          .onClick(() => this.sendCodexCommand())
-        if (this.selectedCodexActiveTurnId.length > 0) {
-          Button('停止')
-            .width(82)
-            .height(48)
-            .fontColor('#B42318')
-            .backgroundColor('#CCFEF3F2')
-            .borderRadius(14)
-            .onClick(() => this.stopCodexTask())
-        }
+          .onClick(() => this.sendCodexCommand('enter'))
+        Button('发送后按 Ctrl+回车')
+          .layoutWeight(1)
+          .height(48)
+          .fontSize(12)
+          .fontColor(this.codexCommand.trim().length > 0 ? '#175CD3' : $r('app.color.text_secondary'))
+          .backgroundColor($r('app.color.glass_surface_strong'))
+          .border({ width: 1, color: $r('app.color.glass_border') })
+          .borderRadius(14)
+          .enabled(this.codexCommand.trim().length > 0 && this.isConnected)
+          .onClick(() => this.sendCodexCommand('ctrl_enter'))
+      }
+      if (this.selectedCodexActiveTurnId.length > 0) {
+        Button('停止当前任务')
+          .width('100%')
+          .height(42)
+          .fontColor('#B42318')
+          .backgroundColor('#CCFEF3F2')
+          .borderRadius(14)
+          .onClick(() => this.stopCodexTask())
       }
     }
     .width('100%')
@@ -1496,11 +1507,12 @@ struct Index {
     }
   }
 
-  private async sendCodexCommand(): Promise<void> {
+  private async sendCodexCommand(submitMode: string): Promise<void> {
     if (this.selectedCodexTaskId.length === 0) {
       return;
     }
-    const sent = await remoteInputClient.sendToCodex(this.selectedCodexTaskId, this.codexCommand);
+    const sent = await remoteInputClient.sendToCodex(
+      this.selectedCodexTaskId, this.codexCommand, submitMode);
     if (sent) {
       this.pendingCodexThreadId = this.selectedCodexTaskId;
       this.statusText = '正在恢复任务并发送…';
