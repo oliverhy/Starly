@@ -581,13 +581,32 @@ struct Index {
       } else {
         ForEach(this.codexTasks.slice(0, 10), (task: CodexTask) => {
           Row({ space: 11 }) {
-            Text('')
-              .width(9)
-              .height(9)
-              .borderRadius(5)
-              .backgroundColor(this.codexStatusColor(task.status))
-              .shadow({ radius: task.status === 'active' ? 8 : 0,
-                color: this.codexStatusColor(task.status) })
+            if (this.selectedCodexTaskId === task.id) {
+              Stack({ alignContent: Alignment.Center }) {
+                Text('')
+                  .width(18)
+                  .height(18)
+                  .borderRadius(9)
+                  .backgroundColor('#1A175CD3')
+                  .border({ width: 1, color: '#52175CD3' })
+                Text('')
+                  .width(8)
+                  .height(8)
+                  .borderRadius(4)
+                  .backgroundColor(this.codexStatusColor(task.status))
+                  .shadow({ radius: 8, color: this.codexStatusColor(task.status) })
+              }
+              .width(20)
+              .height(20)
+            } else {
+              Text('')
+                .width(9)
+                .height(9)
+                .borderRadius(5)
+                .backgroundColor(this.codexStatusColor(task.status))
+                .shadow({ radius: task.status === 'active' ? 8 : 0,
+                  color: this.codexStatusColor(task.status) })
+            }
             Column({ space: 3 }) {
               Text(task.title)
                 .fontSize(15)
@@ -603,19 +622,49 @@ struct Index {
             }
             .layoutWeight(1)
             .alignItems(HorizontalAlign.Start)
-            Text(this.codexStatusLabel(task.status))
-              .fontSize(11)
-              .fontColor(this.codexStatusColor(task.status))
-              .maxLines(1)
+            if (this.selectedCodexTaskId === task.id) {
+              Column({ space: 3 }) {
+                Text('当前')
+                  .fontSize(11)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#175CD3')
+                  .padding({ left: 9, right: 9, top: 3, bottom: 3 })
+                  .backgroundColor('#1A175CD3')
+                  .border({ width: 1, color: '#4D175CD3' })
+                  .borderRadius(11)
+                Text(this.codexStatusLabel(task.status))
+                  .fontSize(10)
+                  .fontColor(this.codexStatusColor(task.status))
+              }
+              .alignItems(HorizontalAlign.End)
+            } else {
+              Text(this.codexStatusLabel(task.status))
+                .fontSize(11)
+                .fontColor(this.codexStatusColor(task.status))
+                .maxLines(1)
+            }
           }
-          .width('100%')
-          .padding({ left: 12, right: 12, top: 11, bottom: 11 })
+          .width(this.selectedCodexTaskId === task.id ? '98%' : '100%')
+          .padding({ left: 12, right: 12, top: 12, bottom: 12 })
           .backgroundColor(this.selectedCodexTaskId === task.id ?
             $r('app.color.glass_surface_strong') : Color.Transparent)
-          .border({ width: 1, color: this.selectedCodexTaskId === task.id ?
-            $r('app.color.glass_border') : Color.Transparent })
-          .borderRadius(17)
-          .animation({ duration: 220, curve: Curve.EaseOut })
+          .border({
+            width: this.selectedCodexTaskId === task.id ? 2 : 1,
+            color: this.selectedCodexTaskId === task.id ? '#73175CD3' : Color.Transparent
+          })
+          .borderRadius(this.selectedCodexTaskId === task.id ? 21 : 17)
+          .shadow({
+            radius: this.selectedCodexTaskId === task.id ? 22 : 0,
+            color: this.selectedCodexTaskId === task.id ? '#4A175CD3' : Color.Transparent,
+            offsetY: this.selectedCodexTaskId === task.id ? 8 : 0
+          })
+          .translate({ y: this.selectedCodexTaskId === task.id ? -2 : 0 })
+          .scale({
+            x: this.selectedCodexTaskId === task.id ? 1.015 : 1,
+            y: this.selectedCodexTaskId === task.id ? 1.015 : 1
+          })
+          .zIndex(this.selectedCodexTaskId === task.id ? 2 : 0)
+          .animation({ duration: 260, curve: Curve.EaseOut })
           .onClick(() => this.selectCodexTask(task.id))
         }, (task: CodexTask): string => task.id)
       }
