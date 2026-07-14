@@ -381,12 +381,14 @@ struct Index {
             .height(58)
             .fontSize(17)
             .fontWeight(FontWeight.Medium)
-            .fontColor(Color.White)
-            .backgroundColor(this.voiceButtonColor())
-            .linearGradient({
-              angle: 112,
-              colors: this.voiceButtonGradient()
+            .fontColor($r('app.color.text_primary'))
+            .backgroundColor($r('app.color.glass_surface_strong'))
+            .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+              colorMode: ThemeColorMode.SYSTEM,
+              adaptiveColor: AdaptiveColor.DEFAULT,
+              scale: 0.82
             })
+            .border({ width: 1, color: $r('app.color.glass_border') })
             .borderRadius(29)
             .shadow({
               radius: this.isVoicePressing ? 34 : 24,
@@ -409,9 +411,12 @@ struct Index {
                 .textAlign(TextAlign.Center)
                 .fontSize(15)
                 .fontWeight(FontWeight.Medium)
-                .fontColor(this.voiceGestureAction === VoiceGestureAction.Send ? Color.White : '#175CD3')
-                .backgroundColor(this.voiceGestureAction === VoiceGestureAction.Send ? '#175CD3' : '#F7FAFF')
-                .border({ width: 1, color: '#B9D2FF' })
+                .fontColor('#175CD3')
+                .backgroundColor($r('app.color.glass_surface_strong'))
+                .border({
+                  width: this.voiceGestureAction === VoiceGestureAction.Send ? 2 : 1,
+                  color: this.voiceGestureAction === VoiceGestureAction.Send ? '#53D8FF' : '#B9D2FF'
+                })
                 .borderRadius(24)
                 .shadow({
                   radius: this.voiceGestureAction === VoiceGestureAction.Send ? 28 : 18,
@@ -433,9 +438,12 @@ struct Index {
                 .textAlign(TextAlign.Center)
                 .fontSize(15)
                 .fontWeight(FontWeight.Medium)
-                .fontColor(this.voiceGestureAction === VoiceGestureAction.Edit ? Color.White : '#7F56D9')
-                .backgroundColor(this.voiceGestureAction === VoiceGestureAction.Edit ? '#7F56D9' : '#FBF9FF')
-                .border({ width: 1, color: '#D8C7F5' })
+                .fontColor('#7F56D9')
+                .backgroundColor($r('app.color.glass_surface_strong'))
+                .border({
+                  width: this.voiceGestureAction === VoiceGestureAction.Edit ? 2 : 1,
+                  color: this.voiceGestureAction === VoiceGestureAction.Edit ? '#D7A8FF' : '#D8C7F5'
+                })
                 .borderRadius(24)
                 .shadow({
                   radius: this.voiceGestureAction === VoiceGestureAction.Edit ? 28 : 18,
@@ -514,28 +522,25 @@ struct Index {
           .layoutWeight(1)
           .height(50)
           .fontSize(16)
-          .fontColor(Color.White)
-          .backgroundColor(this.isConnected ? $r('app.color.accent_primary') : '#98A2B3')
-          .linearGradient({
-            angle: 110,
-            colors: this.isConnected ? [
-              [$r('app.color.accent_primary'), 0.0],
-              [$r('app.color.accent_secondary'), 1.0]
-            ] : [
-              ['#98A2B3', 0.0],
-              ['#98A2B3', 1.0]
-            ]
+          .fontColor(this.isConnected ? $r('app.color.accent_primary') : $r('app.color.text_secondary'))
+          .backgroundColor(this.isConnected ? $r('app.color.glass_surface_strong') : '#80D0D5DD')
+          .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+            colorMode: ThemeColorMode.SYSTEM,
+            adaptiveColor: AdaptiveColor.DEFAULT,
+            scale: 0.78
           })
+          .border({ width: 1, color: $r('app.color.glass_border') })
           .borderRadius(13)
-          .shadow({ radius: 16, color: '#405B5CE2', offsetY: 6 })
+          .shadow({ radius: 14, color: $r('app.color.glass_shadow'), offsetY: 5 })
           .enabled(this.isConnected)
           .onClick(() => this.sendDraft())
         Button('仅按回车')
           .width(104)
           .height(50)
           .fontSize(15)
-          .fontColor('#175CD3')
-          .backgroundColor('#EAF2FF')
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor($r('app.color.glass_surface_strong'))
+          .border({ width: 1, color: $r('app.color.glass_border') })
           .borderRadius(13)
           .enabled(this.isConnected)
           .onClick(() => remoteInputClient.sendEnter())
@@ -805,16 +810,6 @@ struct Index {
     return '松手停止识别';
   }
 
-  private voiceButtonColor(): string {
-    if (this.voiceGestureAction === VoiceGestureAction.Send) {
-      return '#175CD3';
-    }
-    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
-      return '#7F56D9';
-    }
-    return this.isVoicePressing ? '#D92D20' : '#7F56D9';
-  }
-
   private voiceParticlePrimary(): ResourceColor {
     if (this.voiceGestureAction === VoiceGestureAction.Send) {
       return '#00B8FF';
@@ -843,19 +838,6 @@ struct Index {
       return '#99C084FC';
     }
     return this.isVoicePressing ? '#99FF8A65' : '#665B5CE2';
-  }
-
-  private voiceButtonGradient(): Array<[ResourceColor, number]> {
-    if (this.voiceGestureAction === VoiceGestureAction.Send) {
-      return [['#2563EB', 0.0], ['#22A6F2', 1.0]];
-    }
-    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
-      return [['#7C3AED', 0.0], ['#C06CFF', 1.0]];
-    }
-    if (this.isVoicePressing) {
-      return [['#D92D20', 0.0], ['#F97066', 1.0]];
-    }
-    return [[$r('app.color.accent_primary'), 0.0], [$r('app.color.accent_secondary'), 1.0]];
   }
 
   private async sendDraft(): Promise<void> {
