@@ -1,10 +1,22 @@
 import { webSocket } from '@kit.NetworkKit';
 import { PairingConfig } from '../model/PairingConfig';
+import { CodexSnapshot, CodexThreadDetail, parseCodexSnapshot, parseCodexThread } from '../model/CodexModels';
+
+class CodexWireMessage {
+  type: string = '';
+  id: string = '';
+  threadId: string = '';
+  turnId: string = '';
+  text: string = '';
+}
 
 export interface RemoteClientListener {
   onConnectionChanged(isConnected: boolean, message: string): void;
   onAcknowledged(message: string): void;
   onError(message: string): void;
+  onCodexSnapshot(snapshot: CodexSnapshot): void;
+  onCodexThread(detail: CodexThreadDetail): void;
+  onCodexEvent(): void;
 }
 
 class RemoteInputClient {
@@ -92,6 +104,44 @@ class RemoteInputClient {
     }
   }
 
+  async requestCodexSnapshot(): Promise<boolean> {
+    const message = new CodexWireMessage();
+    message.type = 'codex_snapshot_request';
+    message.id = `${Date.now()}`;
+    return await this.sendObject(message);
+  }
+
+  async requestCodexThread(threadId: string): Promise<boolean> {
+    const message = new CodexWireMessage();
+    message.type = 'codex_thread_request';
+    message.id = `${Date.now()}`;
+    message.threadId = threadId;
+    return await this.sendObject(message);
+  }
+
+  async sendToCodex(threadId: string, text: string): Promise<boolean> {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) {
+      this.listener?.onError('请输入要发送给 Codex 的内容');
+      return false;
+    }
+    const message = new CodexWireMessage();
+    message.type = 'codex_send';
+    message.id = `${Date.now()}`;
+    message.threadId = threadId;
+    message.text = trimmed;
+    return await this.sendObject(message);
+  }
+
+  async interruptCodex(threadId: string, turnId: string): Promise<boolean> {
+    const message = new CodexWireMessage();
+    message.type = 'codex_interrupt';
+    message.id = `${Date.now()}`;
+    message.threadId = threadId;
+    message.turnId = turnId;
+    return await this.sendObject(message);
+  }
+
   async disconnect(): Promise<void> {
     const socket = this.socket;
     this.socket = null;
@@ -118,9 +168,28 @@ class RemoteInputClient {
         this.listener?.onError(String(message['message'] ?? '电脑执行失败'));
       } else if (type === 'hello') {
         this.listener?.onConnectionChanged(true, String(message['computer'] ?? '电脑已连接'));
+      } else if (type === 'codex_snapshot') {
+        this.listener?.onCodexSnapshot(parseCodexSnapshot(message));
+      } else if (type === 'codex_thread') {
+        this.listener?.onCodexThread(parseCodexThread(message['thread'] ?? new CodexThreadDetail()));
+      } else if (type === 'codex_event') {
+        this.listener?.onCodexEvent();
       }
     } catch (_error) {
       this.listener?.onError('收到无法识别的电脑响应');
+    }
+  }
+
+  private async sendObject(message: CodexWireMessage): Promise<boolean> {
+    if (!this.connected || this.socket === null) {
+      this.listener?.onError('电脑未连接');
+      return false;
+    }
+    try {
+      return await this.socket.send(JSON.stringify(message));
+    } catch (error) {
+      this.listener?.onError(`发送失败：${JSON.stringify(error)}`);
+      return false;
     }
   }
 }

@@ -5,6 +5,7 @@ import unittest
 import urllib.parse
 
 from pc.starly_bridge import BridgeConfig, BridgeServer, MAX_TEXT_LENGTH, WindowsInput, find_available_port
+from pc.codex_client import normalize_snapshot, normalize_thread
 
 
 class FakeConnection:
@@ -67,6 +68,20 @@ class BridgeProtocolTests(unittest.TestCase):
         response = json.loads(connection.messages[0])
         self.assertEqual(response["type"], "error")
         self.assertEqual(response["message"], "消息必须是 JSON 对象")
+
+    def test_codex_quota_is_reported_as_remaining_percent(self) -> None:
+        snapshot = normalize_snapshot(
+            {"rateLimits": {"primary": {"usedPercent": 34, "resetsAt": 123}, "planType": "prolite"}},
+            {"summary": {"lifetimeTokens": 9000}},
+            {"data": []},
+        )
+        self.assertEqual(snapshot["quota"]["remainingPercent"], 66)
+        self.assertEqual(snapshot["quota"]["plan"], "prolite")
+        self.assertEqual(snapshot["quota"]["lifetimeTokens"], 9000)
+
+    def test_codex_thread_title_falls_back_to_workspace(self) -> None:
+        thread = normalize_thread({"id": "t1", "name": "\ufffd\ufffd", "cwd": r"C:\work\Starly"})
+        self.assertEqual(thread["title"], "Starly")
 
 
 if __name__ == "__main__":

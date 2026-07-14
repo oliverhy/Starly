@@ -24,6 +24,11 @@ import qrcode
 import websockets
 from PIL import Image, ImageDraw, ImageTk
 
+try:
+    from pc.codex_client import CodexAppServerClient
+except ImportError:
+    from codex_client import CodexAppServerClient
+
 
 APP_NAME = "StarlyBridge"
 APP_TITLE = "Starly 电脑端"
@@ -228,6 +233,9 @@ class BridgeServer:
         self.thread: threading.Thread | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: asyncio.Event | None = None
+        self.connections: set[websockets.ServerConnection] = set()
+        self.codex: CodexAppServerClient | None = None
+        self.codex_refresh_task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -250,6 +258,7 @@ class BridgeServer:
     async def _run(self) -> None:
         self.loop = asyncio.get_running_loop()
         self.stop_event = asyncio.Event()
+        self.codex = CodexAppServerClient(self._handle_codex_event)
         async with websockets.serve(
             self._handle_client,
             "0.0.0.0",
@@ -260,6 +269,8 @@ class BridgeServer:
         ):
             self.event_queue.put(("server", f"正在监听端口 {self.config.port}"))
             await self.stop_event.wait()
+        if self.codex:
+            await self.codex.stop()
 
     async def _handle_client(self, connection: websockets.ServerConnection) -> None:
         remote = connection.remote_address
@@ -274,11 +285,13 @@ class BridgeServer:
             self.event_queue.put(("error", f"拒绝了来自 {remote_ip} 的无效配对请求"))
             return
         self.event_queue.put(("client", f"手机已连接：{remote_ip}"))
+        self.connections.add(connection)
         await connection.send(json.dumps({
             "type": "hello",
             "computer": socket.gethostname(),
             "version": "2.0.0",
         }, ensure_ascii=False))
+        await self._send_codex_snapshot(connection)
         last_action = 0.0
         try:
             async for raw in connection:
@@ -291,6 +304,7 @@ class BridgeServer:
         except websockets.ConnectionClosed:
             pass
         finally:
+            self.connections.discard(connection)
             self.event_queue.put(("client", "手机连接已断开"))
 
     async def _handle_message(self, connection: websockets.ServerConnection, raw: str | bytes) -> None:
@@ -323,6 +337,32 @@ class BridgeServer:
             ok, result = await asyncio.to_thread(self.input.press_enter)
         elif message_type == "ping":
             ok, result = True, "pong"
+        elif message_type == "codex_snapshot_request":
+            await self._send_codex_snapshot(connection)
+            return
+        elif message_type == "codex_thread_request":
+            thread_id = str(message.get("threadId", ""))
+            if not thread_id:
+                await self._send_error(connection, "缺少 Codex 任务编号", message_id)
+                return
+            await self._send_codex_thread(connection, thread_id, message_id)
+            return
+        elif message_type == "codex_send":
+            thread_id = str(message.get("threadId", ""))
+            text = str(message.get("text", "")).strip()
+            if not thread_id or not text or len(text) > MAX_TEXT_LENGTH:
+                await self._send_error(connection, "Codex 任务或消息内容无效", message_id)
+                return
+            await self._codex_send(connection, thread_id, text, message_id)
+            return
+        elif message_type == "codex_interrupt":
+            thread_id = str(message.get("threadId", ""))
+            turn_id = str(message.get("turnId", ""))
+            if not thread_id or not turn_id:
+                await self._send_error(connection, "当前任务没有可停止的运行轮次", message_id)
+                return
+            await self._codex_interrupt(connection, thread_id, turn_id, message_id)
+            return
         else:
             await self._send_error(connection, "未知操作", message_id)
             return
@@ -333,6 +373,75 @@ class BridgeServer:
             "id": message_id,
             "message": result,
         }, ensure_ascii=False))
+
+    async def _send_codex_snapshot(self, connection: websockets.ServerConnection) -> None:
+        assert self.codex is not None
+        snapshot = await self.codex.snapshot()
+        await connection.send(json.dumps({"type": "codex_snapshot", **snapshot}, ensure_ascii=False))
+
+    async def _send_codex_thread(self, connection: websockets.ServerConnection,
+                                 thread_id: str, message_id: str = "") -> None:
+        assert self.codex is not None
+        try:
+            detail = await self.codex.thread_detail(thread_id)
+            await connection.send(json.dumps({
+                "type": "codex_thread", "id": message_id, "thread": detail,
+            }, ensure_ascii=False))
+        except Exception as error:
+            await self._send_error(connection, f"读取 Codex 任务失败：{error}", message_id)
+
+    async def _codex_send(self, connection: websockets.ServerConnection, thread_id: str,
+                          text: str, message_id: str) -> None:
+        assert self.codex is not None
+        try:
+            await self.codex.send_message(thread_id, text)
+            await connection.send(json.dumps({
+                "type": "ack", "id": message_id, "message": "消息已发送给 Codex",
+            }, ensure_ascii=False))
+            await self._send_codex_thread(connection, thread_id)
+            await self._schedule_codex_refresh()
+        except Exception as error:
+            await self._send_error(connection, f"发送给 Codex 失败：{error}", message_id)
+
+    async def _codex_interrupt(self, connection: websockets.ServerConnection, thread_id: str,
+                               turn_id: str, message_id: str) -> None:
+        assert self.codex is not None
+        try:
+            await self.codex.interrupt(thread_id, turn_id)
+            await connection.send(json.dumps({
+                "type": "ack", "id": message_id, "message": "已请求停止 Codex 任务",
+            }, ensure_ascii=False))
+            await self._schedule_codex_refresh()
+        except Exception as error:
+            await self._send_error(connection, f"停止 Codex 任务失败：{error}", message_id)
+
+    async def _handle_codex_event(self, method: str, params: dict[str, object]) -> None:
+        if method in ("thread/status/changed", "turn/started", "turn/completed",
+                      "account/rateLimits/updated"):
+            await self._broadcast({"type": "codex_event", "event": method, "params": params})
+            await self._schedule_codex_refresh()
+
+    async def _schedule_codex_refresh(self) -> None:
+        if self.codex_refresh_task and not self.codex_refresh_task.done():
+            return
+        self.codex_refresh_task = asyncio.create_task(self._delayed_codex_refresh())
+
+    async def _delayed_codex_refresh(self) -> None:
+        await asyncio.sleep(0.45)
+        if not self.codex or not self.connections:
+            return
+        snapshot = await self.codex.snapshot()
+        await self._broadcast({"type": "codex_snapshot", **snapshot})
+
+    async def _broadcast(self, message: dict[str, object]) -> None:
+        if not self.connections:
+            return
+        raw = json.dumps(message, ensure_ascii=False)
+        for connection in list(self.connections):
+            try:
+                await connection.send(raw)
+            except websockets.ConnectionClosed:
+                self.connections.discard(connection)
 
     async def _send_error(
         self,
