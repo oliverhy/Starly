@@ -36,6 +36,22 @@ DEFAULT_PORT = 8765
 MAX_TEXT_LENGTH = 8000
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
+SINGLE_INSTANCE_MUTEX = "Local\\StarlyBridge.SingleInstance"
+_single_instance_handle: int | None = None
+
+
+def acquire_single_instance() -> bool:
+    global _single_instance_handle
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
+    if not handle:
+        return False
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return False
+    _single_instance_handle = int(handle)
+    return True
 
 
 def is_port_available(port: int) -> bool:
@@ -383,7 +399,9 @@ class BridgeServer:
                                  thread_id: str, message_id: str = "") -> None:
         assert self.codex is not None
         try:
-            detail = await self.codex.thread_detail(thread_id)
+            # Selecting a persisted task also restores it into this app-server
+            # session, so later commands can start reliably.
+            detail = await self.codex.resume_thread_detail(thread_id)
             await connection.send(json.dumps({
                 "type": "codex_thread", "id": message_id, "thread": detail,
             }, ensure_ascii=False))
@@ -440,11 +458,12 @@ class BridgeServer:
         if not self.connections:
             return
         raw = json.dumps(message, ensure_ascii=False)
-        for connection in list(self.connections):
+        async def send_one(connection: websockets.ServerConnection) -> None:
             try:
-                await connection.send(raw)
-            except websockets.ConnectionClosed:
+                await asyncio.wait_for(connection.send(raw), timeout=2)
+            except (websockets.ConnectionClosed, asyncio.TimeoutError):
                 self.connections.discard(connection)
+        await asyncio.gather(*(send_one(connection) for connection in list(self.connections)))
 
     async def _send_error(
         self,
@@ -644,6 +663,8 @@ class BridgeApp:
 
 
 def main() -> None:
+    if not acquire_single_instance():
+        return
     app = BridgeApp()
     if "--background" in sys.argv:
         app.root.after(300, app.hide_to_tray)

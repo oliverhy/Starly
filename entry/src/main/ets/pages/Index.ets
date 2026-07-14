@@ -19,12 +19,13 @@ class PageRemoteListener implements RemoteClientListener {
   private errorCallback: (message: string) => void;
   private snapshotCallback: (snapshot: CodexSnapshot) => void;
   private threadCallback: (detail: CodexThreadDetail) => void;
-  private eventCallback: () => void;
+  private eventCallback: (event: string, threadId: string) => void;
 
   constructor(connectionCallback: (isConnected: boolean, message: string) => void,
     acknowledgeCallback: (message: string) => void, errorCallback: (message: string) => void,
     snapshotCallback: (snapshot: CodexSnapshot) => void,
-    threadCallback: (detail: CodexThreadDetail) => void, eventCallback: () => void) {
+    threadCallback: (detail: CodexThreadDetail) => void,
+    eventCallback: (event: string, threadId: string) => void) {
     this.connectionCallback = connectionCallback;
     this.acknowledgeCallback = acknowledgeCallback;
     this.errorCallback = errorCallback;
@@ -53,8 +54,8 @@ class PageRemoteListener implements RemoteClientListener {
     this.threadCallback(detail);
   }
 
-  onCodexEvent(): void {
-    this.eventCallback();
+  onCodexEvent(event: string, threadId: string): void {
+    this.eventCallback(event, threadId);
   }
 }
 
@@ -105,8 +106,11 @@ struct Index {
   @State selectedCodexTaskId: string = '';
   @State selectedCodexTitle: string = '';
   @State selectedCodexCwd: string = '';
+  @State selectedCodexStatus: string = 'notLoaded';
   @State selectedCodexActiveTurnId: string = '';
   @State selectedCodexMessages: CodexMessage[] = [];
+  @State pendingCodexThreadId: string = '';
+  @State isCodexConversationOpen: boolean = false;
   @State codexDetailVersion: number = 0;
   @State codexDetailLoading: boolean = false;
   @State codexCommand: string = '';
@@ -154,13 +158,21 @@ struct Index {
       },
       (message: string): void => {
         this.lastAction = message;
-        this.draft = '';
+        if (message === '消息已发送给 Codex') {
+          this.codexCommand = '';
+          this.pendingCodexThreadId = this.selectedCodexTaskId;
+        } else {
+          this.draft = '';
+        }
         this.statusText = '电脑已执行';
         this.statusIsError = false;
       },
       (message: string): void => {
         this.statusText = message;
         this.statusIsError = true;
+        if (message.includes('Codex')) {
+          this.pendingCodexThreadId = '';
+        }
         this.codexDetailLoading = false;
         this.codexLoading = false;
       },
@@ -180,13 +192,30 @@ struct Index {
         }
         this.selectedCodexTitle = detail.title;
         this.selectedCodexCwd = detail.cwd;
+        this.selectedCodexStatus = detail.status;
         this.selectedCodexActiveTurnId = detail.activeTurnId;
         this.selectedCodexMessages = [...detail.messages];
+        if (detail.activeTurnId.length > 0) {
+          this.pendingCodexThreadId = detail.id;
+        } else if (this.pendingCodexThreadId === detail.id) {
+          this.pendingCodexThreadId = '';
+        }
         this.codexDetailVersion += 1;
         this.codexDetailLoading = false;
         this.codexLoading = false;
       },
-      (): void => {
+      (event: string, threadId: string): void => {
+        if (event === 'turn/started' && threadId.length > 0) {
+          this.pendingCodexThreadId = threadId;
+          if (threadId === this.selectedCodexTaskId) {
+            this.selectedCodexStatus = 'active';
+          }
+        } else if (event === 'turn/completed' && threadId === this.pendingCodexThreadId) {
+          this.pendingCodexThreadId = '';
+          if (threadId === this.selectedCodexTaskId) {
+            this.selectedCodexStatus = 'idle';
+          }
+        }
         remoteInputClient.requestCodexSnapshot();
         if (this.selectedCodexTaskId.length > 0) {
           remoteInputClient.requestCodexThread(this.selectedCodexTaskId);
@@ -288,6 +317,9 @@ struct Index {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.page_background'))
+    .bindContentCover($$this.isCodexConversationOpen, this.buildCodexConversationCover(), {
+      modalTransition: ModalTransition.DEFAULT
+    })
   }
 
   @Builder
@@ -593,8 +625,8 @@ struct Index {
                   .width(8)
                   .height(8)
                   .borderRadius(4)
-                  .backgroundColor(this.codexStatusColor(task.status))
-                  .shadow({ radius: 8, color: this.codexStatusColor(task.status) })
+                  .backgroundColor(this.codexStatusColor(this.effectiveCodexStatus(task)))
+                  .shadow({ radius: 8, color: this.codexStatusColor(this.effectiveCodexStatus(task)) })
               }
               .width(20)
               .height(20)
@@ -603,9 +635,9 @@ struct Index {
                 .width(9)
                 .height(9)
                 .borderRadius(5)
-                .backgroundColor(this.codexStatusColor(task.status))
-                .shadow({ radius: task.status === 'active' ? 8 : 0,
-                  color: this.codexStatusColor(task.status) })
+                .backgroundColor(this.codexStatusColor(this.effectiveCodexStatus(task)))
+                .shadow({ radius: this.effectiveCodexStatus(task) === 'active' ? 8 : 0,
+                  color: this.codexStatusColor(this.effectiveCodexStatus(task)) })
             }
             Column({ space: 3 }) {
               Text(task.title)
@@ -632,15 +664,15 @@ struct Index {
                   .backgroundColor('#1A175CD3')
                   .border({ width: 1, color: '#4D175CD3' })
                   .borderRadius(11)
-                Text(this.codexStatusLabel(task.status))
+                Text(this.codexStatusLabel(this.effectiveCodexStatus(task)))
                   .fontSize(10)
-                  .fontColor(this.codexStatusColor(task.status))
+                  .fontColor(this.codexStatusColor(this.effectiveCodexStatus(task)))
               }
               .alignItems(HorizontalAlign.End)
             } else {
-              Text(this.codexStatusLabel(task.status))
+              Text(this.codexStatusLabel(this.effectiveCodexStatus(task)))
                 .fontSize(11)
-                .fontColor(this.codexStatusColor(task.status))
+                .fontColor(this.codexStatusColor(this.effectiveCodexStatus(task)))
                 .maxLines(1)
             }
           }
@@ -701,7 +733,7 @@ struct Index {
         }
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
-        if (this.selectedCodexActiveTurnId.length > 0) {
+        if (this.isSelectedCodexRunning()) {
           Text('正在执行')
             .fontSize(12)
             .fontColor('#067647')
@@ -717,24 +749,51 @@ struct Index {
           .padding({ top: 18, bottom: 18 })
       } else if (this.selectedCodexMessages.length > 0) {
         Column({ space: 8 }) {
+          Row() {
+            Text(`最近对话 · 共 ${this.selectedCodexMessages.length} 条`)
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+            Blank()
+            Text('展开完整对话')
+              .fontSize(12)
+              .fontWeight(FontWeight.Medium)
+              .fontColor('#175CD3')
+          }
+          .width('100%')
+          .onClick(() => {
+            this.isCodexConversationOpen = true;
+          })
           ForEach(this.selectedCodexMessages.slice(-6), (message: CodexMessage, index: number) => {
-            Column({ space: 3 }) {
-              Text(message.role === 'user' ? '你' : 'Codex')
-                .fontSize(11)
-                .fontWeight(FontWeight.Medium)
-                .fontColor(message.role === 'user' ? '#175CD3' : '#067647')
+            Column({ space: 5 }) {
+              Row() {
+                Text(message.role === 'user' ? '你' : 'Codex')
+                  .fontSize(11)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor(message.role === 'user' ? '#175CD3' : '#067647')
+                Blank()
+                Text(this.formatMessageTimestamp(message.timestamp))
+                  .fontSize(10)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .width('100%')
               Text(message.text)
                 .fontSize(13)
                 .lineHeight(19)
                 .fontColor($r('app.color.text_primary'))
-                .maxLines(5)
+                .maxLines(4)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text('点击查看全文')
+                .fontSize(10)
+                .fontColor('#175CD3')
             }
             .width('100%')
             .alignItems(HorizontalAlign.Start)
             .padding(11)
             .backgroundColor($r('app.color.input_background'))
             .borderRadius(14)
+            .onClick(() => {
+              this.isCodexConversationOpen = true;
+            })
           }, (_message: CodexMessage, index: number): string =>
             `${this.selectedCodexTaskId}-${this.codexDetailVersion}-${index}`)
         }
@@ -782,6 +841,88 @@ struct Index {
     .border({ width: 1, color: $r('app.color.glass_border') })
     .borderRadius(28)
     .shadow({ radius: 28, color: $r('app.color.glass_shadow'), offsetY: 10 })
+  }
+
+  @Builder
+  buildCodexConversationCover() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      this.buildAmbientBackground();
+      Column({ space: 14 }) {
+        Row({ space: 12 }) {
+          Column({ space: 3 }) {
+            Text(this.selectedCodexTitle || 'Codex 完整对话')
+              .fontSize(20)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Text(`${this.selectedCodexMessages.length} 条内容 · 可上下滑动查看`)
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+          Button('关闭')
+            .height(40)
+            .fontColor('#175CD3')
+            .backgroundColor($r('app.color.glass_surface_strong'))
+            .border({ width: 1, color: $r('app.color.glass_border') })
+            .borderRadius(14)
+            .onClick(() => {
+              this.isCodexConversationOpen = false;
+            })
+        }
+        .width('100%')
+
+        Scroll() {
+          Column({ space: 12 }) {
+            ForEach(this.selectedCodexMessages, (message: CodexMessage, index: number) => {
+              Column({ space: 8 }) {
+                Row() {
+                  Text(message.role === 'user' ? '你' : 'Codex')
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor(message.role === 'user' ? '#175CD3' : '#067647')
+                  Blank()
+                  Text(this.formatMessageTimestamp(message.timestamp))
+                    .fontSize(11)
+                    .fontColor($r('app.color.text_secondary'))
+                }
+                .width('100%')
+                Text(message.text)
+                  .width('100%')
+                  .fontSize(15)
+                  .lineHeight(23)
+                  .fontColor($r('app.color.text_primary'))
+              }
+              .width('100%')
+              .alignItems(HorizontalAlign.Start)
+              .padding(15)
+              .backgroundColor($r('app.color.glass_surface'))
+              .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+                colorMode: ThemeColorMode.SYSTEM,
+                adaptiveColor: AdaptiveColor.DEFAULT,
+                scale: 0.9
+              })
+              .border({ width: 1, color: $r('app.color.glass_border') })
+              .borderRadius(20)
+            }, (message: CodexMessage, index: number): string =>
+              `${message.turnId}-${message.role}-${index}`)
+          }
+          .width('100%')
+          .padding({ bottom: 24 })
+        }
+        .layoutWeight(1)
+        .width('100%')
+        .scrollBar(BarState.Auto)
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ left: 18, right: 18, top: 58, bottom: 12 })
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor($r('app.color.page_background'))
   }
 
   @Builder
@@ -1265,8 +1406,8 @@ struct Index {
     }
     const sent = await remoteInputClient.sendToCodex(this.selectedCodexTaskId, this.codexCommand);
     if (sent) {
-      this.codexCommand = '';
-      this.statusText = '已发送给 Codex…';
+      this.pendingCodexThreadId = this.selectedCodexTaskId;
+      this.statusText = '正在恢复任务并发送…';
       this.statusIsError = false;
     }
   }
@@ -1285,11 +1426,13 @@ struct Index {
       if (task.id === threadId) {
         this.selectedCodexTitle = task.title;
         this.selectedCodexCwd = task.cwd;
+        this.selectedCodexStatus = task.status;
         return;
       }
     }
     this.selectedCodexTitle = '任务详情';
     this.selectedCodexCwd = '';
+    this.selectedCodexStatus = 'notLoaded';
   }
 
   private codexStatusLabel(status: string): string {
@@ -1297,12 +1440,24 @@ struct Index {
       return '正在执行';
     }
     if (status === 'idle') {
-      return '空闲';
+      return '已完成';
     }
     if (status === 'systemError') {
       return '异常';
     }
-    return '已保存';
+    return '未载入';
+  }
+
+  private effectiveCodexStatus(task: CodexTask): string {
+    if (task.id === this.pendingCodexThreadId) {
+      return 'active';
+    }
+    return task.id === this.selectedCodexTaskId ? this.selectedCodexStatus : task.status;
+  }
+
+  private isSelectedCodexRunning(): boolean {
+    return this.selectedCodexActiveTurnId.length > 0 ||
+      this.pendingCodexThreadId === this.selectedCodexTaskId;
   }
 
   private codexStatusColor(status: string): ResourceColor {
@@ -1358,6 +1513,10 @@ struct Index {
     const hour = date.getHours().toString().padStart(2, '0');
     const minute = date.getMinutes().toString().padStart(2, '0');
     return `${month}-${day} ${hour}:${minute}`;
+  }
+
+  private formatMessageTimestamp(timestamp: number): string {
+    return timestamp > 0 ? this.formatTimestamp(timestamp) : '时间未知';
   }
 
   private shortPath(path: string): string {

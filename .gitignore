@@ -4,6 +4,7 @@
 /build-profile.json5
 /.idea
 **/build
+**/build-*
 **/dist
 **/dist-*
 /linter-cache

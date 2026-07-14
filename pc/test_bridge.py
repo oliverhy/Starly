@@ -91,13 +91,11 @@ class BridgeProtocolTests(unittest.TestCase):
                                timeout: float = 15) -> dict[str, object]:
             _ = timeout
             calls.append(method)
+            if method == "thread/resume":
+                return {"thread": {"id": "thread-1", "turns": []}}
             return {}
 
-        async def fake_detail(_thread_id: str) -> dict[str, object]:
-            return {"activeTurnId": ""}
-
         client.request = fake_request
-        client.thread_detail = fake_detail
         asyncio.run(client.send_message("thread-1", "继续处理"))
 
         self.assertEqual(calls, ["thread/resume", "turn/start"])

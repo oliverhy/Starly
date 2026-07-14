@@ -16,7 +16,7 @@ export interface RemoteClientListener {
   onError(message: string): void;
   onCodexSnapshot(snapshot: CodexSnapshot): void;
   onCodexThread(detail: CodexThreadDetail): void;
-  onCodexEvent(): void;
+  onCodexEvent(event: string, threadId: string): void;
 }
 
 class RemoteInputClient {
@@ -173,7 +173,9 @@ class RemoteInputClient {
       } else if (type === 'codex_thread') {
         this.listener?.onCodexThread(parseCodexThread(message['thread'] ?? new CodexThreadDetail()));
       } else if (type === 'codex_event') {
-        this.listener?.onCodexEvent();
+        const params = (message['params'] ?? {}) as Record<string, Object>;
+        this.listener?.onCodexEvent(
+          String(message['event'] ?? ''), String(params['threadId'] ?? ''));
       }
     } catch (_error) {
       this.listener?.onError('收到无法识别的电脑响应');

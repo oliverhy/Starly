@@ -126,6 +126,8 @@ class CodexAppServerClient:
         self.pending: dict[int, asyncio.Future[JsonObject]] = {}
         self.next_id = 1
         self.start_lock = asyncio.Lock()
+        self.thread_locks: dict[str, asyncio.Lock] = {}
+        self.thread_status: dict[str, str] = {}
 
     async def start(self) -> None:
         if self.process and self.process.returncode is None:
@@ -188,7 +190,12 @@ class CodexAppServerClient:
                 self.request("account/usage/read"),
                 self.request("thread/list", {"limit": 30, "archived": False}),
             )
-            return normalize_snapshot(rate, usage, threads)
+            snapshot = normalize_snapshot(rate, usage, threads)
+            for thread in snapshot["threads"]:
+                thread_id = str(thread.get("id", ""))
+                if thread_id in self.thread_status:
+                    thread["status"] = self.thread_status[thread_id]
+            return snapshot
         except Exception as error:
             return {"available": False, "error": str(error), "quota": {}, "threads": []}
 
@@ -197,6 +204,17 @@ class CodexAppServerClient:
         thread = response.get("thread")
         if not isinstance(thread, dict):
             raise RuntimeError("Codex 没有返回任务详情")
+        return self._normalize_thread_detail(thread)
+
+    async def resume_thread_detail(self, thread_id: str) -> JsonObject:
+        async with self._thread_lock(thread_id):
+            response = await self.request("thread/resume", {"threadId": thread_id}, timeout=30)
+            thread = response.get("thread")
+            if not isinstance(thread, dict):
+                raise RuntimeError("Codex 没有返回恢复后的任务")
+            return self._normalize_thread_detail(thread)
+
+    def _normalize_thread_detail(self, thread: JsonObject) -> JsonObject:
         normalized = normalize_thread(thread)
         messages: list[JsonObject] = []
         active_turn_id = ""
@@ -207,6 +225,8 @@ class CodexAppServerClient:
                     continue
                 if str(turn.get("status", "")) == "inProgress":
                     active_turn_id = str(turn.get("id", ""))
+                started_at = int(turn.get("startedAt", 0) or 0)
+                completed_at = int(turn.get("completedAt", 0) or 0)
                 items = turn.get("items")
                 if not isinstance(items, list):
                     continue
@@ -215,28 +235,54 @@ class CodexAppServerClient:
                         continue
                     role, text = _item_text(item)
                     if role and text.strip():
-                        messages.append({"role": role, "text": text.strip()[:2000]})
-        normalized["messages"] = messages[-12:]
+                        timestamp = started_at if role == "user" else (completed_at or started_at)
+                        messages.append({
+                            "role": role,
+                            "text": text.strip(),
+                            "timestamp": timestamp,
+                            "turnId": str(turn.get("id", "")),
+                        })
+        normalized["messages"] = messages
         normalized["activeTurnId"] = active_turn_id
+        if active_turn_id:
+            normalized["status"] = "active"
+        elif normalized["status"] != "systemError":
+            normalized["status"] = "idle"
+        self.thread_status[str(normalized.get("id", ""))] = normalized["status"]
         return normalized
 
     async def send_message(self, thread_id: str, text: str) -> JsonObject:
         # thread/list and thread/read can see persisted history without loading
         # it into this app-server process. turn/start only accepts a running or
         # resumed thread, so restore the selected history first.
-        await self.request("thread/resume", {"threadId": thread_id})
-        detail = await self.thread_detail(thread_id)
-        input_items = [{"type": "text", "text": text}]
-        active_turn_id = str(detail.get("activeTurnId", ""))
-        if active_turn_id:
-            result = await self.request("turn/steer", {
-                "threadId": thread_id,
-                "expectedTurnId": active_turn_id,
-                "input": input_items,
-            })
-        else:
-            result = await self.request("turn/start", {"threadId": thread_id, "input": input_items})
-        return result
+        async with self._thread_lock(thread_id):
+            resumed = await self.request("thread/resume", {"threadId": thread_id}, timeout=30)
+            thread = resumed.get("thread")
+            if not isinstance(thread, dict):
+                raise RuntimeError("Codex 没有返回恢复后的任务")
+            detail = self._normalize_thread_detail(thread)
+            input_items = [{"type": "text", "text": text}]
+            active_turn_id = str(detail.get("activeTurnId", ""))
+            if active_turn_id:
+                result = await self.request("turn/steer", {
+                    "threadId": thread_id,
+                    "expectedTurnId": active_turn_id,
+                    "input": input_items,
+                }, timeout=30)
+            else:
+                result = await self.request("turn/start", {
+                    "threadId": thread_id,
+                    "input": input_items,
+                }, timeout=30)
+            self.thread_status[thread_id] = "active"
+            return result
+
+    def _thread_lock(self, thread_id: str) -> asyncio.Lock:
+        lock = self.thread_locks.get(thread_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.thread_locks[thread_id] = lock
+        return lock
 
     async def interrupt(self, thread_id: str, turn_id: str) -> JsonObject:
         return await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
@@ -273,6 +319,8 @@ class CodexAppServerClient:
                 continue
             method = str(message.get("method", ""))
             params = message.get("params")
+            if method and isinstance(params, dict):
+                self._track_status(method, params)
             if request_id is not None and method:
                 if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
                     await self._write({"id": request_id, "result": {"decision": "decline"}})
@@ -284,10 +332,25 @@ class CodexAppServerClient:
                         "error": {"code": -32001, "message": "Starly 暂不支持此交互确认，请在电脑端完成"},
                     })
                 if isinstance(params, dict) and self.event_callback:
-                    await self.event_callback(method, params)
+                    asyncio.create_task(self.event_callback(method, params))
                 continue
             if method and isinstance(params, dict) and self.event_callback:
-                await self.event_callback(method, params)
+                # Notifications may arrive before the response to turn/start.
+                # Never let a slow phone broadcast block the protocol reader.
+                asyncio.create_task(self.event_callback(method, params))
+
+    def _track_status(self, method: str, params: JsonObject) -> None:
+        thread_id = str(params.get("threadId", ""))
+        if not thread_id:
+            return
+        if method == "turn/started":
+            self.thread_status[thread_id] = "active"
+        elif method == "turn/completed":
+            turn = params.get("turn")
+            turn_status = str(turn.get("status", "")) if isinstance(turn, dict) else ""
+            self.thread_status[thread_id] = "systemError" if turn_status == "failed" else "idle"
+        elif method == "thread/status/changed":
+            self.thread_status[thread_id] = _status_type(params.get("status"))
 
     async def _drain_stderr(self) -> None:
         assert self.process and self.process.stderr
