@@ -1,0 +1,8 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "Starly 语音遥控输入" },
+    { "name": "EntryAbility_desc", "value": "将手机语音文字发送到电脑当前输入框" },
+    { "name": "EntryAbility_label", "value": "Starly" },
+    { "name": "perm_microphone_reason", "value": "用于把你的语音实时转换为可编辑文字" }
+  ]
+}

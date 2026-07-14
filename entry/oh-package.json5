@@ -1,0 +1,10 @@
+{
+  "name": "entry",
+  "version": "2.0.0",
+  "description": "HarmonyOS voice-to-PC remote input client",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {}
+}
+

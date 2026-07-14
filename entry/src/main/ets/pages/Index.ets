@@ -1,0 +1,610 @@
+import { common } from '@kit.AbilityKit';
+import { scanBarcode } from '@kit.ScanKit';
+import { PairingConfig, parsePairingUri } from '../model/PairingConfig';
+import pairingStore from '../service/PairingStore';
+import remoteInputClient, { RemoteClientListener } from '../service/RemoteInputClient';
+import speechService, { SpeechListener } from '../service/SpeechService';
+
+enum VoiceGestureAction {
+  Keep,
+  Send,
+  Edit
+}
+
+class PageRemoteListener implements RemoteClientListener {
+  private connectionCallback: (isConnected: boolean, message: string) => void;
+  private acknowledgeCallback: (message: string) => void;
+  private errorCallback: (message: string) => void;
+
+  constructor(connectionCallback: (isConnected: boolean, message: string) => void,
+    acknowledgeCallback: (message: string) => void, errorCallback: (message: string) => void) {
+    this.connectionCallback = connectionCallback;
+    this.acknowledgeCallback = acknowledgeCallback;
+    this.errorCallback = errorCallback;
+  }
+
+  onConnectionChanged(isConnected: boolean, message: string): void {
+    this.connectionCallback(isConnected, message);
+  }
+
+  onAcknowledged(message: string): void {
+    this.acknowledgeCallback(message);
+  }
+
+  onError(message: string): void {
+    this.errorCallback(message);
+  }
+}
+
+class PageSpeechListener implements SpeechListener {
+  private stateCallback: (isListening: boolean, message: string) => void;
+  private resultCallback: (text: string, isFinal: boolean) => void;
+  private errorCallback: (message: string) => void;
+
+  constructor(stateCallback: (isListening: boolean, message: string) => void,
+    resultCallback: (text: string, isFinal: boolean) => void, errorCallback: (message: string) => void) {
+    this.stateCallback = stateCallback;
+    this.resultCallback = resultCallback;
+    this.errorCallback = errorCallback;
+  }
+
+  onStateChanged(isListening: boolean, message: string): void {
+    this.stateCallback(isListening, message);
+  }
+
+  onResult(text: string, isFinal: boolean): void {
+    this.resultCallback(text, isFinal);
+  }
+
+  onError(message: string): void {
+    this.errorCallback(message);
+  }
+}
+
+@Entry
+@Component
+struct Index {
+  @State host: string = '';
+  @State portText: string = '8765';
+  @State token: string = '';
+  @State draft: string = '';
+  @State isConnected: boolean = false;
+  @State isListening: boolean = false;
+  @State isPairingExpanded: boolean = true;
+  @State submitMode: string = 'ctrl_enter';
+  @State statusText: string = '请先与电脑配对';
+  @State statusIsError: boolean = false;
+  @State lastAction: string = '';
+  @State isVoicePressing: boolean = false;
+  @State voiceGestureAction: VoiceGestureAction = VoiceGestureAction.Keep;
+  private voiceStartX: number = 0;
+  private voiceStartY: number = 0;
+  private voicePressSequence: number = 0;
+  private pendingVoiceSend: boolean = false;
+
+  aboutToAppear(): void {
+    remoteInputClient.setListener(new PageRemoteListener(
+      (isConnected: boolean, message: string): void => {
+        this.isConnected = isConnected;
+        this.statusText = message;
+        this.statusIsError = false;
+        if (isConnected) {
+          this.isPairingExpanded = false;
+        }
+      },
+      (message: string): void => {
+        this.lastAction = message;
+        this.draft = '';
+        this.statusText = '电脑已执行';
+        this.statusIsError = false;
+      },
+      (message: string): void => {
+        this.statusText = message;
+        this.statusIsError = true;
+      }
+    ));
+    speechService.setListener(new PageSpeechListener(
+      (isListening: boolean, message: string): void => {
+        this.isListening = isListening;
+        this.statusText = message;
+        this.statusIsError = false;
+        if (!isListening && message === '识别完成' && this.pendingVoiceSend) {
+          this.pendingVoiceSend = false;
+          this.sendDraft();
+        }
+      },
+      (text: string, isFinal: boolean): void => {
+        this.draft = text;
+        if (isFinal && this.pendingVoiceSend) {
+          this.pendingVoiceSend = false;
+          this.sendDraft();
+        }
+      },
+      (message: string): void => {
+        this.isListening = false;
+        this.statusText = message;
+        this.statusIsError = true;
+      }
+    ));
+    this.loadPairing();
+  }
+
+  aboutToDisappear(): void {
+    remoteInputClient.setListener(null);
+    speechService.setListener(null);
+  }
+
+  build() {
+    Column() {
+      this.buildHeader();
+      Scroll() {
+        Column({ space: 16 }) {
+          this.buildStatusCard();
+          if (this.isPairingExpanded) {
+            this.buildPairingCard();
+          }
+          this.buildComposerCard();
+          this.buildSafetyHint();
+        }
+        .width('100%')
+        .padding({ left: 18, right: 18, top: 16, bottom: 32 })
+      }
+      .layoutWeight(1)
+      .width('100%')
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor($r('app.color.page_background'))
+  }
+
+  @Builder
+  buildHeader() {
+    Row() {
+      Column() {
+        Text('Starly')
+          .fontSize(28)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+        Text('把声音送到电脑光标处')
+          .fontSize(13)
+          .fontColor($r('app.color.text_secondary'))
+          .margin({ top: 3 })
+      }
+      .alignItems(HorizontalAlign.Start)
+      Blank()
+      Text(this.isConnected ? '在线' : '离线')
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.isConnected ? '#067647' : '#667085')
+        .padding({ left: 12, right: 12, top: 7, bottom: 7 })
+        .backgroundColor(this.isConnected ? '#DDF8EA' : '#EAECF0')
+        .borderRadius(18)
+    }
+    .width('100%')
+    .padding({ left: 20, right: 20, top: 20, bottom: 14 })
+  }
+
+  @Builder
+  buildStatusCard() {
+    Row() {
+      Text(this.statusIsError ? '!' : (this.isConnected ? '✓' : '•'))
+        .fontSize(18)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(this.statusIsError ? '#B42318' : '#175CD3')
+      Column() {
+        Text(this.statusText)
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.statusIsError ? '#B42318' : $r('app.color.text_primary'))
+        if (this.lastAction.length > 0) {
+          Text(this.lastAction)
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+            .margin({ top: 3 })
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .margin({ left: 10 })
+      Blank()
+      Text(this.isPairingExpanded ? '收起' : '配对')
+        .fontSize(13)
+        .fontColor('#175CD3')
+        .onClick(() => {
+          this.isPairingExpanded = !this.isPairingExpanded;
+        })
+    }
+    .width('100%')
+    .padding(14)
+    .backgroundColor(this.statusIsError ? '#FEF3F2' : $r('app.color.card_background'))
+    .borderRadius(16)
+  }
+
+  @Builder
+  buildPairingCard() {
+    Column({ space: 12 }) {
+      Row() {
+        Text('连接电脑')
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+        Blank()
+        Button('扫码配对')
+          .height(36)
+          .fontSize(13)
+          .fontColor('#175CD3')
+          .backgroundColor('#EAF2FF')
+          .borderRadius(18)
+          .onClick(() => this.scanPairingCode())
+      }
+      TextInput({ text: this.host, placeholder: '电脑 IP，例如 192.168.1.20' })
+        .height(48)
+        .backgroundColor($r('app.color.input_background'))
+        .borderRadius(12)
+        .onChange((value: string) => {
+          this.host = value;
+        })
+      TextInput({ text: this.portText, placeholder: '端口' })
+        .height(48)
+        .type(InputType.Number)
+        .backgroundColor($r('app.color.input_background'))
+        .borderRadius(12)
+        .onChange((value: string) => {
+          this.portText = value;
+        })
+      TextInput({ text: this.token, placeholder: '配对密钥' })
+        .height(48)
+        .type(InputType.Password)
+        .backgroundColor($r('app.color.input_background'))
+        .borderRadius(12)
+        .onChange((value: string) => {
+          this.token = value;
+        })
+      Row({ space: 10 }) {
+        Button('保存并连接')
+          .layoutWeight(1)
+          .height(46)
+          .fontColor(Color.White)
+          .backgroundColor('#175CD3')
+          .borderRadius(12)
+          .onClick(() => this.saveAndConnect())
+        Button('清除')
+          .width(82)
+          .height(46)
+          .fontColor('#B42318')
+          .backgroundColor('#FEF3F2')
+          .borderRadius(12)
+          .onClick(() => this.clearPairing())
+      }
+    }
+    .width('100%')
+    .padding(16)
+    .backgroundColor($r('app.color.card_background'))
+    .borderRadius(18)
+  }
+
+  @Builder
+  buildComposerCard() {
+    Column({ space: 14 }) {
+      Row() {
+        Text('语音文字')
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+        Blank()
+        if (this.draft.length > 0) {
+          Text('清空')
+            .fontSize(13)
+            .fontColor('#B42318')
+            .onClick(() => {
+              this.draft = '';
+            })
+        }
+      }
+      TextArea({ text: this.draft, placeholder: '按住下方按钮说话，也可以直接输入文字' })
+        .id('voiceDraftEditor')
+        .height(150)
+        .fontSize(17)
+        .backgroundColor($r('app.color.input_background'))
+        .borderRadius(14)
+        .padding(12)
+        .onChange((value: string) => {
+          this.draft = value;
+        })
+      Column({ space: 10 }) {
+        Stack({ alignContent: Alignment.Center }) {
+          Button(this.voiceButtonText())
+            .width('100%')
+            .height(58)
+            .fontSize(17)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Color.White)
+            .backgroundColor(this.voiceButtonColor())
+            .borderRadius(29)
+            .onTouch((event: TouchEvent) => {
+              this.handleVoiceTouch(event);
+            })
+
+          Row() {
+            Text('发送')
+              .width(104)
+              .height(48)
+              .textAlign(TextAlign.Center)
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.voiceGestureAction === VoiceGestureAction.Send ? Color.White : '#175CD3')
+              .backgroundColor(this.voiceGestureAction === VoiceGestureAction.Send ? '#175CD3' : '#F7FAFF')
+              .border({ width: 1, color: '#B9D2FF' })
+              .borderRadius(24)
+              .shadow({ radius: 18, color: '#33000000', offsetY: 6 })
+            Blank()
+            Text('编辑')
+              .width(104)
+              .height(48)
+              .textAlign(TextAlign.Center)
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.voiceGestureAction === VoiceGestureAction.Edit ? Color.White : '#7F56D9')
+              .backgroundColor(this.voiceGestureAction === VoiceGestureAction.Edit ? '#7F56D9' : '#FBF9FF')
+              .border({ width: 1, color: '#D8C7F5' })
+              .borderRadius(24)
+              .shadow({ radius: 18, color: '#33000000', offsetY: 6 })
+          }
+          .width('88%')
+          .opacity(this.isVoicePressing ? 1 : 0)
+          .translate({ y: this.isVoicePressing ? -70 : -48 })
+          .scale({ x: this.isVoicePressing ? 1 : 0.92, y: this.isVoicePressing ? 1 : 0.92 })
+          .animation({ duration: 180, curve: Curve.EaseOut })
+          .hitTestBehavior(HitTestMode.None)
+          .zIndex(2)
+        }
+        .width('100%')
+        .height(58)
+
+        Text(this.isVoicePressing ? '向左上滑发送，向右上滑编辑' : '按住说话，松手停止识别')
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+      }
+      .width('100%')
+      Row({ space: 18 }) {
+        Row({ space: 7 }) {
+          Radio({ value: 'ctrl_enter', group: 'submitMode' })
+            .checked(this.submitMode === 'ctrl_enter')
+            .onChange((isChecked: boolean) => {
+              if (isChecked) {
+                this.submitMode = 'ctrl_enter';
+              }
+            })
+          Text('Ctrl + 回车')
+            .fontSize(14)
+            .fontColor($r('app.color.text_primary'))
+        }
+        .onClick(() => {
+          this.submitMode = 'ctrl_enter';
+        })
+
+        Row({ space: 7 }) {
+          Radio({ value: 'enter', group: 'submitMode' })
+            .checked(this.submitMode === 'enter')
+            .onChange((isChecked: boolean) => {
+              if (isChecked) {
+                this.submitMode = 'enter';
+              }
+            })
+          Text('回车')
+            .fontSize(14)
+            .fontColor($r('app.color.text_primary'))
+        }
+        .onClick(() => {
+          this.submitMode = 'enter';
+        })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Center)
+      Row({ space: 10 }) {
+        Button('发送文字')
+          .layoutWeight(1)
+          .height(50)
+          .fontSize(16)
+          .fontColor(Color.White)
+          .backgroundColor(this.isConnected ? '#175CD3' : '#98A2B3')
+          .borderRadius(13)
+          .enabled(this.isConnected)
+          .onClick(() => this.sendDraft())
+        Button('仅按回车')
+          .width(104)
+          .height(50)
+          .fontSize(15)
+          .fontColor('#175CD3')
+          .backgroundColor('#EAF2FF')
+          .borderRadius(13)
+          .enabled(this.isConnected)
+          .onClick(() => remoteInputClient.sendEnter())
+      }
+    }
+    .width('100%')
+    .padding(16)
+    .backgroundColor($r('app.color.card_background'))
+    .borderRadius(18)
+  }
+
+  @Builder
+  buildSafetyHint() {
+    Text('发送前请先在电脑上点中目标输入框。Starly 不会主动切换窗口，也不会读取电脑上的文字。')
+      .fontSize(12)
+      .lineHeight(19)
+      .fontColor($r('app.color.text_secondary'))
+      .padding({ left: 4, right: 4 })
+  }
+
+  private getContext(): common.UIAbilityContext {
+    return this.getUIContext().getHostContext() as common.UIAbilityContext;
+  }
+
+  private async loadPairing(): Promise<void> {
+    try {
+      const config = await pairingStore.load(this.getContext());
+      this.applyConfig(config);
+      if (config.isComplete()) {
+        this.statusText = '正在连接电脑…';
+        await remoteInputClient.connect(config);
+      }
+    } catch (error) {
+      this.statusText = `读取配对信息失败：${JSON.stringify(error)}`;
+      this.statusIsError = true;
+    }
+  }
+
+  private async scanPairingCode(): Promise<void> {
+    try {
+      const result = await scanBarcode.startScanForResult(this.getContext());
+      const config = parsePairingUri(result.originalValue);
+      if (config === null) {
+        this.statusText = '这不是有效的 Starly 配对二维码';
+        this.statusIsError = true;
+        return;
+      }
+      this.applyConfig(config);
+      await this.saveAndConnect();
+    } catch (_error) {
+      this.statusText = '扫码已取消或不可用，可手动填写配对信息';
+      this.statusIsError = false;
+    }
+  }
+
+  private async saveAndConnect(): Promise<void> {
+    const config = this.readConfigFromForm();
+    if (!config.isComplete()) {
+      this.statusText = '请填写有效的电脑地址、端口和配对密钥';
+      this.statusIsError = true;
+      return;
+    }
+    await pairingStore.save(this.getContext(), config);
+    this.statusText = '正在连接电脑…';
+    this.statusIsError = false;
+    await remoteInputClient.connect(config);
+  }
+
+  private async clearPairing(): Promise<void> {
+    await remoteInputClient.disconnect();
+    await pairingStore.clear(this.getContext());
+    this.host = '';
+    this.portText = '8765';
+    this.token = '';
+    this.isConnected = false;
+    this.statusText = '配对信息已清除';
+    this.statusIsError = false;
+  }
+
+  private handleVoiceTouch(event: TouchEvent): void {
+    if (event.changedTouches.length === 0) {
+      return;
+    }
+    const point = event.changedTouches[0];
+    if (event.type === TouchType.Down) {
+      this.voiceStartX = point.x;
+      this.voiceStartY = point.y;
+      this.voiceGestureAction = VoiceGestureAction.Keep;
+      this.isVoicePressing = true;
+      this.pendingVoiceSend = false;
+      this.draft = '';
+      this.voicePressSequence += 1;
+      this.beginVoiceHold(this.voicePressSequence);
+      return;
+    }
+    if (event.type === TouchType.Move && this.isVoicePressing) {
+      const deltaX = point.x - this.voiceStartX;
+      const deltaY = point.y - this.voiceStartY;
+      if (deltaY < -36 && deltaX < -28) {
+        this.voiceGestureAction = VoiceGestureAction.Send;
+      } else if (deltaY < -36 && deltaX > 28) {
+        this.voiceGestureAction = VoiceGestureAction.Edit;
+      } else {
+        this.voiceGestureAction = VoiceGestureAction.Keep;
+      }
+      return;
+    }
+    if ((event.type === TouchType.Up || event.type === TouchType.Cancel) && this.isVoicePressing) {
+      const action = event.type === TouchType.Cancel ? VoiceGestureAction.Keep : this.voiceGestureAction;
+      this.finishVoiceHold(action);
+    }
+  }
+
+  private async beginVoiceHold(sequence: number): Promise<void> {
+    const started = await speechService.start();
+    if (!started) {
+      this.isVoicePressing = false;
+      return;
+    }
+    if (!this.isVoicePressing || sequence !== this.voicePressSequence) {
+      await speechService.stop();
+    }
+  }
+
+  private async finishVoiceHold(action: VoiceGestureAction): Promise<void> {
+    this.isVoicePressing = false;
+    this.isListening = false;
+    this.voiceGestureAction = VoiceGestureAction.Keep;
+    this.pendingVoiceSend = action === VoiceGestureAction.Send;
+    if (action === VoiceGestureAction.Send) {
+      this.statusText = '正在整理并发送语音…';
+    } else if (action === VoiceGestureAction.Edit) {
+      this.statusText = '正在整理识别文字…';
+    } else {
+      this.statusText = '正在整理识别结果…';
+    }
+    await speechService.stop();
+    if (action === VoiceGestureAction.Edit) {
+      try {
+        this.getUIContext().getFocusController().requestFocus('voiceDraftEditor');
+      } catch (_error) {
+      }
+    }
+  }
+
+  private voiceButtonText(): string {
+    if (!this.isVoicePressing) {
+      return '按住说话';
+    }
+    if (this.voiceGestureAction === VoiceGestureAction.Send) {
+      return '松手发送';
+    }
+    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
+      return '松手编辑';
+    }
+    return '松手停止识别';
+  }
+
+  private voiceButtonColor(): string {
+    if (this.voiceGestureAction === VoiceGestureAction.Send) {
+      return '#175CD3';
+    }
+    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
+      return '#7F56D9';
+    }
+    return this.isVoicePressing ? '#D92D20' : '#7F56D9';
+  }
+
+  private async sendDraft(): Promise<void> {
+    const sent = await remoteInputClient.sendText(this.draft, this.submitMode);
+    if (sent) {
+      this.statusText = '已发送，等待电脑确认…';
+      this.statusIsError = false;
+    }
+  }
+
+  private readConfigFromForm(): PairingConfig {
+    const config = new PairingConfig();
+    config.host = this.host.trim();
+    config.port = Number(this.portText);
+    config.token = this.token;
+    return config;
+  }
+
+  private applyConfig(config: PairingConfig): void {
+    this.host = config.host;
+    this.portText = config.port.toString();
+    this.token = config.token;
+  }
+}
