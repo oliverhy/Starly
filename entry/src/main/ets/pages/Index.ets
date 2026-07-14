@@ -524,7 +524,7 @@ struct Index {
       .barHeight(46)
       .barMode(BarMode.Fixed)
       .scrollable(true)
-      .animationDuration(180)
+      .animationDuration(280)
       .onChange((index: number) => {
         this.submitMode = index === 0 ? 'ctrl_enter' : 'enter';
       })
@@ -588,6 +588,7 @@ struct Index {
           FontWeight.Medium : FontWeight.Regular)
         .fontColor(this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ?
           $r('app.color.text_primary') : $r('app.color.text_secondary'))
+        .animation({ duration: 240, curve: Curve.EaseOut })
     }
     .width('94%')
     .height(38)
@@ -605,6 +606,15 @@ struct Index {
       color: $r('app.color.glass_shadow'),
       offsetY: 3
     })
+    .scale({
+      x: this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ? 1 : 0.94,
+      y: this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ? 1 : 0.94
+    })
+    .opacity(this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ? 1 : 0.72)
+    .translate({
+      y: this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ? 0 : 1
+    })
+    .animation({ duration: 260, curve: Curve.EaseOut })
   }
 
   @Builder
