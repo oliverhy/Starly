@@ -23,6 +23,7 @@ export class CodexTask {
 export class CodexMessage {
   role: string = '';
   text: string = '';
+  images: string[] = [];
   timestamp: number = 0;
   turnId: string = '';
 }
@@ -96,6 +97,7 @@ export function parseCodexThread(value: Object): CodexThreadDetail {
     const message = new CodexMessage();
     message.role = String(raw['role'] ?? '');
     message.text = String(raw['text'] ?? '');
+    message.images = (raw['images'] ?? []) as string[];
     message.timestamp = numeric(raw['timestamp']);
     message.turnId = String(raw['turnId'] ?? '');
     return message;

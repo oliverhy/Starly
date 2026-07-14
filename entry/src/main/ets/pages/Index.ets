@@ -816,6 +816,17 @@ struct Index {
                 .fontColor($r('app.color.text_primary'))
                 .maxLines(4)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
+              if (message.images.length > 0) {
+                ForEach(message.images, (source: string, imageIndex: number) => {
+                  Image(source)
+                    .width('100%')
+                    .height(150)
+                    .objectFit(ImageFit.Contain)
+                    .backgroundColor('#12000000')
+                    .borderRadius(12)
+                }, (_source: string, imageIndex: number): string =>
+                  `${message.turnId}-preview-image-${imageIndex}`)
+              }
               Text('点击查看全文')
                 .fontSize(10)
                 .fontColor('#175CD3')
@@ -955,6 +966,17 @@ struct Index {
                   .fontSize(15)
                   .lineHeight(23)
                   .fontColor($r('app.color.text_primary'))
+                if (message.images.length > 0) {
+                  ForEach(message.images, (source: string, imageIndex: number) => {
+                    Image(source)
+                      .width('100%')
+                      .height(280)
+                      .objectFit(ImageFit.Contain)
+                      .backgroundColor('#12000000')
+                      .borderRadius(16)
+                  }, (_source: string, imageIndex: number): string =>
+                    `${message.turnId}-full-image-${imageIndex}`)
+                }
               }
               .width('100%')
               .alignItems(HorizontalAlign.Start)

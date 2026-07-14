@@ -410,9 +410,9 @@ class BridgeServer:
                                  thread_id: str, message_id: str = "") -> None:
         assert self.codex is not None
         try:
-            # Selecting a persisted task also restores it into this app-server
-            # session, so later commands can start reliably.
-            detail = await self.codex.resume_thread_detail(thread_id)
+            # Reading history must stay read-only. Resuming here leaves a second
+            # app-server owning the same thread and makes the desktop view stale.
+            detail = await self.codex.thread_detail(thread_id)
             await connection.send(json.dumps({
                 "type": "codex_thread", "id": message_id, "thread": detail,
             }, ensure_ascii=False))
@@ -459,18 +459,25 @@ class BridgeServer:
                 if thread_id in self.pending_desktop_open:
                     self.pending_desktop_open.discard(thread_id)
                     asyncio.create_task(self._open_completed_codex_thread(thread_id))
+                    return
             await self._schedule_codex_refresh()
 
     async def _open_completed_codex_thread(self, thread_id: str) -> None:
-        # Let app-server finish persisting and releasing the completed turn
-        # before the desktop client resumes the same thread.
-        await asyncio.sleep(0.65)
+        # The bridge and Codex Desktop are separate app-server clients. Release
+        # the bridge-owned runtime completely so the desktop can reload the
+        # persisted turn instead of keeping its stale in-memory copy.
+        if self.codex:
+            await self.codex.release_thread(thread_id)
+            await self.codex.stop()
+        await asyncio.sleep(0.8)
         opened = await asyncio.to_thread(open_codex_thread, thread_id)
         await self._broadcast({
             "type": "codex_event",
             "event": "desktop/opened" if opened else "desktop/openFailed",
             "params": {"threadId": thread_id},
         })
+        await asyncio.sleep(0.8)
+        await self._schedule_codex_refresh()
 
     async def _schedule_codex_refresh(self) -> None:
         if self.codex_refresh_task and not self.codex_refresh_task.done():

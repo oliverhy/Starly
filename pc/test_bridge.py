@@ -5,7 +5,7 @@ import unittest
 import urllib.parse
 
 from pc.starly_bridge import BridgeConfig, BridgeServer, MAX_TEXT_LENGTH, WindowsInput, find_available_port
-from pc.codex_client import CodexAppServerClient, normalize_snapshot, normalize_thread
+from pc.codex_client import CodexAppServerClient, _item_content, normalize_snapshot, normalize_thread
 
 
 class FakeConnection:
@@ -100,6 +100,18 @@ class BridgeProtocolTests(unittest.TestCase):
 
         self.assertEqual(calls, ["thread/resume", "turn/start"])
 
+    def test_codex_history_preserves_remote_images(self) -> None:
+        role, text, images = _item_content({
+            "type": "userMessage",
+            "content": [
+                {"type": "text", "text": "看看这张图"},
+                {"type": "image", "url": "https://example.com/test.png"},
+            ],
+        })
+        self.assertEqual(role, "user")
+        self.assertEqual(text, "看看这张图")
+        self.assertEqual(images, ["https://example.com/test.png"])
+
     def test_desktop_thread_opens_only_after_turn_completed(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
         server.pending_desktop_open = {"thread-1"}
@@ -133,6 +145,39 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(opened, ["thread-1"])
         self.assertNotIn("thread-1", server.pending_desktop_open)
         self.assertEqual(broadcasts, ["turn/started", "turn/completed"])
+
+    def test_completed_turn_releases_bridge_runtime_before_desktop_open(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        order: list[str] = []
+
+        class FakeCodex:
+            async def release_thread(self, thread_id: str) -> None:
+                order.append(f"release:{thread_id}")
+
+            async def stop(self) -> None:
+                order.append("stop")
+
+        async def fake_broadcast(message: dict[str, object]) -> None:
+            order.append(str(message.get("event", "")))
+
+        async def fake_refresh() -> None:
+            order.append("refresh")
+
+        server.codex = FakeCodex()
+        server._broadcast = fake_broadcast
+        server._schedule_codex_refresh = fake_refresh
+
+        import pc.starly_bridge as bridge_module
+        original_open = bridge_module.open_codex_thread
+        bridge_module.open_codex_thread = lambda thread_id: not order.append(f"open:{thread_id}")
+        try:
+            asyncio.run(server._open_completed_codex_thread("thread-1"))
+        finally:
+            bridge_module.open_codex_thread = original_open
+
+        self.assertEqual(order, [
+            "release:thread-1", "stop", "open:thread-1", "desktop/opened", "refresh",
+        ])
 
 
 if __name__ == "__main__":

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import os
 import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from PIL import Image
 
 
 JsonObject = dict[str, Any]
@@ -101,19 +105,68 @@ def normalize_snapshot(rate_response: JsonObject, usage_response: JsonObject,
     }
 
 
-def _item_text(item: JsonObject) -> tuple[str, str]:
+def _local_image_data_url(raw_path: str) -> str:
+    path_text = raw_path.strip()
+    if not path_text:
+        return ""
+    if path_text.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        path_text = unquote(urlparse(path_text).path).lstrip("/") if os.name == "nt" else unquote(urlparse(path_text).path)
+    path = Path(path_text)
+    if not path.is_file():
+        return ""
+    try:
+        with Image.open(path) as source:
+            source.thumbnail((960, 960), Image.Resampling.LANCZOS)
+            if source.mode != "RGB":
+                rgb = Image.new("RGB", source.size, "white")
+                if "A" in source.getbands():
+                    rgb.paste(source, mask=source.getchannel("A"))
+                else:
+                    rgb.paste(source)
+                source = rgb
+            output = io.BytesIO()
+            source.save(output, format="JPEG", quality=76, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    except (OSError, ValueError):
+        return ""
+
+
+def _image_source(value: object) -> str:
+    source = str(value or "").strip()
+    if source.startswith(("https://", "http://", "data:image/")):
+        return source
+    return _local_image_data_url(source)
+
+
+def _item_content(item: JsonObject) -> tuple[str, str, list[str]]:
     item_type = str(item.get("type", ""))
     if item_type == "agentMessage":
-        return "assistant", str(item.get("text", ""))
+        return "assistant", str(item.get("text", "")), []
     if item_type == "userMessage":
         content = item.get("content")
         parts: list[str] = []
+        images: list[str] = []
         if isinstance(content, list):
             for value in content:
-                if isinstance(value, dict) and value.get("type") in ("text", "inputText"):
+                if not isinstance(value, dict):
+                    continue
+                value_type = str(value.get("type", ""))
+                if value_type in ("text", "inputText"):
                     parts.append(str(value.get("text", "")))
-        return "user", "\n".join(parts)
-    return "", ""
+                elif value_type == "image":
+                    source = _image_source(value.get("url"))
+                    if source:
+                        images.append(source)
+                elif value_type in ("localImage", "inputImage"):
+                    source = _image_source(value.get("path", value.get("imageUrl")))
+                    if source:
+                        images.append(source)
+        return "user", "\n".join(parts), images
+    if item_type == "imageGeneration":
+        source = _image_source(item.get("savedPath", item.get("result")))
+        return "assistant", "生成的图片", [source] if source else []
+    return "", "", []
 
 
 class CodexAppServerClient:
@@ -233,12 +286,13 @@ class CodexAppServerClient:
                 for item in items:
                     if not isinstance(item, dict):
                         continue
-                    role, text = _item_text(item)
-                    if role and text.strip():
+                    role, text, images = _item_content(item)
+                    if role and (text.strip() or images):
                         timestamp = started_at if role == "user" else (completed_at or started_at)
                         messages.append({
                             "role": role,
                             "text": text.strip(),
+                            "images": images,
                             "timestamp": timestamp,
                             "turnId": str(turn.get("id", "")),
                         })
@@ -286,6 +340,14 @@ class CodexAppServerClient:
 
     async def interrupt(self, thread_id: str, turn_id: str) -> JsonObject:
         return await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+
+    async def release_thread(self, thread_id: str) -> None:
+        try:
+            await self.request("thread/unsubscribe", {"threadId": thread_id}, timeout=10)
+        except Exception:
+            # Older app-server builds may not expose unsubscribe. Stopping the
+            # bridge-owned process still releases the thread safely.
+            pass
 
     async def _write(self, value: JsonObject) -> None:
         if not self.process or not self.process.stdin:
