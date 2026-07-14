@@ -9,6 +9,7 @@ Starly 是一套“鸿蒙手机语音输入 → Windows 当前输入框”的局
 ## 主要功能
 
 - HarmonyOS 原生 ArkTS / ArkUI 应用。
+- 基于 HarmonyOS 6.1（API 23）的沉浸光感标题栏与液态玻璃界面。
 - 按住持续语音识别，松手停止。
 - 左上滑“发送”、右上滑“编辑”的手势操作。
 - 识别结果可在手机端继续修改或清空。
@@ -64,7 +65,7 @@ Starly/
 
 ### 手机端
 
-- HarmonyOS 6.0.1（API 21）或兼容版本。
+- HarmonyOS 6.1（API 23）或兼容版本。
 - 带麦克风的鸿蒙手机或平板。
 - DevEco Studio 与对应 HarmonyOS SDK，用于源码构建。
 

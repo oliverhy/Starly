@@ -1,5 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { scanBarcode } from '@kit.ScanKit';
+import { HdsNavigation, HdsNavigationTitleMode, ScrollEffectType, hdsMaterial } from '@kit.UIDesignKit';
 import { PairingConfig, parsePairingUri } from '../model/PairingConfig';
 import pairingStore from '../service/PairingStore';
 import remoteInputClient, { RemoteClientListener } from '../service/RemoteInputClient';
@@ -80,6 +81,7 @@ struct Index {
   private voiceStartY: number = 0;
   private voicePressSequence: number = 0;
   private pendingVoiceSend: boolean = false;
+  private pageScroller: Scroller = new Scroller();
 
   aboutToAppear(): void {
     remoteInputClient.setListener(new PageRemoteListener(
@@ -132,22 +134,62 @@ struct Index {
   }
 
   build() {
-    Column() {
-      this.buildHeader();
-      Scroll() {
-        Column({ space: 16 }) {
-          this.buildStatusCard();
-          if (this.isPairingExpanded) {
-            this.buildPairingCard();
+    Stack({ alignContent: Alignment.TopStart }) {
+      this.buildAmbientBackground();
+      HdsNavigation() {
+        Scroll(this.pageScroller) {
+          Column({ space: 16 }) {
+            this.buildStatusCard();
+            if (this.isPairingExpanded) {
+              this.buildPairingCard();
+            }
+            this.buildComposerCard();
+            this.buildSafetyHint();
           }
-          this.buildComposerCard();
-          this.buildSafetyHint();
+          .width('100%')
+          .padding({ left: 18, right: 18, top: 12, bottom: 36 })
         }
         .width('100%')
-        .padding({ left: 18, right: 18, top: 16, bottom: 32 })
+        .height('100%')
       }
-      .layoutWeight(1)
+      .titleBar({
+        content: {
+          title: {
+            mainTitle: 'Starly',
+            subTitle: '把声音送到电脑光标处'
+          }
+        },
+        style: {
+          scrollEffectOpts: {
+            enableScrollEffect: true,
+            scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR
+          },
+          originalStyle: {
+            backgroundStyle: {
+              backgroundColor: '#00FFFFFF',
+              blurRadius: 56
+            }
+          },
+          scrollEffectStyle: {
+            backgroundStyle: {
+              backgroundColor: $r('app.color.glass_surface_strong'),
+              blurRadius: 72
+            }
+          },
+          thermoCtrl: true,
+          systemMaterialEffect: {
+            materialType: hdsMaterial.MaterialType.IMMERSIVE,
+            materialLevel: hdsMaterial.MaterialLevel.EXQUISITE
+          }
+        },
+        enableComponentSafeArea: true
+      })
+      .titleMode(HdsNavigationTitleMode.FREE)
+      .hideBackButton(true)
+      .mode(NavigationMode.Stack)
+      .bindToScrollable([this.pageScroller])
       .width('100%')
+      .height('100%')
     }
     .width('100%')
     .height('100%')
@@ -155,30 +197,33 @@ struct Index {
   }
 
   @Builder
-  buildHeader() {
-    Row() {
-      Column() {
-        Text('Starly')
-          .fontSize(28)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.text_primary'))
-        Text('把声音送到电脑光标处')
-          .fontSize(13)
-          .fontColor($r('app.color.text_secondary'))
-          .margin({ top: 3 })
-      }
-      .alignItems(HorizontalAlign.Start)
-      Blank()
-      Text(this.isConnected ? '在线' : '离线')
-        .fontSize(13)
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.isConnected ? '#067647' : '#667085')
-        .padding({ left: 12, right: 12, top: 7, bottom: 7 })
-        .backgroundColor(this.isConnected ? '#DDF8EA' : '#EAECF0')
-        .borderRadius(18)
+  buildAmbientBackground() {
+    Stack() {
+      Column()
+        .width(260)
+        .height(260)
+        .borderRadius(130)
+        .backgroundColor('#475B8CFF')
+        .blur(72)
+        .position({ x: -72, y: -48 })
+      Column()
+        .width(230)
+        .height(230)
+        .borderRadius(115)
+        .backgroundColor('#3DBB84FF')
+        .blur(82)
+        .position({ x: '68%', y: 250 })
+      Column()
+        .width(280)
+        .height(280)
+        .borderRadius(140)
+        .backgroundColor('#35A36BFF')
+        .blur(92)
+        .position({ x: -92, y: 760 })
     }
     .width('100%')
-    .padding({ left: 20, right: 20, top: 20, bottom: 14 })
+    .height('100%')
+    .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
@@ -211,9 +256,16 @@ struct Index {
         })
     }
     .width('100%')
-    .padding(14)
-    .backgroundColor(this.statusIsError ? '#FEF3F2' : $r('app.color.card_background'))
-    .borderRadius(16)
+    .padding(16)
+    .backgroundColor(this.statusIsError ? '#D9FEF3F2' : $r('app.color.glass_surface'))
+    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+      colorMode: ThemeColorMode.SYSTEM,
+      adaptiveColor: AdaptiveColor.DEFAULT,
+      scale: 0.88
+    })
+    .border({ width: 1, color: $r('app.color.glass_border') })
+    .borderRadius(22)
+    .shadow({ radius: 24, color: $r('app.color.glass_shadow'), offsetY: 10 })
   }
 
   @Builder
@@ -236,6 +288,7 @@ struct Index {
       TextInput({ text: this.host, placeholder: '电脑 IP，例如 192.168.1.20' })
         .height(48)
         .backgroundColor($r('app.color.input_background'))
+        .border({ width: 1, color: $r('app.color.glass_border') })
         .borderRadius(12)
         .onChange((value: string) => {
           this.host = value;
@@ -244,6 +297,7 @@ struct Index {
         .height(48)
         .type(InputType.Number)
         .backgroundColor($r('app.color.input_background'))
+        .border({ width: 1, color: $r('app.color.glass_border') })
         .borderRadius(12)
         .onChange((value: string) => {
           this.portText = value;
@@ -252,6 +306,7 @@ struct Index {
         .height(48)
         .type(InputType.Password)
         .backgroundColor($r('app.color.input_background'))
+        .border({ width: 1, color: $r('app.color.glass_border') })
         .borderRadius(12)
         .onChange((value: string) => {
           this.token = value;
@@ -275,8 +330,15 @@ struct Index {
     }
     .width('100%')
     .padding(16)
-    .backgroundColor($r('app.color.card_background'))
-    .borderRadius(18)
+    .backgroundColor($r('app.color.glass_surface'))
+    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+      colorMode: ThemeColorMode.SYSTEM,
+      adaptiveColor: AdaptiveColor.DEFAULT,
+      scale: 0.88
+    })
+    .border({ width: 1, color: $r('app.color.glass_border') })
+    .borderRadius(26)
+    .shadow({ radius: 28, color: $r('app.color.glass_shadow'), offsetY: 12 })
   }
 
   @Builder
@@ -302,7 +364,8 @@ struct Index {
         .height(150)
         .fontSize(17)
         .backgroundColor($r('app.color.input_background'))
-        .borderRadius(14)
+        .border({ width: 1, color: $r('app.color.glass_border') })
+        .borderRadius(20)
         .padding(12)
         .onChange((value: string) => {
           this.draft = value;
@@ -316,7 +379,12 @@ struct Index {
             .fontWeight(FontWeight.Medium)
             .fontColor(Color.White)
             .backgroundColor(this.voiceButtonColor())
+            .linearGradient({
+              angle: 112,
+              colors: this.voiceButtonGradient()
+            })
             .borderRadius(29)
+            .shadow({ radius: 24, color: '#665B5CE2', offsetY: 10 })
             .onTouch((event: TouchEvent) => {
               this.handleVoiceTouch(event);
             })
@@ -399,14 +467,34 @@ struct Index {
       }
       .width('100%')
       .justifyContent(FlexAlign.Center)
+      .padding({ top: 8, bottom: 8, left: 12, right: 12 })
+      .backgroundColor($r('app.color.input_background'))
+      .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+        colorMode: ThemeColorMode.SYSTEM,
+        adaptiveColor: AdaptiveColor.DEFAULT,
+        scale: 0.72
+      })
+      .border({ width: 1, color: $r('app.color.glass_border') })
+      .borderRadius(22)
       Row({ space: 10 }) {
         Button('发送文字')
           .layoutWeight(1)
           .height(50)
           .fontSize(16)
           .fontColor(Color.White)
-          .backgroundColor(this.isConnected ? '#175CD3' : '#98A2B3')
+          .backgroundColor(this.isConnected ? $r('app.color.accent_primary') : '#98A2B3')
+          .linearGradient({
+            angle: 110,
+            colors: this.isConnected ? [
+              [$r('app.color.accent_primary'), 0.0],
+              [$r('app.color.accent_secondary'), 1.0]
+            ] : [
+              ['#98A2B3', 0.0],
+              ['#98A2B3', 1.0]
+            ]
+          })
           .borderRadius(13)
+          .shadow({ radius: 16, color: '#405B5CE2', offsetY: 6 })
           .enabled(this.isConnected)
           .onClick(() => this.sendDraft())
         Button('仅按回车')
@@ -422,8 +510,15 @@ struct Index {
     }
     .width('100%')
     .padding(16)
-    .backgroundColor($r('app.color.card_background'))
-    .borderRadius(18)
+    .backgroundColor($r('app.color.glass_surface'))
+    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+      colorMode: ThemeColorMode.SYSTEM,
+      adaptiveColor: AdaptiveColor.DEFAULT,
+      scale: 0.92
+    })
+    .border({ width: 1, color: $r('app.color.glass_border') })
+    .borderRadius(28)
+    .shadow({ radius: 30, color: $r('app.color.glass_shadow'), offsetY: 12 })
   }
 
   @Builder
@@ -432,7 +527,15 @@ struct Index {
       .fontSize(12)
       .lineHeight(19)
       .fontColor($r('app.color.text_secondary'))
-      .padding({ left: 4, right: 4 })
+      .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+      .backgroundColor($r('app.color.glass_surface'))
+      .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+        colorMode: ThemeColorMode.SYSTEM,
+        adaptiveColor: AdaptiveColor.DEFAULT,
+        scale: 0.7
+      })
+      .border({ width: 1, color: $r('app.color.glass_border') })
+      .borderRadius(18)
   }
 
   private getContext(): common.UIAbilityContext {
@@ -592,6 +695,19 @@ struct Index {
       return '#7F56D9';
     }
     return this.isVoicePressing ? '#D92D20' : '#7F56D9';
+  }
+
+  private voiceButtonGradient(): Array<[ResourceColor, number]> {
+    if (this.voiceGestureAction === VoiceGestureAction.Send) {
+      return [['#2563EB', 0.0], ['#22A6F2', 1.0]];
+    }
+    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
+      return [['#7C3AED', 0.0], ['#C06CFF', 1.0]];
+    }
+    if (this.isVoicePressing) {
+      return [['#D92D20', 0.0], ['#F97066', 1.0]];
+    }
+    return [[$r('app.color.accent_primary'), 0.0], [$r('app.color.accent_secondary'), 1.0]];
   }
 
   private async sendDraft(): Promise<void> {

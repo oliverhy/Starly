@@ -1,10 +1,16 @@
 {
   "color": [
-    { "name": "start_window_background", "value": "#F3F5F8" },
-    { "name": "page_background", "value": "#F3F5F8" },
-    { "name": "card_background", "value": "#FFFFFFFF" },
-    { "name": "input_background", "value": "#F2F4F7" },
+    { "name": "start_window_background", "value": "#EEF3FF" },
+    { "name": "page_background", "value": "#EEF3FF" },
+    { "name": "card_background", "value": "#CFFFFFFF" },
+    { "name": "input_background", "value": "#99F8FAFF" },
+    { "name": "glass_surface", "value": "#BFFFFFFF" },
+    { "name": "glass_surface_strong", "value": "#E6FFFFFF" },
+    { "name": "glass_border", "value": "#CCFFFFFF" },
+    { "name": "glass_shadow", "value": "#2E3458A8" },
+    { "name": "accent_primary", "value": "#5B5CE2" },
+    { "name": "accent_secondary", "value": "#9B6DFF" },
     { "name": "text_primary", "value": "#101828" },
-    { "name": "text_secondary", "value": "#667085" }
+    { "name": "text_secondary", "value": "#5F6B85" }
   ]
 }
