@@ -372,6 +372,10 @@ struct Index {
         })
       Column({ space: 10 }) {
         Stack({ alignContent: Alignment.Center }) {
+          if (this.isVoicePressing) {
+            this.buildVoiceParticleField()
+          }
+
           Button(this.voiceButtonText())
             .width('100%')
             .height(58)
@@ -384,35 +388,64 @@ struct Index {
               colors: this.voiceButtonGradient()
             })
             .borderRadius(29)
-            .shadow({ radius: 24, color: '#665B5CE2', offsetY: 10 })
+            .shadow({
+              radius: this.isVoicePressing ? 34 : 24,
+              color: this.voiceParticleShadow(),
+              offsetY: this.isVoicePressing ? 4 : 10
+            })
+            .zIndex(1)
             .onTouch((event: TouchEvent) => {
               this.handleVoiceTouch(event);
             })
 
           Row() {
-            Text('发送')
+            Stack({ alignContent: Alignment.Center }) {
+              if (this.voiceGestureAction === VoiceGestureAction.Send) {
+                this.buildTargetParticleField('#00B8FF', '#2F80ED')
+              }
+              Text('发送')
+                .width(104)
+                .height(48)
+                .textAlign(TextAlign.Center)
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.voiceGestureAction === VoiceGestureAction.Send ? Color.White : '#175CD3')
+                .backgroundColor(this.voiceGestureAction === VoiceGestureAction.Send ? '#175CD3' : '#F7FAFF')
+                .border({ width: 1, color: '#B9D2FF' })
+                .borderRadius(24)
+                .shadow({
+                  radius: this.voiceGestureAction === VoiceGestureAction.Send ? 28 : 18,
+                  color: this.voiceGestureAction === VoiceGestureAction.Send ? '#9953D8FF' : '#33000000',
+                  offsetY: 6
+                })
+                .zIndex(1)
+            }
               .width(104)
               .height(48)
-              .textAlign(TextAlign.Center)
-              .fontSize(15)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(this.voiceGestureAction === VoiceGestureAction.Send ? Color.White : '#175CD3')
-              .backgroundColor(this.voiceGestureAction === VoiceGestureAction.Send ? '#175CD3' : '#F7FAFF')
-              .border({ width: 1, color: '#B9D2FF' })
-              .borderRadius(24)
-              .shadow({ radius: 18, color: '#33000000', offsetY: 6 })
             Blank()
-            Text('编辑')
+            Stack({ alignContent: Alignment.Center }) {
+              if (this.voiceGestureAction === VoiceGestureAction.Edit) {
+                this.buildTargetParticleField('#9B51E0', '#FF7AD9')
+              }
+              Text('编辑')
+                .width(104)
+                .height(48)
+                .textAlign(TextAlign.Center)
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.voiceGestureAction === VoiceGestureAction.Edit ? Color.White : '#7F56D9')
+                .backgroundColor(this.voiceGestureAction === VoiceGestureAction.Edit ? '#7F56D9' : '#FBF9FF')
+                .border({ width: 1, color: '#D8C7F5' })
+                .borderRadius(24)
+                .shadow({
+                  radius: this.voiceGestureAction === VoiceGestureAction.Edit ? 28 : 18,
+                  color: this.voiceGestureAction === VoiceGestureAction.Edit ? '#99C084FC' : '#33000000',
+                  offsetY: 6
+                })
+                .zIndex(1)
+            }
               .width(104)
               .height(48)
-              .textAlign(TextAlign.Center)
-              .fontSize(15)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(this.voiceGestureAction === VoiceGestureAction.Edit ? Color.White : '#7F56D9')
-              .backgroundColor(this.voiceGestureAction === VoiceGestureAction.Edit ? '#7F56D9' : '#FBF9FF')
-              .border({ width: 1, color: '#D8C7F5' })
-              .borderRadius(24)
-              .shadow({ radius: 18, color: '#33000000', offsetY: 6 })
           }
           .width('88%')
           .opacity(this.isVoicePressing ? 1 : 0)
@@ -536,6 +569,91 @@ struct Index {
       })
       .border({ width: 1, color: $r('app.color.glass_border') })
       .borderRadius(18)
+  }
+
+  @Builder
+  buildVoiceParticleField() {
+    Particle({
+      particles: [{
+        emitter: {
+          particle: {
+            type: ParticleType.POINT,
+            config: { radius: 4.2 },
+            count: 108,
+            lifetime: 1150,
+            lifetimeRange: 340
+          },
+          emitRate: 132,
+          shape: ParticleEmitterShape.CIRCLE,
+          position: ['5%', '18%'],
+          size: ['90%', '64%']
+        },
+        color: { range: [this.voiceParticlePrimary(), this.voiceParticleSecondary()] },
+        opacity: {
+          range: [0.28, 1.0],
+          updater: {
+            type: ParticleUpdater.CURVE,
+            config: [{ from: 1.0, to: 0.0, startMillis: 0, endMillis: 1150, curve: Curve.EaseOut }]
+          }
+        },
+        scale: {
+          range: [0.55, 1.45],
+          updater: {
+            type: ParticleUpdater.CURVE,
+            config: [{ from: 1.0, to: 0.18, startMillis: 0, endMillis: 1150, curve: Curve.EaseOut }]
+          }
+        },
+        velocity: { speed: [46, 122], angle: [0, 360] }
+      }]
+    })
+      .width('112%')
+      .height(112)
+      .translate({ y: -3 })
+      .opacity(0.96)
+      .hitTestBehavior(HitTestMode.None)
+      .zIndex(0)
+  }
+
+  @Builder
+  buildTargetParticleField(primary: ResourceColor, secondary: ResourceColor) {
+    Particle({
+      particles: [{
+        emitter: {
+          particle: {
+            type: ParticleType.POINT,
+            config: { radius: 3.8 },
+            count: 62,
+            lifetime: 860,
+            lifetimeRange: 240
+          },
+          emitRate: 88,
+          shape: ParticleEmitterShape.CIRCLE,
+          position: ['10%', '14%'],
+          size: ['80%', '72%']
+        },
+        color: { range: [primary, secondary] },
+        opacity: {
+          range: [0.42, 1.0],
+          updater: {
+            type: ParticleUpdater.CURVE,
+            config: [{ from: 1.0, to: 0.0, startMillis: 0, endMillis: 860, curve: Curve.EaseOut }]
+          }
+        },
+        scale: {
+          range: [0.65, 1.35],
+          updater: {
+            type: ParticleUpdater.CURVE,
+            config: [{ from: 1.0, to: 0.12, startMillis: 0, endMillis: 860, curve: Curve.EaseOut }]
+          }
+        },
+        velocity: { speed: [38, 96], angle: [0, 360] }
+      }]
+    })
+      .width(142)
+      .height(92)
+      .opacity(1.0)
+      .hitTestBehavior(HitTestMode.None)
+      .zIndex(0)
   }
 
   private getContext(): common.UIAbilityContext {
@@ -695,6 +813,36 @@ struct Index {
       return '#7F56D9';
     }
     return this.isVoicePressing ? '#D92D20' : '#7F56D9';
+  }
+
+  private voiceParticlePrimary(): ResourceColor {
+    if (this.voiceGestureAction === VoiceGestureAction.Send) {
+      return '#00B8FF';
+    }
+    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
+      return '#9B51E0';
+    }
+    return '#FF7A45';
+  }
+
+  private voiceParticleSecondary(): ResourceColor {
+    if (this.voiceGestureAction === VoiceGestureAction.Send) {
+      return '#2F80ED';
+    }
+    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
+      return '#FF7AD9';
+    }
+    return '#FFD166';
+  }
+
+  private voiceParticleShadow(): ResourceColor {
+    if (this.voiceGestureAction === VoiceGestureAction.Send) {
+      return '#9953D8FF';
+    }
+    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
+      return '#99C084FC';
+    }
+    return this.isVoicePressing ? '#99FF8A65' : '#665B5CE2';
   }
 
   private voiceButtonGradient(): Array<[ResourceColor, number]> {
