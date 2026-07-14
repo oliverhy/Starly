@@ -1,6 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { scanBarcode } from '@kit.ScanKit';
-import { HdsNavigation, HdsNavigationTitleMode, ScrollEffectType, hdsMaterial } from '@kit.UIDesignKit';
+import { HdsNavigation, HdsNavigationTitleMode, ScrollEffectType, hdsEffect, hdsMaterial } from '@kit.UIDesignKit';
 import { PairingConfig, parsePairingUri } from '../model/PairingConfig';
 import pairingStore from '../service/PairingStore';
 import remoteInputClient, { RemoteClientListener } from '../service/RemoteInputClient';
@@ -77,11 +77,36 @@ struct Index {
   @State lastAction: string = '';
   @State isVoicePressing: boolean = false;
   @State voiceGestureAction: VoiceGestureAction = VoiceGestureAction.Keep;
+  @State voiceLightX: number = 180;
+  @State voiceLightY: number = 29;
   private voiceStartX: number = 0;
   private voiceStartY: number = 0;
   private voicePressSequence: number = 0;
   private pendingVoiceSend: boolean = false;
   private pageScroller: Scroller = new Scroller();
+  private voiceRestEffect = new hdsEffect.HdsEffectBuilder()
+    .pressShadow(hdsEffect.PressShadowType.BLEND_GRADIENT)
+    .pointLight({
+      sourceType: hdsEffect.PointLightSourceType.SOFT,
+      illuminatedType: hdsEffect.PointLightIlluminatedType.DEFAULT_FEATHERING_BORDER,
+      options: { color: '#FFFFFFFF', intensity: 0.52, height: 42, bloom: 0.28 }
+    })
+    .buildEffect();
+  private voiceActiveEffect = new hdsEffect.HdsEffectBuilder()
+    .pressShadow(hdsEffect.PressShadowType.BLEND_GRADIENT)
+    .pointLight({
+      sourceType: hdsEffect.PointLightSourceType.BRIGHT,
+      illuminatedType: hdsEffect.PointLightIlluminatedType.BORDER_CONTENT,
+      options: { color: '#FFFFFFFF', intensity: 0.92, height: 64, bloom: 0.68 }
+    })
+    .buildEffect();
+  private targetLightEffect = new hdsEffect.HdsEffectBuilder()
+    .pointLight({
+      sourceType: hdsEffect.PointLightSourceType.BRIGHT,
+      illuminatedType: hdsEffect.PointLightIlluminatedType.BORDER_CONTENT,
+      options: { color: '#FFFFFFFF', intensity: 0.88, height: 48, bloom: 0.72 }
+    })
+    .buildEffect();
 
   aboutToAppear(): void {
     remoteInputClient.setListener(new PageRemoteListener(
@@ -372,10 +397,6 @@ struct Index {
         })
       Column({ space: 10 }) {
         Stack({ alignContent: Alignment.Center }) {
-          if (this.isVoicePressing) {
-            this.buildVoiceParticleField()
-          }
-
           Button(this.voiceButtonText())
             .width('100%')
             .height(58)
@@ -390,9 +411,10 @@ struct Index {
             })
             .border({ width: 1, color: $r('app.color.glass_border') })
             .borderRadius(29)
+            .visualEffect(this.isVoicePressing ? this.voiceActiveEffect : this.voiceRestEffect)
             .shadow({
               radius: this.isVoicePressing ? 34 : 24,
-              color: this.voiceParticleShadow(),
+              color: this.voiceLightShadow(),
               offsetY: this.isVoicePressing ? 4 : 10
             })
             .zIndex(1)
@@ -400,10 +422,14 @@ struct Index {
               this.handleVoiceTouch(event);
             })
 
+          if (this.isVoicePressing) {
+            this.buildVoiceLightField()
+          }
+
           Row() {
             Stack({ alignContent: Alignment.Center }) {
               if (this.voiceGestureAction === VoiceGestureAction.Send) {
-                this.buildTargetParticleField('#00B8FF', '#2F80ED')
+                this.buildTargetLightField()
               }
               Text('发送')
                 .width(104)
@@ -411,16 +437,18 @@ struct Index {
                 .textAlign(TextAlign.Center)
                 .fontSize(15)
                 .fontWeight(FontWeight.Medium)
-                .fontColor('#175CD3')
+                .fontColor($r('app.color.text_primary'))
                 .backgroundColor($r('app.color.glass_surface_strong'))
                 .border({
                   width: this.voiceGestureAction === VoiceGestureAction.Send ? 2 : 1,
-                  color: this.voiceGestureAction === VoiceGestureAction.Send ? '#53D8FF' : '#B9D2FF'
+                  color: this.voiceGestureAction === VoiceGestureAction.Send ? '#FFFFFFFF' : $r('app.color.glass_border')
                 })
                 .borderRadius(24)
+                .visualEffect(this.voiceGestureAction === VoiceGestureAction.Send ?
+                  this.targetLightEffect : this.voiceRestEffect)
                 .shadow({
                   radius: this.voiceGestureAction === VoiceGestureAction.Send ? 28 : 18,
-                  color: this.voiceGestureAction === VoiceGestureAction.Send ? '#9953D8FF' : '#33000000',
+                  color: this.voiceGestureAction === VoiceGestureAction.Send ? '#8FFFFFFF' : '#26000000',
                   offsetY: 6
                 })
                 .zIndex(1)
@@ -430,7 +458,7 @@ struct Index {
             Blank()
             Stack({ alignContent: Alignment.Center }) {
               if (this.voiceGestureAction === VoiceGestureAction.Edit) {
-                this.buildTargetParticleField('#9B51E0', '#FF7AD9')
+                this.buildTargetLightField()
               }
               Text('编辑')
                 .width(104)
@@ -438,16 +466,18 @@ struct Index {
                 .textAlign(TextAlign.Center)
                 .fontSize(15)
                 .fontWeight(FontWeight.Medium)
-                .fontColor('#7F56D9')
+                .fontColor($r('app.color.text_primary'))
                 .backgroundColor($r('app.color.glass_surface_strong'))
                 .border({
                   width: this.voiceGestureAction === VoiceGestureAction.Edit ? 2 : 1,
-                  color: this.voiceGestureAction === VoiceGestureAction.Edit ? '#D7A8FF' : '#D8C7F5'
+                  color: this.voiceGestureAction === VoiceGestureAction.Edit ? '#FFFFFFFF' : $r('app.color.glass_border')
                 })
                 .borderRadius(24)
+                .visualEffect(this.voiceGestureAction === VoiceGestureAction.Edit ?
+                  this.targetLightEffect : this.voiceRestEffect)
                 .shadow({
                   radius: this.voiceGestureAction === VoiceGestureAction.Edit ? 28 : 18,
-                  color: this.voiceGestureAction === VoiceGestureAction.Edit ? '#99C084FC' : '#33000000',
+                  color: this.voiceGestureAction === VoiceGestureAction.Edit ? '#8FFFFFFF' : '#26000000',
                   offsetY: 6
                 })
                 .zIndex(1)
@@ -577,88 +607,67 @@ struct Index {
   }
 
   @Builder
-  buildVoiceParticleField() {
-    Particle({
-      particles: [{
-        emitter: {
-          particle: {
-            type: ParticleType.POINT,
-            config: { radius: 4.2 },
-            count: 108,
-            lifetime: 1150,
-            lifetimeRange: 340
-          },
-          emitRate: 132,
-          shape: ParticleEmitterShape.CIRCLE,
-          position: ['5%', '18%'],
-          size: ['90%', '64%']
-        },
-        color: { range: [this.voiceParticlePrimary(), this.voiceParticleSecondary()] },
-        opacity: {
-          range: [0.28, 1.0],
-          updater: {
-            type: ParticleUpdater.CURVE,
-            config: [{ from: 1.0, to: 0.0, startMillis: 0, endMillis: 1150, curve: Curve.EaseOut }]
-          }
-        },
-        scale: {
-          range: [0.55, 1.45],
-          updater: {
-            type: ParticleUpdater.CURVE,
-            config: [{ from: 1.0, to: 0.18, startMillis: 0, endMillis: 1150, curve: Curve.EaseOut }]
-          }
-        },
-        velocity: { speed: [46, 122], angle: [0, 360] }
-      }]
-    })
-      .width('112%')
-      .height(112)
-      .translate({ y: -3 })
-      .opacity(0.96)
-      .hitTestBehavior(HitTestMode.None)
-      .zIndex(0)
+  buildVoiceLightField() {
+    Stack() {
+      Column()
+        .width(154)
+        .height(82)
+        .borderRadius(41)
+        .backgroundColor('#54FFFFFF')
+        .blur(24)
+        .position({ x: this.voiceLightX - 77, y: this.voiceLightY - 41 })
+      Column()
+        .width(62)
+        .height(62)
+        .borderRadius(31)
+        .backgroundColor('#6EFFFFFF')
+        .blur(13)
+        .position({ x: this.voiceLightX - 31, y: this.voiceLightY - 31 })
+      Column()
+        .width(20)
+        .height(20)
+        .borderRadius(10)
+        .backgroundColor('#22FFFFFF')
+        .border({ width: 1.5, color: '#F2FFFFFF' })
+        .shadow({ radius: 16, color: '#BFFFFFFF' })
+        .position({ x: this.voiceLightX - 10, y: this.voiceLightY - 10 })
+    }
+    .width('100%')
+    .height(180)
+    .translate({ y: -61 })
+    .opacity(0.94)
+    .hitTestBehavior(HitTestMode.None)
+    .zIndex(2)
   }
 
   @Builder
-  buildTargetParticleField(primary: ResourceColor, secondary: ResourceColor) {
-    Particle({
-      particles: [{
-        emitter: {
-          particle: {
-            type: ParticleType.POINT,
-            config: { radius: 3.8 },
-            count: 62,
-            lifetime: 860,
-            lifetimeRange: 240
-          },
-          emitRate: 88,
-          shape: ParticleEmitterShape.CIRCLE,
-          position: ['10%', '14%'],
-          size: ['80%', '72%']
-        },
-        color: { range: [primary, secondary] },
-        opacity: {
-          range: [0.42, 1.0],
-          updater: {
-            type: ParticleUpdater.CURVE,
-            config: [{ from: 1.0, to: 0.0, startMillis: 0, endMillis: 860, curve: Curve.EaseOut }]
-          }
-        },
-        scale: {
-          range: [0.65, 1.35],
-          updater: {
-            type: ParticleUpdater.CURVE,
-            config: [{ from: 1.0, to: 0.12, startMillis: 0, endMillis: 860, curve: Curve.EaseOut }]
-          }
-        },
-        velocity: { speed: [38, 96], angle: [0, 360] }
-      }]
-    })
-      .width(142)
-      .height(92)
-      .opacity(1.0)
-      .hitTestBehavior(HitTestMode.None)
-      .zIndex(0)
+  buildTargetLightField() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column()
+        .width(128)
+        .height(76)
+        .borderRadius(38)
+        .backgroundColor('#60FFFFFF')
+        .blur(22)
+      Column()
+        .width(52)
+        .height(52)
+        .borderRadius(26)
+        .backgroundColor('#7AFFFFFF')
+        .blur(11)
+      Column()
+        .width(14)
+        .height(14)
+        .borderRadius(7)
+        .backgroundColor('#26FFFFFF')
+        .border({ width: 1.5, color: '#FFFFFFFF' })
+        .shadow({ radius: 14, color: '#CFFFFFFF' })
+    }
+    .width(142)
+    .height(92)
+    .opacity(0.96)
+    .hitTestBehavior(HitTestMode.None)
+    .zIndex(2)
   }
 
   private getContext(): common.UIAbilityContext {
@@ -740,6 +749,8 @@ struct Index {
     if (event.type === TouchType.Down) {
       this.voiceStartX = point.x;
       this.voiceStartY = point.y;
+      this.voiceLightX = point.x;
+      this.voiceLightY = point.y;
       this.voiceGestureAction = VoiceGestureAction.Keep;
       this.isVoicePressing = true;
       this.pendingVoiceSend = false;
@@ -751,6 +762,8 @@ struct Index {
     if (event.type === TouchType.Move && this.isVoicePressing) {
       const deltaX = point.x - this.voiceStartX;
       const deltaY = point.y - this.voiceStartY;
+      this.voiceLightX = point.x;
+      this.voiceLightY = point.y;
       if (deltaY < -36 && deltaX < -28) {
         this.voiceGestureAction = VoiceGestureAction.Send;
       } else if (deltaY < -36 && deltaX > 28) {
@@ -810,34 +823,8 @@ struct Index {
     return '松手停止识别';
   }
 
-  private voiceParticlePrimary(): ResourceColor {
-    if (this.voiceGestureAction === VoiceGestureAction.Send) {
-      return '#00B8FF';
-    }
-    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
-      return '#9B51E0';
-    }
-    return '#FF7A45';
-  }
-
-  private voiceParticleSecondary(): ResourceColor {
-    if (this.voiceGestureAction === VoiceGestureAction.Send) {
-      return '#2F80ED';
-    }
-    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
-      return '#FF7AD9';
-    }
-    return '#FFD166';
-  }
-
-  private voiceParticleShadow(): ResourceColor {
-    if (this.voiceGestureAction === VoiceGestureAction.Send) {
-      return '#9953D8FF';
-    }
-    if (this.voiceGestureAction === VoiceGestureAction.Edit) {
-      return '#99C084FC';
-    }
-    return this.isVoicePressing ? '#99FF8A65' : '#665B5CE2';
+  private voiceLightShadow(): ResourceColor {
+    return this.isVoicePressing ? '#A6FFFFFF' : '#2E000000';
   }
 
   private async sendDraft(): Promise<void> {
