@@ -799,7 +799,7 @@ struct Index {
     if (Math.abs(offsetX) < 18) {
       return;
     }
-    const targetIndex = offsetX < 0 ? 1 : 0;
+    const targetIndex = offsetX > 0 ? 1 : 0;
     const targetMode = targetIndex === 0 ? 'ctrl_enter' : 'enter';
     if (this.submitMode === targetMode) {
       return;
