@@ -82,6 +82,7 @@ struct Index {
   private voicePressSequence: number = 0;
   private pendingVoiceSend: boolean = false;
   private pageScroller: Scroller = new Scroller();
+  private submitTabsController: TabsController = new TabsController();
   private voiceRestEffect = new hdsEffect.HdsEffectBuilder()
     .pressShadow(hdsEffect.PressShadowType.BLEND_GRADIENT)
     .pointLight({
@@ -497,7 +498,8 @@ struct Index {
       .width('100%')
       Tabs({
         barPosition: BarPosition.Start,
-        index: this.submitMode === 'ctrl_enter' ? 0 : 1
+        index: this.submitMode === 'ctrl_enter' ? 0 : 1,
+        controller: this.submitTabsController
       }) {
         TabContent() {
           Text('发送文字后使用 Ctrl + 回车')
@@ -615,6 +617,12 @@ struct Index {
       y: this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ? 0 : 1
     })
     .animation({ duration: 260, curve: Curve.EaseOut })
+    .parallelGesture(
+      PanGesture({ direction: PanDirection.Horizontal, distance: 8 })
+        .onActionEnd((event: GestureEvent) => {
+          this.changeSubmitModeByTabSwipe(event.offsetX);
+        })
+    )
   }
 
   @Builder
@@ -785,6 +793,18 @@ struct Index {
 
   private voiceLightShadow(): ResourceColor {
     return this.isVoicePressing ? '#A6FFFFFF' : '#2E000000';
+  }
+
+  private changeSubmitModeByTabSwipe(offsetX: number): void {
+    if (Math.abs(offsetX) < 18) {
+      return;
+    }
+    const targetIndex = offsetX < 0 ? 1 : 0;
+    const targetMode = targetIndex === 0 ? 'ctrl_enter' : 'enter';
+    if (this.submitMode === targetMode) {
+      return;
+    }
+    this.submitTabsController.changeIndex(targetIndex);
   }
 
   private async sendDraft(): Promise<void> {
