@@ -1493,6 +1493,10 @@ struct Index {
   }
 
   private async selectCodexTask(threadId: string): Promise<void> {
+    const previousThreadId = this.selectedCodexTaskId;
+    if (previousThreadId.length > 0 && this.selectedCodexStatus !== 'notLoaded') {
+      this.rememberCodexTaskStatus(previousThreadId, this.selectedCodexStatus);
+    }
     this.selectedCodexTaskId = threadId;
     this.prepareSelectedCodexTask(threadId);
     this.selectedCodexMessages = [];
@@ -1534,7 +1538,7 @@ struct Index {
       if (task.id === threadId) {
         this.selectedCodexTitle = task.title;
         this.selectedCodexCwd = task.cwd;
-        this.selectedCodexStatus = task.status;
+        this.selectedCodexStatus = this.resolvedCodexStatus(task.id, task.status);
         return;
       }
     }
@@ -1564,6 +1568,10 @@ struct Index {
 
   private rememberCodexTaskStatus(threadId: string, status: string): void {
     if (threadId.length === 0 || status.length === 0) {
+      return;
+    }
+    const cachedStatus = this.codexResolvedStatuses.get(threadId);
+    if (status === 'notLoaded' && cachedStatus !== undefined && cachedStatus !== 'notLoaded') {
       return;
     }
     this.codexResolvedStatuses.set(threadId, status);
@@ -1597,7 +1605,16 @@ struct Index {
     if (task.id === this.pendingCodexThreadId) {
       return 'active';
     }
-    return task.id === this.selectedCodexTaskId ? this.selectedCodexStatus : task.status;
+    const currentStatus = task.id === this.selectedCodexTaskId ? this.selectedCodexStatus : task.status;
+    return this.resolvedCodexStatus(task.id, currentStatus);
+  }
+
+  private resolvedCodexStatus(threadId: string, status: string): string {
+    if (status !== 'notLoaded') {
+      return status;
+    }
+    const cachedStatus = this.codexResolvedStatuses.get(threadId);
+    return cachedStatus !== undefined ? cachedStatus : status;
   }
 
   private isSelectedCodexRunning(): boolean {
