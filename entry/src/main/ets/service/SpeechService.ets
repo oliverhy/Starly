@@ -19,10 +19,6 @@ class SpeechService {
     this.listener = listener;
   }
 
-  isListening(): boolean {
-    return this.listening;
-  }
-
   async start(): Promise<boolean> {
     if (this.listening) {
       return true;
@@ -117,15 +113,6 @@ class SpeechService {
       this.listener?.onError(`结束识别失败：${JSON.stringify(error)}`);
       this.shutdownEngine();
     }
-  }
-
-  async cancel(): Promise<void> {
-    try {
-      this.engine?.cancel(this.sessionId);
-    } catch (_error) {
-    }
-    await this.release();
-    this.listener?.onStateChanged(false, '已取消');
   }
 
   async release(): Promise<void> {

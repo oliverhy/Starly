@@ -1,7 +1,18 @@
+import asyncio
+import json
+import queue
 import unittest
 import urllib.parse
 
-from pc.starly_bridge import BridgeConfig, BridgeServer, MAX_TEXT_LENGTH, find_available_port
+from pc.starly_bridge import BridgeConfig, BridgeServer, MAX_TEXT_LENGTH, WindowsInput, find_available_port
+
+
+class FakeConnection:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def send(self, message: str) -> None:
+        self.messages.append(message)
 
 
 class BridgeProtocolTests(unittest.TestCase):
@@ -28,6 +39,34 @@ class BridgeProtocolTests(unittest.TestCase):
         selected = find_available_port()
         self.assertGreater(selected, 0)
         self.assertLessEqual(selected, 65535)
+
+    def test_ctrl_enter_uses_balanced_key_sequence(self) -> None:
+        windows_input = WindowsInput.__new__(WindowsInput)
+        windows_input.foreground_window = lambda: (1, "测试窗口", 99999)
+        windows_input._keyboard_input = lambda virtual_key, scan_code, flags: (virtual_key, scan_code, flags)
+        sent: list[tuple[int, int, int]] = []
+        windows_input._send = lambda inputs: not sent.extend(inputs)
+
+        ok, _message = windows_input.press_submit("ctrl_enter")
+
+        self.assertTrue(ok)
+        self.assertEqual(sent, [
+            (WindowsInput.VK_CONTROL, WindowsInput.SCAN_CONTROL, 0),
+            (WindowsInput.VK_RETURN, WindowsInput.SCAN_RETURN, 0),
+            (WindowsInput.VK_RETURN, WindowsInput.SCAN_RETURN, WindowsInput.KEYEVENTF_KEYUP),
+            (WindowsInput.VK_CONTROL, WindowsInput.SCAN_CONTROL, WindowsInput.KEYEVENTF_KEYUP),
+        ])
+
+    def test_protocol_rejects_non_object_json(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        server.event_queue = queue.Queue()
+        connection = FakeConnection()
+
+        asyncio.run(server._handle_message(connection, "[]"))
+
+        response = json.loads(connection.messages[0])
+        self.assertEqual(response["type"], "error")
+        self.assertEqual(response["message"], "消息必须是 JSON 对象")
 
 
 if __name__ == "__main__":

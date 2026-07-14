@@ -69,7 +69,6 @@ struct Index {
   @State token: string = '';
   @State draft: string = '';
   @State isConnected: boolean = false;
-  @State isListening: boolean = false;
   @State isPairingExpanded: boolean = true;
   @State submitMode: string = 'ctrl_enter';
   @State statusText: string = '请先与电脑配对';
@@ -105,7 +104,6 @@ struct Index {
     ));
     speechService.setListener(new PageSpeechListener(
       (isListening: boolean, message: string): void => {
-        this.isListening = isListening;
         this.statusText = message;
         this.statusIsError = false;
         if (!isListening && message === '识别完成' && this.pendingVoiceSend) {
@@ -121,7 +119,6 @@ struct Index {
         }
       },
       (message: string): void => {
-        this.isListening = false;
         this.statusText = message;
         this.statusIsError = true;
       }
@@ -480,7 +477,13 @@ struct Index {
       this.statusIsError = true;
       return;
     }
-    await pairingStore.save(this.getContext(), config);
+    try {
+      await pairingStore.save(this.getContext(), config);
+    } catch (error) {
+      this.statusText = `${error}`;
+      this.statusIsError = true;
+      return;
+    }
     this.statusText = '正在连接电脑…';
     this.statusIsError = false;
     await remoteInputClient.connect(config);
@@ -488,7 +491,13 @@ struct Index {
 
   private async clearPairing(): Promise<void> {
     await remoteInputClient.disconnect();
-    await pairingStore.clear(this.getContext());
+    try {
+      await pairingStore.clear(this.getContext());
+    } catch (error) {
+      this.statusText = `${error}`;
+      this.statusIsError = true;
+      return;
+    }
     this.host = '';
     this.portText = '8765';
     this.token = '';
@@ -544,7 +553,6 @@ struct Index {
 
   private async finishVoiceHold(action: VoiceGestureAction): Promise<void> {
     this.isVoicePressing = false;
-    this.isListening = false;
     this.voiceGestureAction = VoiceGestureAction.Keep;
     this.pendingVoiceSend = action === VoiceGestureAction.Send;
     if (action === VoiceGestureAction.Send) {

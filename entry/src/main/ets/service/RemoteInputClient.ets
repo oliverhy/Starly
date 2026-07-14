@@ -16,10 +16,6 @@ class RemoteInputClient {
     this.listener = listener;
   }
 
-  isConnected(): boolean {
-    return this.connected;
-  }
-
   async connect(config: PairingConfig): Promise<boolean> {
     await this.disconnect();
     if (!config.isComplete()) {

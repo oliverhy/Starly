@@ -56,11 +56,6 @@ def find_available_port(preferred: int = DEFAULT_PORT) -> int:
     raise RuntimeError("未找到可用的局域网监听端口")
 
 
-def resource_path(relative: str) -> Path:
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    return base / relative
-
-
 class BridgeConfig:
     def __init__(self, port: int = DEFAULT_PORT, token: str = "") -> None:
         self.port = port
@@ -144,7 +139,6 @@ class WindowsInput:
 
     def __init__(self) -> None:
         self.user32 = ctypes.windll.user32
-        self.kernel32 = ctypes.windll.kernel32
 
     def foreground_window(self) -> tuple[int, str, int]:
         hwnd = int(self.user32.GetForegroundWindow())
@@ -234,7 +228,6 @@ class BridgeServer:
         self.thread: threading.Thread | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: asyncio.Event | None = None
-        self.client_count = 0
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -280,7 +273,6 @@ class BridgeServer:
             await connection.close(code=4001, reason="invalid token")
             self.event_queue.put(("error", f"拒绝了来自 {remote_ip} 的无效配对请求"))
             return
-        self.client_count += 1
         self.event_queue.put(("client", f"手机已连接：{remote_ip}"))
         await connection.send(json.dumps({
             "type": "hello",
@@ -299,7 +291,6 @@ class BridgeServer:
         except websockets.ConnectionClosed:
             pass
         finally:
-            self.client_count = max(0, self.client_count - 1)
             self.event_queue.put(("client", "手机连接已断开"))
 
     async def _handle_message(self, connection: websockets.ServerConnection, raw: str | bytes) -> None:
@@ -310,6 +301,9 @@ class BridgeServer:
             message = json.loads(raw)
         except json.JSONDecodeError:
             await self._send_error(connection, "消息格式错误")
+            return
+        if not isinstance(message, dict):
+            await self._send_error(connection, "消息必须是 JSON 对象")
             return
         message_type = message.get("type")
         message_id = str(message.get("id", ""))
@@ -408,8 +402,6 @@ class BridgeApp:
         self.root.mainloop()
 
     def _build_ui(self) -> None:
-        style = ttk.Style()
-        style.configure("Primary.TButton", padding=(14, 10))
         outer = ttk.Frame(self.root, padding=20)
         outer.pack(fill=tk.BOTH, expand=True)
         ttk.Label(outer, text="Starly 电脑端", font=("Microsoft YaHei UI", 22, "bold")).pack(anchor=tk.W)
