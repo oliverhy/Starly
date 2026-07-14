@@ -40,6 +40,16 @@ SINGLE_INSTANCE_MUTEX = "Local\\StarlyBridge.SingleInstance"
 _single_instance_handle: int | None = None
 
 
+def open_codex_thread(thread_id: str) -> bool:
+    if os.name != "nt" or not thread_id:
+        return False
+    try:
+        os.startfile(f"codex://threads/{urllib.parse.quote(thread_id, safe='')}")
+        return True
+    except OSError:
+        return False
+
+
 def acquire_single_instance() -> bool:
     global _single_instance_handle
     kernel32 = ctypes.windll.kernel32
@@ -413,8 +423,12 @@ class BridgeServer:
         assert self.codex is not None
         try:
             await self.codex.send_message(thread_id, text)
+            opened = await asyncio.to_thread(open_codex_thread, thread_id)
+            ack_message = "消息已发送给 Codex"
+            if opened:
+                ack_message += "，已在电脑打开任务"
             await connection.send(json.dumps({
-                "type": "ack", "id": message_id, "message": "消息已发送给 Codex",
+                "type": "ack", "id": message_id, "message": ack_message,
             }, ensure_ascii=False))
             await self._send_codex_thread(connection, thread_id)
             await self._schedule_codex_refresh()
