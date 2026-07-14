@@ -491,42 +491,40 @@ struct Index {
           .fontColor($r('app.color.text_secondary'))
       }
       .width('100%')
-      Row({ space: 18 }) {
-        Row({ space: 7 }) {
-          Radio({ value: 'ctrl_enter', group: 'submitMode' })
-            .checked(this.submitMode === 'ctrl_enter')
-            .onChange((isChecked: boolean) => {
-              if (isChecked) {
-                this.submitMode = 'ctrl_enter';
-              }
-            })
-          Text('Ctrl + 回车')
-            .fontSize(14)
-            .fontColor($r('app.color.text_primary'))
+      Tabs({
+        barPosition: BarPosition.Start,
+        index: this.submitMode === 'ctrl_enter' ? 0 : 1
+      }) {
+        TabContent() {
+          Text('发送文字后使用 Ctrl + 回车')
+            .width('100%')
+            .height(30)
+            .textAlign(TextAlign.Center)
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
         }
-        .onClick(() => {
-          this.submitMode = 'ctrl_enter';
-        })
+        .tabBar(this.buildSubmitModeTab(0, 'Ctrl + 回车'))
 
-        Row({ space: 7 }) {
-          Radio({ value: 'enter', group: 'submitMode' })
-            .checked(this.submitMode === 'enter')
-            .onChange((isChecked: boolean) => {
-              if (isChecked) {
-                this.submitMode = 'enter';
-              }
-            })
-          Text('回车')
-            .fontSize(14)
-            .fontColor($r('app.color.text_primary'))
+        TabContent() {
+          Text('发送文字后只按一次回车')
+            .width('100%')
+            .height(30)
+            .textAlign(TextAlign.Center)
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
         }
-        .onClick(() => {
-          this.submitMode = 'enter';
-        })
+        .tabBar(this.buildSubmitModeTab(1, '回车'))
       }
       .width('100%')
-      .justifyContent(FlexAlign.Center)
-      .padding({ top: 8, bottom: 8, left: 12, right: 12 })
+      .height(82)
+      .barHeight(46)
+      .barMode(BarMode.Fixed)
+      .scrollable(true)
+      .animationDuration(180)
+      .onChange((index: number) => {
+        this.submitMode = index === 0 ? 'ctrl_enter' : 'enter';
+      })
+      .padding({ top: 4, bottom: 2, left: 6, right: 6 })
       .backgroundColor($r('app.color.input_background'))
       .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
         colorMode: ThemeColorMode.SYSTEM,
@@ -575,6 +573,34 @@ struct Index {
     .border({ width: 1, color: $r('app.color.glass_border') })
     .borderRadius(28)
     .shadow({ radius: 30, color: $r('app.color.glass_shadow'), offsetY: 12 })
+  }
+
+  @Builder
+  buildSubmitModeTab(index: number, label: string) {
+    Row() {
+      Text(label)
+        .fontSize(14)
+        .fontWeight(this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ?
+          FontWeight.Medium : FontWeight.Regular)
+        .fontColor(this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ?
+          $r('app.color.text_primary') : $r('app.color.text_secondary'))
+    }
+    .width('94%')
+    .height(38)
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor(this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ?
+      $r('app.color.glass_surface_strong') : Color.Transparent)
+    .border({
+      width: 1,
+      color: this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ?
+        $r('app.color.glass_border') : Color.Transparent
+    })
+    .borderRadius(19)
+    .shadow({
+      radius: this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ? 10 : 0,
+      color: $r('app.color.glass_shadow'),
+      offsetY: 3
+    })
   }
 
   @Builder
