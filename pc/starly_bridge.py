@@ -466,6 +466,10 @@ class BridgeServer:
         # The bridge and Codex Desktop are separate app-server clients. Release
         # the bridge-owned runtime completely so the desktop can reload the
         # persisted turn instead of keeping its stale in-memory copy.
+        if self.codex_refresh_task and not self.codex_refresh_task.done():
+            self.codex_refresh_task.cancel()
+            await asyncio.gather(self.codex_refresh_task, return_exceptions=True)
+        self.codex_refresh_task = None
         if self.codex:
             await self.codex.release_thread(thread_id)
             await self.codex.stop()
@@ -490,6 +494,12 @@ class BridgeServer:
             return
         snapshot = await self.codex.snapshot()
         await self._broadcast({"type": "codex_snapshot", **snapshot})
+        if bool(snapshot.get("available", False)):
+            await self._broadcast({
+                "type": "codex_event",
+                "event": "codex/refreshReady",
+                "params": {},
+            })
 
     async def _broadcast(self, message: dict[str, object]) -> None:
         if not self.connections:

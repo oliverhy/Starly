@@ -148,6 +148,7 @@ class BridgeProtocolTests(unittest.TestCase):
 
     def test_completed_turn_releases_bridge_runtime_before_desktop_open(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
+        server.codex_refresh_task = None
         order: list[str] = []
 
         class FakeCodex:
@@ -178,6 +179,25 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(order, [
             "release:thread-1", "stop", "open:thread-1", "desktop/opened", "refresh",
         ])
+
+    def test_codex_refresh_announces_when_reads_are_safe_again(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        server.connections = {object()}
+        events: list[str] = []
+
+        class FakeCodex:
+            async def snapshot(self) -> dict[str, object]:
+                return {"available": True, "quota": {}, "threads": []}
+
+        async def fake_broadcast(message: dict[str, object]) -> None:
+            events.append(str(message.get("event", message.get("type", ""))))
+
+        server.codex = FakeCodex()
+        server._broadcast = fake_broadcast
+
+        asyncio.run(server._delayed_codex_refresh())
+
+        self.assertEqual(events, ["codex_snapshot", "codex/refreshReady"])
 
 
 if __name__ == "__main__":

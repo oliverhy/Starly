@@ -209,6 +209,8 @@ struct Index {
         this.codexLoading = false;
       },
       (event: string, threadId: string): void => {
+        let shouldRefreshSnapshot = false;
+        let shouldRefreshThread = false;
         if (event === 'desktop/opened' && threadId === this.selectedCodexTaskId) {
           this.statusText = '任务已完成，电脑端已打开';
           this.statusIsError = false;
@@ -221,6 +223,8 @@ struct Index {
           if (threadId === this.selectedCodexTaskId) {
             this.selectedCodexStatus = 'active';
           }
+          shouldRefreshSnapshot = true;
+          shouldRefreshThread = true;
         } else if (event === 'turn/completed' && threadId.length > 0) {
           if (threadId === this.pendingCodexThreadId) {
             this.pendingCodexThreadId = '';
@@ -229,9 +233,18 @@ struct Index {
           if (threadId === this.selectedCodexTaskId) {
             this.selectedCodexStatus = 'idle';
           }
+          // The bridge may now be handing the thread back to Codex Desktop.
+          // Wait for codex/refreshReady instead of racing the app-server stop.
+        } else if (event === 'codex/refreshReady') {
+          shouldRefreshThread = true;
+        } else if (event === 'thread/status/changed' ||
+          event === 'account/rateLimits/updated') {
+          shouldRefreshSnapshot = true;
         }
-        remoteInputClient.requestCodexSnapshot();
-        if (this.selectedCodexTaskId.length > 0) {
+        if (shouldRefreshSnapshot) {
+          remoteInputClient.requestCodexSnapshot();
+        }
+        if (shouldRefreshThread && this.selectedCodexTaskId.length > 0) {
           remoteInputClient.requestCodexThread(this.selectedCodexTaskId);
         }
       }
