@@ -262,17 +262,24 @@ struct Index {
           .fontSize(14)
           .fontWeight(FontWeight.Medium)
           .fontColor(this.statusIsError ? '#B42318' : $r('app.color.text_primary'))
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
         if (this.lastAction.length > 0) {
           Text(this.lastAction)
             .fontSize(12)
             .fontColor($r('app.color.text_secondary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
             .margin({ top: 3 })
         }
       }
+      .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
-      .margin({ left: 10 })
-      Blank()
+      .margin({ left: 10, right: 8 })
       Text(this.isPairingExpanded ? '收起' : '配对')
+        .width(52)
+        .textAlign(TextAlign.End)
+        .maxLines(1)
         .fontSize(13)
         .fontColor('#175CD3')
         .onClick(() => {
