@@ -210,17 +210,29 @@ class CodexAppServerClient:
     async def stop(self) -> None:
         process = self.process
         self.process = None
+        tasks = [task for task in (self.reader_task, self.stderr_task) if task]
+        self.reader_task = None
+        self.stderr_task = None
         if process and process.returncode is None:
             process.terminate()
             try:
                 await asyncio.wait_for(process.wait(), timeout=2)
             except asyncio.TimeoutError:
                 process.kill()
-        for task in (self.reader_task, self.stderr_task):
-            if task:
+                await process.wait()
+        current_task = asyncio.current_task()
+        wait_tasks: list[asyncio.Task[None]] = []
+        for task in tasks:
+            if task is not current_task:
                 task.cancel()
-        self.reader_task = None
-        self.stderr_task = None
+                wait_tasks.append(task)
+        if wait_tasks:
+            await asyncio.gather(*wait_tasks, return_exceptions=True)
+        restart_error = RuntimeError("Codex 服务正在重新连接")
+        for future in list(self.pending.values()):
+            if not future.done():
+                future.set_exception(restart_error)
+        self.pending.clear()
 
     async def request(self, method: str, params: JsonObject | None = None,
                       timeout: float = 15) -> JsonObject:
@@ -237,20 +249,32 @@ class CodexAppServerClient:
             self.pending.pop(request_id, None)
 
     async def snapshot(self) -> JsonObject:
-        try:
-            rate, usage, threads = await asyncio.gather(
-                self.request("account/rateLimits/read"),
-                self.request("account/usage/read"),
-                self.request("thread/list", {"limit": 30, "archived": False}),
-            )
-            snapshot = normalize_snapshot(rate, usage, threads)
-            for thread in snapshot["threads"]:
-                thread_id = str(thread.get("id", ""))
-                if thread_id in self.thread_status:
-                    thread["status"] = self.thread_status[thread_id]
-            return snapshot
-        except Exception as error:
-            return {"available": False, "error": str(error), "quota": {}, "threads": []}
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                rate, usage, threads = await asyncio.gather(
+                    self.request("account/rateLimits/read"),
+                    self.request("account/usage/read"),
+                    self.request("thread/list", {"limit": 30, "archived": False}),
+                )
+                snapshot = normalize_snapshot(rate, usage, threads)
+                for thread in snapshot["threads"]:
+                    thread_id = str(thread.get("id", ""))
+                    if thread_id in self.thread_status:
+                        thread["status"] = self.thread_status[thread_id]
+                return snapshot
+            except Exception as error:
+                last_error = error
+                has_active_turn = any(status == "active" for status in self.thread_status.values())
+                if attempt == 0 and not has_active_turn:
+                    await self.stop()
+                    await asyncio.sleep(0.2)
+                    continue
+                break
+        error_text = str(last_error or "").strip()
+        if not error_text and last_error is not None:
+            error_text = type(last_error).__name__
+        return {"available": False, "error": error_text, "quota": {}, "threads": []}
 
     async def thread_detail(self, thread_id: str) -> JsonObject:
         response = await self.request("thread/read", {"threadId": thread_id, "includeTurns": True})

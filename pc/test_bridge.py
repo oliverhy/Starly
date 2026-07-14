@@ -79,6 +79,33 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["quota"]["plan"], "prolite")
         self.assertEqual(snapshot["quota"]["lifetimeTokens"], 9000)
 
+    def test_codex_snapshot_restarts_stalled_idle_client_once(self) -> None:
+        client = CodexAppServerClient()
+        failures = 0
+        stops = 0
+
+        async def fake_request(method: str, _params: dict[str, object] | None = None,
+                               timeout: float = 15) -> dict[str, object]:
+            nonlocal failures
+            _ = timeout
+            if method == "account/rateLimits/read" and failures == 0:
+                failures += 1
+                raise TimeoutError()
+            if method == "thread/list":
+                return {"data": []}
+            return {}
+
+        async def fake_stop() -> None:
+            nonlocal stops
+            stops += 1
+
+        client.request = fake_request
+        client.stop = fake_stop
+        snapshot = asyncio.run(client.snapshot())
+
+        self.assertTrue(snapshot["available"])
+        self.assertEqual(stops, 1)
+
     def test_codex_thread_title_falls_back_to_workspace(self) -> None:
         thread = normalize_thread({"id": "t1", "name": "\ufffd\ufffd", "cwd": r"C:\work\Starly"})
         self.assertEqual(thread["title"], "Starly")
