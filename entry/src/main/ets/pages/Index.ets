@@ -77,8 +77,6 @@ struct Index {
   @State lastAction: string = '';
   @State isVoicePressing: boolean = false;
   @State voiceGestureAction: VoiceGestureAction = VoiceGestureAction.Keep;
-  @State voiceLightX: number = 180;
-  @State voiceLightY: number = 29;
   private voiceStartX: number = 0;
   private voiceStartY: number = 0;
   private voicePressSequence: number = 0;
@@ -422,15 +420,8 @@ struct Index {
               this.handleVoiceTouch(event);
             })
 
-          if (this.isVoicePressing) {
-            this.buildVoiceLightField()
-          }
-
           Row() {
             Stack({ alignContent: Alignment.Center }) {
-              if (this.voiceGestureAction === VoiceGestureAction.Send) {
-                this.buildTargetLightField()
-              }
               Text('发送')
                 .width(104)
                 .height(48)
@@ -457,9 +448,6 @@ struct Index {
               .height(48)
             Blank()
             Stack({ alignContent: Alignment.Center }) {
-              if (this.voiceGestureAction === VoiceGestureAction.Edit) {
-                this.buildTargetLightField()
-              }
               Text('编辑')
                 .width(104)
                 .height(48)
@@ -606,55 +594,6 @@ struct Index {
       .borderRadius(18)
   }
 
-  @Builder
-  buildVoiceLightField() {
-    Stack() {
-      Column()
-        .width(154)
-        .height(82)
-        .borderRadius(41)
-        .backgroundColor('#54FFFFFF')
-        .blur(24)
-        .position({ x: this.voiceLightX - 77, y: this.voiceLightY - 41 })
-      Column()
-        .width(62)
-        .height(62)
-        .borderRadius(31)
-        .backgroundColor('#6EFFFFFF')
-        .blur(13)
-        .position({ x: this.voiceLightX - 31, y: this.voiceLightY - 31 })
-    }
-    .width('100%')
-    .height(180)
-    .translate({ y: -61 })
-    .opacity(0.94)
-    .hitTestBehavior(HitTestMode.None)
-    .zIndex(2)
-  }
-
-  @Builder
-  buildTargetLightField() {
-    Stack({ alignContent: Alignment.Center }) {
-      Column()
-        .width(128)
-        .height(76)
-        .borderRadius(38)
-        .backgroundColor('#60FFFFFF')
-        .blur(22)
-      Column()
-        .width(52)
-        .height(52)
-        .borderRadius(26)
-        .backgroundColor('#7AFFFFFF')
-        .blur(11)
-    }
-    .width(142)
-    .height(92)
-    .opacity(0.96)
-    .hitTestBehavior(HitTestMode.None)
-    .zIndex(2)
-  }
-
   private getContext(): common.UIAbilityContext {
     return this.getUIContext().getHostContext() as common.UIAbilityContext;
   }
@@ -734,8 +673,6 @@ struct Index {
     if (event.type === TouchType.Down) {
       this.voiceStartX = point.x;
       this.voiceStartY = point.y;
-      this.voiceLightX = point.x;
-      this.voiceLightY = point.y;
       this.voiceGestureAction = VoiceGestureAction.Keep;
       this.isVoicePressing = true;
       this.pendingVoiceSend = false;
@@ -747,8 +684,6 @@ struct Index {
     if (event.type === TouchType.Move && this.isVoicePressing) {
       const deltaX = point.x - this.voiceStartX;
       const deltaY = point.y - this.voiceStartY;
-      this.voiceLightX = point.x;
-      this.voiceLightY = point.y;
       if (deltaY < -36 && deltaX < -28) {
         this.voiceGestureAction = VoiceGestureAction.Send;
       } else if (deltaY < -36 && deltaX > 28) {
