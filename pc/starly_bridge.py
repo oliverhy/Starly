@@ -401,7 +401,10 @@ class BridgeServer:
             await self._send_codex_thread(connection, thread_id)
             await self._schedule_codex_refresh()
         except Exception as error:
-            await self._send_error(connection, f"发送给 Codex 失败：{error}", message_id)
+            error_text = str(error)
+            if "thread not found" in error_text.lower():
+                error_text = "任务暂时无法恢复，请刷新任务列表后重新选择"
+            await self._send_error(connection, f"发送给 Codex 失败：{error_text}", message_id)
 
     async def _codex_interrupt(self, connection: websockets.ServerConnection, thread_id: str,
                                turn_id: str, message_id: str) -> None:

@@ -37,6 +37,14 @@ def _status_type(value: object) -> str:
     return str(value or "notLoaded")
 
 
+def _rpc_error_text(value: object) -> str:
+    if isinstance(value, dict):
+        message = str(value.get("message", "") or "").strip()
+        if message:
+            return message
+    return str(value)
+
+
 def normalize_thread(thread: JsonObject) -> JsonObject:
     cwd = str(thread.get("cwd", ""))
     title = _usable_text(thread.get("name"))
@@ -213,6 +221,10 @@ class CodexAppServerClient:
         return normalized
 
     async def send_message(self, thread_id: str, text: str) -> JsonObject:
+        # thread/list and thread/read can see persisted history without loading
+        # it into this app-server process. turn/start only accepts a running or
+        # resumed thread, so restore the selected history first.
+        await self.request("thread/resume", {"threadId": thread_id})
         detail = await self.thread_detail(thread_id)
         input_items = [{"type": "text", "text": text}]
         active_turn_id = str(detail.get("activeTurnId", ""))
@@ -254,7 +266,7 @@ class CodexAppServerClient:
                 future = self.pending.get(request_id)
                 if future and not future.done():
                     if "error" in message:
-                        future.set_exception(RuntimeError(str(message["error"])))
+                        future.set_exception(RuntimeError(_rpc_error_text(message["error"])))
                     else:
                         result = message.get("result")
                         future.set_result(result if isinstance(result, dict) else {})

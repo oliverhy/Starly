@@ -5,7 +5,7 @@ import unittest
 import urllib.parse
 
 from pc.starly_bridge import BridgeConfig, BridgeServer, MAX_TEXT_LENGTH, WindowsInput, find_available_port
-from pc.codex_client import normalize_snapshot, normalize_thread
+from pc.codex_client import CodexAppServerClient, normalize_snapshot, normalize_thread
 
 
 class FakeConnection:
@@ -82,6 +82,25 @@ class BridgeProtocolTests(unittest.TestCase):
     def test_codex_thread_title_falls_back_to_workspace(self) -> None:
         thread = normalize_thread({"id": "t1", "name": "\ufffd\ufffd", "cwd": r"C:\work\Starly"})
         self.assertEqual(thread["title"], "Starly")
+
+    def test_codex_message_resumes_persisted_thread_before_turn(self) -> None:
+        client = CodexAppServerClient()
+        calls: list[str] = []
+
+        async def fake_request(method: str, _params: dict[str, object] | None = None,
+                               timeout: float = 15) -> dict[str, object]:
+            _ = timeout
+            calls.append(method)
+            return {}
+
+        async def fake_detail(_thread_id: str) -> dict[str, object]:
+            return {"activeTurnId": ""}
+
+        client.request = fake_request
+        client.thread_detail = fake_detail
+        asyncio.run(client.send_message("thread-1", "继续处理"))
+
+        self.assertEqual(calls, ["thread/resume", "turn/start"])
 
 
 if __name__ == "__main__":
