@@ -395,12 +395,22 @@ struct Index {
         })
       Column({ space: 10 }) {
         Stack({ alignContent: Alignment.Center }) {
-          Button(this.voiceButtonText())
+          Button() {
+            Column({ space: 2 }) {
+              Text(this.voiceButtonText())
+                .fontSize(17)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_primary'))
+              Text('按住说话，松手停止识别')
+                .fontSize(11)
+                .fontColor($r('app.color.text_secondary'))
+            }
             .width('100%')
-            .height(58)
-            .fontSize(17)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.text_primary'))
+            .justifyContent(FlexAlign.Center)
+          }
+            .width('100%')
+            .height(66)
+            .padding(0)
             .backgroundColor($r('app.color.glass_surface_strong'))
             .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
               colorMode: ThemeColorMode.SYSTEM,
@@ -408,7 +418,7 @@ struct Index {
               scale: 0.82
             })
             .border({ width: 1, color: $r('app.color.glass_border') })
-            .borderRadius(29)
+            .borderRadius(33)
             .visualEffect(this.isVoicePressing ? this.voiceActiveEffect : this.voiceRestEffect)
             .shadow({
               radius: this.isVoicePressing ? 34 : 24,
@@ -482,13 +492,7 @@ struct Index {
           .zIndex(2)
         }
         .width('100%')
-        .height(58)
-
-        Text('按住说话，松手停止识别')
-          .width('100%')
-          .textAlign(TextAlign.Center)
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
+        .height(66)
       }
       .width('100%')
       Tabs({
