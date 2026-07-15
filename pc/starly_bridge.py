@@ -900,10 +900,12 @@ class BridgeApp:
                 self.connected_devices.discard(message)
                 self._refresh_paired_devices()
                 display_message = f"手机已断开：{message}"
+            elif event_type == "wire":
+                display_message = self._compact_wire_message(message)
             else:
                 display_message = message
             self.status_var.set(display_message)
-            self._append_log(display_message)
+            self._append_log(display_message, file_message=message if event_type == "wire" else None)
             if event_type == "action":
                 try:
                     import winsound
@@ -930,8 +932,42 @@ class BridgeApp:
             self.qr_body.pack(fill=tk.X)
             self.qr_toggle_button.configure(text="收起二维码")
 
-    def _append_log(self, message: str) -> None:
+    @staticmethod
+    def _compact_wire_message(message: str) -> str:
+        """Keep the live window readable while retaining the full wire record on disk."""
+        brace = message.find("{")
+        if brace < 0:
+            return message[:280] + ("…" if len(message) > 280 else "")
+        prefix = message[:brace].strip()
+        try:
+            payload = json.loads(message[brace:])
+        except (TypeError, ValueError):
+            return message[:280] + ("…" if len(message) > 280 else "")
+        message_type = str(payload.get("type", "消息"))
+        if message_type == "codex_snapshot":
+            tasks = payload.get("threads")
+            task_count = len(tasks) if isinstance(tasks, list) else 0
+            return f"{prefix} {message_type}（任务 {task_count} 个）"
+        if message_type == "codex_thread":
+            thread = payload.get("thread")
+            if isinstance(thread, dict):
+                title = str(thread.get("title", "任务"))[:36]
+                messages = thread.get("messages")
+                count = len(messages) if isinstance(messages, list) else 0
+                return f"{prefix} {message_type}（{title}，对话 {count} 条）"
+        if message_type == "codex_event":
+            return f"{prefix} codex_event（{payload.get('event', '状态更新')}）"
+        if message_type in ("ack", "error"):
+            return f"{prefix} {message_type}：{str(payload.get('message', ''))[:100]}"
+        if message_type in ("input", "codex_send"):
+            text = str(payload.get("text", "")).replace("\r", " ").replace("\n", " ")
+            return f"{prefix} {message_type}：{text[:100]}"
+        return f"{prefix} {message_type}"
+
+    def _append_log(self, message: str, file_message: str | None = None) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S  ")
         line = time.strftime("%Y-%m-%d %H:%M:%S  ") + message
+        file_line = timestamp + (file_message if file_message is not None else message)
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, line + "\n")
         self.log_text.see(tk.END)
@@ -939,7 +975,7 @@ class BridgeApp:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             with LOG_PATH.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+                handle.write(file_line + "\n")
         except OSError:
             # The live UI log remains available even if the disk log cannot be written.
             pass
@@ -952,7 +988,10 @@ class BridgeApp:
         if not lines:
             return
         self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, "—— 已加载最近运行记录 ——\n" + "\n".join(lines) + "\n")
+        compact_lines = [self._compact_wire_message(line) if "手机→电脑" in line or
+                         "电脑→手机" in line else line for line in lines]
+        self.log_text.insert(tk.END, "—— 已加载最近运行记录 ——\n" +
+                             "\n".join(compact_lines) + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
 

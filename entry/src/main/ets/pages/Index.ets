@@ -126,6 +126,7 @@ struct Index {
   private lastCodexTaskTapId: string = '';
   private lastCodexTaskTapAt: number = 0;
   private codexAutoRefreshTimer: number = -1;
+  private codexAutoRefreshInFlight: boolean = false;
   private codexResolvedStatuses: Map<string, string> = new Map<string, string>();
   private pageScroller: Scroller = new Scroller();
   private submitTabsController: TabsController = new TabsController();
@@ -1607,10 +1608,7 @@ struct Index {
       if (!this.isConnected || this.mainSection !== 'codex') {
         return;
       }
-      remoteInputClient.requestCodexSnapshot();
-      if (this.selectedCodexTaskId.length > 0) {
-        remoteInputClient.requestCodexThread(this.selectedCodexTaskId);
-      }
+      this.refreshCodexAutomatically();
     }, 2000);
   }
 
@@ -1620,6 +1618,30 @@ struct Index {
     }
     clearInterval(this.codexAutoRefreshTimer);
     this.codexAutoRefreshTimer = -1;
+  }
+
+  private async refreshCodexAutomatically(): Promise<void> {
+    if (this.codexAutoRefreshInFlight || !this.isConnected || this.mainSection !== 'codex') {
+      return;
+    }
+    this.codexAutoRefreshInFlight = true;
+    try {
+      // The bridge rate-limits requests that arrive within 120 ms. Read the
+      // list first, then read the selected task after a short gap so the
+      // detail response is not rejected as a burst request.
+      await remoteInputClient.requestCodexSnapshot();
+      if (this.selectedCodexTaskId.length > 0) {
+        await new Promise<void>((resolve: () => void) => {
+          setTimeout(resolve, 180);
+        });
+        if (this.isConnected && this.mainSection === 'codex' &&
+          this.selectedCodexTaskId.length > 0) {
+          await remoteInputClient.requestCodexThread(this.selectedCodexTaskId);
+        }
+      }
+    } finally {
+      this.codexAutoRefreshInFlight = false;
+    }
   }
 
   private async sendDraft(): Promise<void> {
