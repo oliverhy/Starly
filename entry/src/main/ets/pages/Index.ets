@@ -1,6 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { scanBarcode } from '@kit.ScanKit';
-import { HdsNavigation, HdsNavigationTitleMode, ScrollEffectType, hdsEffect, hdsMaterial } from '@kit.UIDesignKit';
+import { HdsNavigation, hdsEffect } from '@kit.UIDesignKit';
 import { PairingConfig, parsePairingUri } from '../model/PairingConfig';
 import {
   CodexMessage, CodexQuota, CodexSnapshot, CodexTask, CodexThreadDetail,
@@ -355,7 +355,8 @@ struct Index {
       this.buildAmbientBackground();
       HdsNavigation() {
         Column({ space: 12 }) {
-          this.buildMainSectionTabs(this.mainSection);
+          this.buildFixedHeader();
+          this.buildMainSectionTabs();
           Stack({ alignContent: Alignment.TopStart }) {
             this.buildMainSectionPage('codex', this.codexPageScroller);
             this.buildMainSectionPage('voice', this.voicePageScroller);
@@ -369,67 +370,33 @@ struct Index {
               this.mainSectionViewportWidth = width;
             }
           })
+          .parallelGesture(
+            PanGesture({ direction: PanDirection.Horizontal, distance: 10 })
+              .onActionStart(() => {
+                this.beginMainSectionSwipe();
+              })
+              .onActionUpdate((event: GestureEvent) => {
+                this.updateMainSectionSwipe(event.offsetX);
+              })
+              .onActionEnd((event: GestureEvent) => {
+                this.finishMainSectionSwipe(event.offsetX);
+              })
+              .onActionCancel(() => {
+                this.cancelMainSectionSwipe();
+              })
+          )
         }
         .width('100%')
         .height('100%')
-        .padding({ left: 18, right: 18, top: 12 })
+        .padding({ left: 18, right: 18, top: 8 })
       }
-      .titleBar({
-        content: {
-          title: {
-            mainTitle: 'Starly'
-          }
-        },
-        style: {
-          scrollEffectOpts: {
-            enableScrollEffect: true,
-            scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR
-          },
-          originalStyle: {
-            backgroundStyle: {
-              backgroundColor: '#00FFFFFF',
-              blurRadius: 56
-            }
-          },
-          scrollEffectStyle: {
-            backgroundStyle: {
-              backgroundColor: $r('app.color.glass_surface_strong'),
-              blurRadius: 72
-            }
-          },
-          thermoCtrl: true,
-          systemMaterialEffect: {
-            materialType: hdsMaterial.MaterialType.IMMERSIVE,
-            materialLevel: hdsMaterial.MaterialLevel.EXQUISITE
-          }
-        },
-        enableComponentSafeArea: true
-      })
-      .titleMode(HdsNavigationTitleMode.FREE)
       .hideBackButton(true)
       .mode(NavigationMode.Stack)
-      .bindToScrollable([this.voicePageScroller, this.codexPageScroller])
       .width('100%')
       .height('100%')
-      .parallelGesture(
-        PanGesture({ direction: PanDirection.Horizontal, distance: 10 })
-          .onActionStart(() => {
-            this.beginMainSectionSwipe();
-          })
-          .onActionUpdate((event: GestureEvent) => {
-            this.updateMainSectionSwipe(event.offsetX);
-          })
-          .onActionEnd((event: GestureEvent) => {
-            this.finishMainSectionSwipe(event.offsetX);
-          })
-          .onActionCancel(() => {
-            this.cancelMainSectionSwipe();
-          })
-      )
       if (this.isPairingOverlayMounted) {
         this.buildPairingOverlay();
       }
-      this.buildTitleConnectionOverlay();
     }
     .width('100%')
     .height('100%')
@@ -489,15 +456,18 @@ struct Index {
   }
 
   @Builder
-  buildTitleConnectionOverlay() {
+  buildFixedHeader() {
     Row() {
+      Text('Starly')
+        .fontSize(26)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('app.color.text_primary'))
       Blank()
       this.buildTitleConnectionStatus();
     }
     .width('100%')
-    .padding({ right: 18 })
-    .position({ x: 0, y: 60 })
-    .zIndex(30)
+    .height(52)
+    .alignItems(VerticalAlign.Center)
   }
 
   @Builder
@@ -641,10 +611,10 @@ struct Index {
   }
 
   @Builder
-  buildMainSectionTabs(activeSection: string) {
+  buildMainSectionTabs() {
     Row() {
-      this.buildMainSectionButton('voice', '语音输入', activeSection)
-      this.buildMainSectionButton('codex', 'Codex 任务', activeSection)
+      this.buildMainSectionButton('voice', '语音输入')
+      this.buildMainSectionButton('codex', 'Codex 任务')
     }
     .width('100%')
     .height(50)
@@ -660,22 +630,21 @@ struct Index {
   }
 
   @Builder
-  buildMainSectionButton(value: string, label: string, activeSection: string) {
-    Text(label)
+  buildMainSectionButton(value: string, label: string) {
+    Button(label)
       .layoutWeight(1)
       .height(40)
-      .textAlign(TextAlign.Center)
       .fontSize(15)
-      .fontWeight(activeSection === value ? FontWeight.Medium : FontWeight.Regular)
-      .fontColor(activeSection === value ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
-      .backgroundColor(activeSection === value ? $r('app.color.glass_surface_strong') : Color.Transparent)
+      .fontWeight(this.mainSection === value ? FontWeight.Medium : FontWeight.Regular)
+      .fontColor(this.mainSection === value ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
+      .backgroundColor(this.mainSection === value ? $r('app.color.glass_surface_strong') : Color.Transparent)
       .border({
         width: 1,
-        color: activeSection === value ? $r('app.color.glass_border') : Color.Transparent
+        color: this.mainSection === value ? $r('app.color.glass_border') : Color.Transparent
       })
       .borderRadius(20)
       .shadow({
-        radius: activeSection === value ? 12 : 0,
+        radius: this.mainSection === value ? 12 : 0,
         color: $r('app.color.glass_shadow'),
         offsetY: 4
       })
@@ -683,6 +652,12 @@ struct Index {
       .onClick(() => {
         this.animateMainSectionTo(value);
       })
+      .priorityGesture(
+        TapGesture()
+          .onAction(() => {
+            this.animateMainSectionTo(value);
+          })
+      )
   }
 
   @Builder
@@ -1034,7 +1009,7 @@ struct Index {
           }
           .width('100%')
           .onClick(() => {
-            this.isCodexConversationOpen = true;
+            this.openCodexConversation();
           })
           ForEach(this.selectedCodexMessages.slice(-5), (message: CodexMessage, index: number) => {
             Column({ space: 5 }) {
@@ -1076,7 +1051,7 @@ struct Index {
             .backgroundColor($r('app.color.input_background'))
             .borderRadius(14)
             .onClick(() => {
-              this.isCodexConversationOpen = true;
+              this.openCodexConversation();
             })
           }, (_message: CodexMessage, index: number): string =>
             `${this.selectedCodexTaskId}-${this.codexDetailVersion}-${index}`)
@@ -1737,11 +1712,11 @@ struct Index {
     this.updateMainSectionSwipe(offsetX);
     const threshold = Math.min(72, this.mainSectionViewportWidth * 0.2);
     if (this.mainSection === 'voice' && this.mainSectionDragOffset > threshold) {
-      this.settleMainSection('codex', this.mainSectionViewportWidth);
+      this.settleMainSection('codex');
       return;
     }
     if (this.mainSection === 'codex' && this.mainSectionDragOffset < -threshold) {
-      this.settleMainSection('voice', -this.mainSectionViewportWidth);
+      this.settleMainSection('voice');
       return;
     }
     this.cancelMainSectionSwipe();
@@ -1768,25 +1743,37 @@ struct Index {
     if (targetSection === this.mainSection || this.mainSectionAnimating) {
       return;
     }
-    const targetOffset = targetSection === 'codex' ? this.mainSectionViewportWidth :
-      -this.mainSectionViewportWidth;
-    this.settleMainSection(targetSection, targetOffset);
+    this.settleMainSection(targetSection);
   }
 
-  private settleMainSection(targetSection: string, targetOffset: number): void {
+  private settleMainSection(targetSection: string): void {
+    const currentDragOffset = this.mainSectionDragOffset;
+    const adjustedOffset = targetSection === 'codex' ?
+      currentDragOffset - this.mainSectionViewportWidth :
+      currentDragOffset + this.mainSectionViewportWidth;
     this.mainSectionAnimating = true;
+    this.mainSection = targetSection;
+    this.mainSectionDragOffset = adjustedOffset;
+    this.onMainSectionChanged(targetSection);
     this.getUIContext().animateTo({
       duration: 320,
       curve: Curve.FastOutSlowIn,
       onFinish: () => {
-        this.mainSection = targetSection;
         this.mainSectionDragOffset = 0;
         this.mainSectionAnimating = false;
-        this.onMainSectionChanged(targetSection);
       }
     }, () => {
-      this.mainSectionDragOffset = targetOffset;
+      this.mainSectionDragOffset = 0;
     });
+  }
+
+  private openCodexConversation(): void {
+    if (this.mainSection !== 'codex') {
+      this.mainSection = 'codex';
+      this.mainSectionDragOffset = 0;
+      this.onMainSectionChanged('codex');
+    }
+    this.isCodexConversationOpen = true;
   }
 
   private onMainSectionChanged(targetSection: string): void {
