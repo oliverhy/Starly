@@ -834,9 +834,16 @@ class BridgeApp:
         ttk.Button(options, text="最小化到托盘", command=self.hide_to_tray).pack(side=tk.LEFT)
         ttk.Button(options, text="设置开机启动", command=self.enable_autostart).pack(side=tk.LEFT, padx=8)
         ttk.Button(options, text="取消开机启动", command=self.disable_autostart).pack(side=tk.LEFT)
-        ttk.Label(outer, text="运行记录", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor=tk.W)
-        self.log_text = tk.Text(outer, height=10, state=tk.DISABLED, wrap=tk.WORD, relief=tk.FLAT, background="#F2F4F7")
-        self.log_text.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        ttk.Label(outer, text="运行记录（完整收发日志）", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor=tk.W)
+        ttk.Label(outer, text=f"日志文件：{LOG_PATH}", foreground="#667085", wraplength=460).pack(anchor=tk.W, pady=(3, 0))
+        log_frame = ttk.Frame(outer)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        self.log_text = tk.Text(log_frame, height=10, state=tk.DISABLED, wrap=tk.WORD,
+                                relief=tk.FLAT, background="#F2F4F7")
+        log_scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self._load_existing_log()
         ttk.Label(
             outer,
