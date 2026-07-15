@@ -365,8 +365,7 @@ struct Index {
       .titleBar({
         content: {
           title: {
-            mainTitle: 'Starly',
-            subTitle: '把声音送到电脑光标处'
+            mainTitle: 'Starly'
           }
         },
         style: {
@@ -415,6 +414,7 @@ struct Index {
             this.cancelMainSectionSwipe();
           })
       )
+      this.buildTitleConnectionOverlay();
     }
     .width('100%')
     .height('100%')
@@ -428,7 +428,6 @@ struct Index {
   buildMainSectionPage(section: string, scroller: Scroller) {
     Scroll(scroller) {
       Column({ space: 16 }) {
-        this.buildStatusCard();
         if (this.isPairingExpanded) {
           this.buildPairingCard();
         }
@@ -479,52 +478,53 @@ struct Index {
   }
 
   @Builder
-  buildStatusCard() {
+  buildTitleConnectionOverlay() {
+    Row() {
+      this.buildTitleConnectionStatus();
+    }
+    .width('100%')
+    .padding({ left: 104, right: 18 })
+    .position({ x: 0, y: 61 })
+    .zIndex(20)
+  }
+
+  @Builder
+  buildTitleConnectionStatus() {
     Row() {
       Text(this.statusIsError ? '!' : (this.isConnected ? '✓' : '•'))
-        .fontSize(18)
+        .fontSize(13)
         .fontWeight(FontWeight.Bold)
         .fontColor(this.statusIsError ? '#B42318' : '#175CD3')
-      Column() {
-        Text(this.statusText)
-          .fontSize(14)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(this.statusIsError ? '#B42318' : $r('app.color.text_primary'))
-          .maxLines(2)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        if (this.lastAction.length > 0) {
-          Text(this.lastAction)
-            .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .margin({ top: 3 })
-        }
-      }
+      Text(this.lastAction.length > 0 ? `${this.statusText} · ${this.lastAction}` : this.statusText)
+        .fontSize(12)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.statusIsError ? '#B42318' : $r('app.color.text_primary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
       .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start)
-      .margin({ left: 10, right: 8 })
+      .margin({ left: 6, right: 6 })
       Text(this.isPairingExpanded ? '收起' : '配对')
-        .width(52)
+        .width(38)
         .textAlign(TextAlign.End)
         .maxLines(1)
-        .fontSize(13)
+        .fontSize(11)
         .fontColor('#175CD3')
         .onClick(() => {
           this.isPairingExpanded = !this.isPairingExpanded;
         })
     }
     .width('100%')
-    .padding(16)
+    .height(34)
+    .padding({ left: 10, right: 10 })
     .backgroundColor(this.statusIsError ? '#D9FEF3F2' : $r('app.color.glass_surface'))
     .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
       colorMode: ThemeColorMode.SYSTEM,
       adaptiveColor: AdaptiveColor.DEFAULT,
-      scale: 0.88
+      scale: 0.82
     })
     .border({ width: 1, color: $r('app.color.glass_border') })
-    .borderRadius(22)
-    .shadow({ radius: 24, color: $r('app.color.glass_shadow'), offsetY: 10 })
+    .borderRadius(17)
+    .shadow({ radius: 12, color: $r('app.color.glass_shadow'), offsetY: 4 })
   }
 
   @Builder
