@@ -426,6 +426,8 @@ class BridgeServer:
     async def _handle_client(self, connection: websockets.ServerConnection) -> None:
         remote = connection.remote_address
         remote_ip = str(remote[0]) if remote else ""
+        remote_port = str(remote[1]) if isinstance(remote, tuple) and len(remote) > 1 else ""
+        peer_label = f"{remote_ip}:{remote_port}" if remote_port else remote_ip
         if not self._is_allowed_address(remote_ip):
             await connection.close(code=4003, reason="local network only")
             return
@@ -435,7 +437,7 @@ class BridgeServer:
             await connection.close(code=4001, reason="invalid token")
             self.event_queue.put(("error", f"拒绝了来自 {remote_ip} 的无效配对请求"))
             return
-        self.event_queue.put(("client", f"手机已连接：{remote_ip}"))
+        self.event_queue.put(("client_connected", peer_label))
         self.connections.add(connection)
         await self._send_json(connection, {
             "type": "hello",
@@ -456,7 +458,7 @@ class BridgeServer:
             pass
         finally:
             self.connections.discard(connection)
-            self.event_queue.put(("client", "手机连接已断开"))
+            self.event_queue.put(("client_disconnected", peer_label))
 
     async def _handle_message(self, connection: websockets.ServerConnection, raw: str | bytes) -> None:
         if not isinstance(raw, str):
@@ -800,6 +802,9 @@ class BridgeApp:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.status_var = tk.StringVar(value="正在启动…")
         self.address_var = tk.StringVar()
+        self.paired_devices_var = tk.StringVar(value="暂无手机连接")
+        self.connected_devices: set[str] = set()
+        self.qr_collapsed = False
         self.log_text: tk.Text
         self.qr_photo: ImageTk.PhotoImage | None = None
         self.tray: pystray.Icon | None = None
@@ -822,13 +827,24 @@ class BridgeApp:
         ttk.Label(status, textvariable=self.status_var, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor=tk.W)
         qr_frame = ttk.LabelFrame(outer, text="手机扫码配对", padding=14)
         qr_frame.pack(fill=tk.X)
-        self.qr_label = ttk.Label(qr_frame)
+        qr_header = ttk.Frame(qr_frame)
+        qr_header.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(qr_header, text="扫码后手机即可连接电脑").pack(side=tk.LEFT)
+        self.qr_toggle_button = ttk.Button(qr_header, text="收起二维码", command=self.toggle_qr)
+        self.qr_toggle_button.pack(side=tk.RIGHT)
+        self.qr_body = ttk.Frame(qr_frame)
+        self.qr_body.pack(fill=tk.X)
+        self.qr_label = ttk.Label(self.qr_body)
         self.qr_label.pack(pady=(0, 8))
-        ttk.Label(qr_frame, textvariable=self.address_var, foreground="#475467").pack()
-        button_row = ttk.Frame(qr_frame)
+        ttk.Label(self.qr_body, textvariable=self.address_var, foreground="#475467").pack()
+        button_row = ttk.Frame(self.qr_body)
         button_row.pack(fill=tk.X, pady=(12, 0))
         ttk.Button(button_row, text="复制配对信息", command=self.copy_pairing).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
         ttk.Button(button_row, text="更换配对密钥", command=self.regenerate_token).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(6, 0))
+        paired_frame = ttk.LabelFrame(outer, text="已配对手机", padding=12)
+        paired_frame.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(paired_frame, textvariable=self.paired_devices_var, foreground="#175CD3",
+                  justify=tk.LEFT, anchor=tk.W, wraplength=460).pack(fill=tk.X)
         options = ttk.Frame(outer)
         options.pack(fill=tk.X, pady=14)
         ttk.Button(options, text="最小化到托盘", command=self.hide_to_tray).pack(side=tk.LEFT)
@@ -876,8 +892,18 @@ class BridgeApp:
                 event_type, message = self.events.get_nowait()
             except queue.Empty:
                 break
-            self.status_var.set(message)
-            self._append_log(message)
+            if event_type == "client_connected":
+                self.connected_devices.add(message)
+                self._refresh_paired_devices()
+                display_message = f"手机已配对：{message}"
+            elif event_type == "client_disconnected":
+                self.connected_devices.discard(message)
+                self._refresh_paired_devices()
+                display_message = f"手机已断开：{message}"
+            else:
+                display_message = message
+            self.status_var.set(display_message)
+            self._append_log(display_message)
             if event_type == "action":
                 try:
                     import winsound
@@ -885,6 +911,24 @@ class BridgeApp:
                 except OSError:
                     pass
         self.root.after(120, self._poll_events)
+
+    def _refresh_paired_devices(self) -> None:
+        if not self.connected_devices:
+            self.paired_devices_var.set("暂无手机连接")
+            return
+        devices = sorted(self.connected_devices)
+        lines = [f"当前已配对 {len(devices)} 部手机"]
+        lines.extend(f"• {device}" for device in devices)
+        self.paired_devices_var.set("\n".join(lines))
+
+    def toggle_qr(self) -> None:
+        self.qr_collapsed = not self.qr_collapsed
+        if self.qr_collapsed:
+            self.qr_body.pack_forget()
+            self.qr_toggle_button.configure(text="展开二维码")
+        else:
+            self.qr_body.pack(fill=tk.X)
+            self.qr_toggle_button.configure(text="收起二维码")
 
     def _append_log(self, message: str) -> None:
         line = time.strftime("%Y-%m-%d %H:%M:%S  ") + message
