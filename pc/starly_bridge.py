@@ -805,7 +805,6 @@ class BridgeApp:
         self.paired_devices_var = tk.StringVar(value="暂无手机连接")
         self.connected_devices: set[str] = set()
         self.qr_collapsed = False
-        self.log_text: tk.Text
         self.qr_photo: ImageTk.PhotoImage | None = None
         self.tray: pystray.Icon | None = None
         self._build_ui()
@@ -850,17 +849,6 @@ class BridgeApp:
         ttk.Button(options, text="最小化到托盘", command=self.hide_to_tray).pack(side=tk.LEFT)
         ttk.Button(options, text="设置开机启动", command=self.enable_autostart).pack(side=tk.LEFT, padx=8)
         ttk.Button(options, text="取消开机启动", command=self.disable_autostart).pack(side=tk.LEFT)
-        ttk.Label(outer, text="运行记录（完整收发日志）", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor=tk.W)
-        ttk.Label(outer, text=f"日志文件：{LOG_PATH}", foreground="#667085", wraplength=460).pack(anchor=tk.W, pady=(3, 0))
-        log_frame = ttk.Frame(outer)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
-        self.log_text = tk.Text(log_frame, height=10, state=tk.DISABLED, wrap=tk.WORD,
-                                relief=tk.FLAT, background="#F2F4F7")
-        log_scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scrollbar.set)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self._load_existing_log()
         ttk.Label(
             outer,
             text="使用时先最小化本窗口，再点击电脑上的目标输入框。为安全起见，仅接受局域网设备和正确配对密钥。",
@@ -965,35 +953,16 @@ class BridgeApp:
         return f"{prefix} {message_type}"
 
     def _append_log(self, message: str, file_message: str | None = None) -> None:
+        """Persist the detailed record without placing a long log viewer in the UI."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S  ")
-        line = time.strftime("%Y-%m-%d %H:%M:%S  ") + message
         file_line = timestamp + (file_message if file_message is not None else message)
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, line + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             with LOG_PATH.open("a", encoding="utf-8") as handle:
                 handle.write(file_line + "\n")
         except OSError:
-            # The live UI log remains available even if the disk log cannot be written.
+            # The bridge remains usable even if the optional disk log cannot be written.
             pass
-
-    def _load_existing_log(self) -> None:
-        try:
-            lines = LOG_PATH.read_text(encoding="utf-8").splitlines()[-300:]
-        except (OSError, UnicodeError):
-            return
-        if not lines:
-            return
-        self.log_text.configure(state=tk.NORMAL)
-        compact_lines = [self._compact_wire_message(line) if "手机→电脑" in line or
-                         "电脑→手机" in line else line for line in lines]
-        self.log_text.insert(tk.END, "—— 已加载最近运行记录 ——\n" +
-                             "\n".join(compact_lines) + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
 
     def copy_pairing(self) -> None:
         self.root.clipboard_clear()
