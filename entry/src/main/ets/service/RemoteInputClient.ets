@@ -24,6 +24,12 @@ class RemoteInputClient {
   private socket: webSocket.WebSocket | null = null;
   private listener: RemoteClientListener | null = null;
   private connected: boolean = false;
+  // The PC bridge deliberately rate-limits requests. Keep Codex reads in a
+  // small serial queue so a snapshot and its selected-thread detail never
+  // arrive as a burst and get rejected.
+  private codexRequestChain: Promise<boolean> = Promise.resolve(true);
+  private lastCodexRequestAt: number = 0;
+  private codexRequestGeneration: number = 0;
 
   setListener(listener: RemoteClientListener | null): void {
     this.listener = listener;
@@ -109,7 +115,7 @@ class RemoteInputClient {
     const message = new CodexWireMessage();
     message.type = 'codex_snapshot_request';
     message.id = `${Date.now()}`;
-    return await this.sendObject(message);
+    return await this.enqueueCodexRequest(message);
   }
 
   async requestCodexThread(threadId: string): Promise<boolean> {
@@ -117,7 +123,7 @@ class RemoteInputClient {
     message.type = 'codex_thread_request';
     message.id = `${Date.now()}`;
     message.threadId = threadId;
-    return await this.sendObject(message);
+    return await this.enqueueCodexRequest(message);
   }
 
   async sendToCodex(threadId: string, text: string, submitMode: string): Promise<boolean> {
@@ -132,7 +138,7 @@ class RemoteInputClient {
     message.threadId = threadId;
     message.text = trimmed;
     message.submitMode = submitMode;
-    return await this.sendObject(message);
+    return await this.enqueueCodexRequest(message);
   }
 
   async interruptCodex(threadId: string, turnId: string): Promise<boolean> {
@@ -141,10 +147,13 @@ class RemoteInputClient {
     message.id = `${Date.now()}`;
     message.threadId = threadId;
     message.turnId = turnId;
-    return await this.sendObject(message);
+    return await this.enqueueCodexRequest(message);
   }
 
   async disconnect(): Promise<void> {
+    this.codexRequestGeneration += 1;
+    this.codexRequestChain = Promise.resolve(true);
+    this.lastCodexRequestAt = 0;
     const socket = this.socket;
     this.socket = null;
     this.connected = false;
@@ -195,6 +204,30 @@ class RemoteInputClient {
       this.listener?.onError(`发送失败：${JSON.stringify(error)}`);
       return false;
     }
+  }
+
+  private enqueueCodexRequest(message: CodexWireMessage): Promise<boolean> {
+    const generation = this.codexRequestGeneration;
+    const task = this.codexRequestChain.then(async (): Promise<boolean> => {
+      if (generation !== this.codexRequestGeneration) {
+        return false;
+      }
+      const elapsed = Date.now() - this.lastCodexRequestAt;
+      const waitMs = 180 - elapsed;
+      if (waitMs > 0) {
+        await new Promise<void>((resolve: () => void) => {
+          setTimeout(resolve, waitMs);
+        });
+      }
+      if (generation !== this.codexRequestGeneration) {
+        return false;
+      }
+      const sent = await this.sendObject(message);
+      this.lastCodexRequestAt = Date.now();
+      return sent;
+    }, (): boolean => false);
+    this.codexRequestChain = task.then((): boolean => true, (): boolean => false);
+    return task;
   }
 }
 

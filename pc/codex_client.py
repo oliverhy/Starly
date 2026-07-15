@@ -125,7 +125,7 @@ def _local_image_data_url(raw_path: str) -> str:
         return ""
     try:
         with Image.open(path) as source:
-            source.thumbnail((960, 960), Image.Resampling.LANCZOS)
+            source.thumbnail((720, 720), Image.Resampling.LANCZOS)
             if source.mode != "RGB":
                 rgb = Image.new("RGB", source.size, "white")
                 if "A" in source.getbands():
@@ -134,7 +134,7 @@ def _local_image_data_url(raw_path: str) -> str:
                     rgb.paste(source)
                 source = rgb
             output = io.BytesIO()
-            source.save(output, format="JPEG", quality=76, optimize=True)
+            source.save(output, format="JPEG", quality=70, optimize=True)
         return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
     except (OSError, ValueError):
         return ""

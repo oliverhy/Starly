@@ -127,6 +127,10 @@ struct Index {
   private lastCodexTaskTapAt: number = 0;
   private codexAutoRefreshTimer: number = -1;
   private codexAutoRefreshInFlight: boolean = false;
+  private codexDetailRetryTimer: number = -1;
+  private codexDetailWatchdogTimer: number = -1;
+  private codexDetailRetryCount: number = 0;
+  private codexDetailRequestToken: number = 0;
   private codexResolvedStatuses: Map<string, string> = new Map<string, string>();
   private pageScroller: Scroller = new Scroller();
   private submitTabsController: TabsController = new TabsController();
@@ -164,6 +168,7 @@ struct Index {
           this.isPairingExpanded = false;
         } else {
           this.stopCodexAutoRefresh();
+          this.clearCodexDetailTimers();
         }
       },
       (message: string): void => {
@@ -178,6 +183,8 @@ struct Index {
         this.statusIsError = false;
       },
       (message: string): void => {
+        const shouldRetryCodexDetail = this.codexDetailLoading &&
+          this.selectedCodexTaskId.length > 0 && this.mainSection === 'codex';
         this.statusText = message;
         this.statusIsError = true;
         if (message.includes('Codex')) {
@@ -185,6 +192,9 @@ struct Index {
         }
         this.codexDetailLoading = false;
         this.codexLoading = false;
+        if (shouldRetryCodexDetail) {
+          this.scheduleCodexDetailRetry(this.selectedCodexTaskId, 450);
+        }
       },
       (snapshot: CodexSnapshot): void => {
         this.codexAvailable = snapshot.available;
@@ -201,6 +211,8 @@ struct Index {
         if (detail.id !== this.selectedCodexTaskId) {
           return;
         }
+        this.clearCodexDetailTimers();
+        this.codexDetailRetryCount = 0;
         this.selectedCodexTitle = detail.title;
         this.selectedCodexCwd = detail.cwd;
         this.selectedCodexStatus = detail.status;
@@ -254,7 +266,7 @@ struct Index {
           remoteInputClient.requestCodexSnapshot();
         }
         if (shouldRefreshThread && this.selectedCodexTaskId.length > 0) {
-          remoteInputClient.requestCodexThread(this.selectedCodexTaskId);
+          this.requestSelectedCodexThread();
         }
       }
     ));
@@ -1634,14 +1646,79 @@ struct Index {
         await new Promise<void>((resolve: () => void) => {
           setTimeout(resolve, 180);
         });
-        if (this.isConnected && this.mainSection === 'codex' &&
-          this.selectedCodexTaskId.length > 0) {
-          await remoteInputClient.requestCodexThread(this.selectedCodexTaskId);
+        if (this.isConnected && this.mainSection === 'codex') {
+          await this.requestSelectedCodexThread();
         }
       }
     } finally {
       this.codexAutoRefreshInFlight = false;
     }
+  }
+
+  private async requestSelectedCodexThread(force: boolean = false): Promise<void> {
+    const threadId = this.selectedCodexTaskId;
+    if (!this.isConnected || this.mainSection !== 'codex' || threadId.length === 0) {
+      return;
+    }
+    if (!force && this.codexDetailLoading) {
+      return;
+    }
+    this.codexDetailLoading = true;
+    this.codexLoading = true;
+    const requestToken = ++this.codexDetailRequestToken;
+    this.clearCodexDetailWatchdog();
+    this.codexDetailWatchdogTimer = setTimeout(() => {
+      if (requestToken !== this.codexDetailRequestToken ||
+        threadId !== this.selectedCodexTaskId || !this.codexDetailLoading) {
+        return;
+      }
+      this.codexDetailWatchdogTimer = -1;
+      this.codexDetailLoading = false;
+      this.codexLoading = false;
+      this.statusText = 'Codex 任务加载超时，正在重试';
+      this.statusIsError = true;
+      this.scheduleCodexDetailRetry(threadId, 300);
+    }, 12000);
+    const requested = await remoteInputClient.requestCodexThread(threadId);
+    if (!requested && requestToken === this.codexDetailRequestToken &&
+      this.selectedCodexTaskId === threadId) {
+      this.clearCodexDetailWatchdog();
+      this.codexDetailLoading = false;
+      this.codexLoading = false;
+      this.scheduleCodexDetailRetry(threadId, 300);
+    }
+  }
+
+  private scheduleCodexDetailRetry(threadId: string, delayMs: number): void {
+    if (threadId.length === 0 || threadId !== this.selectedCodexTaskId ||
+      this.mainSection !== 'codex' || !this.isConnected ||
+      this.codexDetailRetryTimer >= 0 || this.codexDetailRetryCount >= 3) {
+      return;
+    }
+    this.codexDetailRetryCount += 1;
+    this.codexDetailRetryTimer = setTimeout(() => {
+      this.codexDetailRetryTimer = -1;
+      if (threadId === this.selectedCodexTaskId && this.mainSection === 'codex' &&
+        this.isConnected) {
+        this.requestSelectedCodexThread(true);
+      }
+    }, delayMs);
+  }
+
+  private clearCodexDetailWatchdog(): void {
+    if (this.codexDetailWatchdogTimer >= 0) {
+      clearTimeout(this.codexDetailWatchdogTimer);
+      this.codexDetailWatchdogTimer = -1;
+    }
+  }
+
+  private clearCodexDetailTimers(): void {
+    this.clearCodexDetailWatchdog();
+    if (this.codexDetailRetryTimer >= 0) {
+      clearTimeout(this.codexDetailRetryTimer);
+      this.codexDetailRetryTimer = -1;
+    }
+    this.codexDetailRequestToken += 1;
   }
 
   private async sendDraft(): Promise<void> {
@@ -1663,6 +1740,8 @@ struct Index {
   }
 
   private async selectCodexTask(threadId: string): Promise<void> {
+    this.clearCodexDetailTimers();
+    this.codexDetailRetryCount = 0;
     const previousThreadId = this.selectedCodexTaskId;
     if (previousThreadId.length > 0 && this.selectedCodexStatus !== 'notLoaded') {
       this.rememberCodexTaskStatus(previousThreadId, this.selectedCodexStatus);
@@ -1672,13 +1751,9 @@ struct Index {
     this.selectedCodexMessages = [];
     this.selectedCodexActiveTurnId = '';
     this.codexDetailVersion += 1;
-    this.codexDetailLoading = true;
-    this.codexLoading = true;
-    const requested = await remoteInputClient.requestCodexThread(threadId);
-    if (!requested && this.selectedCodexTaskId === threadId) {
-      this.codexDetailLoading = false;
-      this.codexLoading = false;
-    }
+    this.codexDetailLoading = false;
+    this.codexLoading = false;
+    await this.requestSelectedCodexThread(true);
   }
 
   private async sendCodexCommand(submitMode: string): Promise<void> {

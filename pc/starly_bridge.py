@@ -35,6 +35,8 @@ APP_NAME = "StarlyBridge"
 APP_TITLE = "Starly 电脑端"
 DEFAULT_PORT = 8765
 MAX_TEXT_LENGTH = 8000
+MAX_PHONE_DETAIL_MESSAGES = 15
+MAX_WIRE_MESSAGE_SIZE = 16 * 1024 * 1024
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = CONFIG_DIR / "bridge.log"
@@ -414,7 +416,7 @@ class BridgeServer:
             self._handle_client,
             "0.0.0.0",
             self.config.port,
-            max_size=MAX_TEXT_LENGTH * 4,
+            max_size=MAX_WIRE_MESSAGE_SIZE,
             ping_interval=20,
             ping_timeout=20,
         ):
@@ -543,7 +545,8 @@ class BridgeServer:
             # app-server owning the same thread and makes the desktop view stale.
             detail = await self.codex.thread_detail(thread_id)
             await self._send_json(connection, {
-                "type": "codex_thread", "id": message_id, "thread": detail,
+                "type": "codex_thread", "id": message_id,
+                "thread": self._phone_thread_detail(detail),
             })
         except Exception as error:
             await self._send_error(connection, f"读取 Codex 任务失败：{error}", message_id)
@@ -608,7 +611,9 @@ class BridgeServer:
                     saw_activity = True
                 if message_count > baseline_messages:
                     saw_activity = True
-                await self._broadcast({"type": "codex_thread", "thread": detail})
+                await self._broadcast({
+                    "type": "codex_thread", "thread": self._phone_thread_detail(detail),
+                })
                 if message_count >= baseline_messages + 2 and not active_turn_id and saw_activity:
                     await self._broadcast({
                         "type": "codex_event", "event": "turn/completed",
@@ -627,6 +632,16 @@ class BridgeServer:
             current = self.codex_poll_tasks.get(thread_id)
             if current is asyncio.current_task():
                 self.codex_poll_tasks.pop(thread_id, None)
+
+    @staticmethod
+    def _phone_thread_detail(detail: dict[str, object]) -> dict[str, object]:
+        """Trim only the phone payload; keep the full detail for bridge logic."""
+        messages = detail.get("messages")
+        if not isinstance(messages, list) or len(messages) <= MAX_PHONE_DETAIL_MESSAGES:
+            return detail
+        payload = dict(detail)
+        payload["messages"] = messages[-MAX_PHONE_DETAIL_MESSAGES:]
+        return payload
 
     async def _codex_interrupt(self, connection: websockets.ServerConnection, thread_id: str,
                                turn_id: str, message_id: str) -> None:
@@ -805,6 +820,8 @@ class BridgeApp:
         self.paired_devices_var = tk.StringVar(value="暂无手机连接")
         self.connected_devices: set[str] = set()
         self.qr_collapsed = False
+        self.log_collapsed = False
+        self.log_text: tk.Text
         self.qr_photo: ImageTk.PhotoImage | None = None
         self.tray: pystray.Icon | None = None
         self._build_ui()
@@ -849,6 +866,22 @@ class BridgeApp:
         ttk.Button(options, text="最小化到托盘", command=self.hide_to_tray).pack(side=tk.LEFT)
         ttk.Button(options, text="设置开机启动", command=self.enable_autostart).pack(side=tk.LEFT, padx=8)
         ttk.Button(options, text="取消开机启动", command=self.disable_autostart).pack(side=tk.LEFT)
+        log_frame = ttk.LabelFrame(outer, text="运行记录", padding=10)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        log_header = ttk.Frame(log_frame)
+        log_header.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(log_header, text="显示精简收发摘要，完整日志仍保存到本机").pack(side=tk.LEFT)
+        self.log_toggle_button = ttk.Button(log_header, text="收起日志", command=self.toggle_log)
+        self.log_toggle_button.pack(side=tk.RIGHT)
+        self.log_body = ttk.Frame(log_frame)
+        self.log_body.pack(fill=tk.BOTH, expand=True)
+        self.log_text = tk.Text(self.log_body, height=8, state=tk.DISABLED, wrap=tk.WORD,
+                                relief=tk.FLAT, background="#F2F4F7")
+        log_scrollbar = ttk.Scrollbar(self.log_body, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._load_existing_log()
         ttk.Label(
             outer,
             text="使用时先最小化本窗口，再点击电脑上的目标输入框。为安全起见，仅接受局域网设备和正确配对密钥。",
@@ -920,6 +953,15 @@ class BridgeApp:
             self.qr_body.pack(fill=tk.X)
             self.qr_toggle_button.configure(text="收起二维码")
 
+    def toggle_log(self) -> None:
+        self.log_collapsed = not self.log_collapsed
+        if self.log_collapsed:
+            self.log_body.pack_forget()
+            self.log_toggle_button.configure(text="展开日志")
+        else:
+            self.log_body.pack(fill=tk.BOTH, expand=True)
+            self.log_toggle_button.configure(text="收起日志")
+
     @staticmethod
     def _compact_wire_message(message: str) -> str:
         """Keep the live window readable while retaining the full wire record on disk."""
@@ -953,16 +995,36 @@ class BridgeApp:
         return f"{prefix} {message_type}"
 
     def _append_log(self, message: str, file_message: str | None = None) -> None:
-        """Persist the detailed record without placing a long log viewer in the UI."""
+        """Show a compact live line and persist the complete record to disk."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S  ")
+        line = timestamp + message
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, line + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
         file_line = timestamp + (file_message if file_message is not None else message)
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             with LOG_PATH.open("a", encoding="utf-8") as handle:
                 handle.write(file_line + "\n")
         except OSError:
-            # The bridge remains usable even if the optional disk log cannot be written.
+            # The live UI line remains available even if the disk log cannot be written.
             pass
+
+    def _load_existing_log(self) -> None:
+        try:
+            lines = LOG_PATH.read_text(encoding="utf-8").splitlines()[-300:]
+        except (OSError, UnicodeError):
+            return
+        if not lines:
+            return
+        compact_lines = [self._compact_wire_message(line) if "手机→电脑" in line or
+                         "电脑→手机" in line else line for line in lines]
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, "—— 已加载最近运行记录 ——\n" +
+                             "\n".join(compact_lines) + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
 
     def copy_pairing(self) -> None:
         self.root.clipboard_clear()
