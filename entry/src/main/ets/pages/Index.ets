@@ -125,6 +125,7 @@ struct Index {
   private pendingVoiceSend: boolean = false;
   private lastCodexTaskTapId: string = '';
   private lastCodexTaskTapAt: number = 0;
+  private codexAutoRefreshTimer: number = -1;
   private codexResolvedStatuses: Map<string, string> = new Map<string, string>();
   private pageScroller: Scroller = new Scroller();
   private submitTabsController: TabsController = new TabsController();
@@ -160,6 +161,8 @@ struct Index {
         this.statusIsError = false;
         if (isConnected) {
           this.isPairingExpanded = false;
+        } else {
+          this.stopCodexAutoRefresh();
         }
       },
       (message: string): void => {
@@ -236,8 +239,10 @@ struct Index {
           if (threadId === this.selectedCodexTaskId) {
             this.selectedCodexStatus = 'idle';
           }
-          // The bridge may now be handing the thread back to Codex Desktop.
-          // Wait for codex/refreshReady instead of racing the app-server stop.
+          // Refresh the list immediately. The auto-refresh timer below also
+          // reads the selected thread again after the desktop has persisted
+          // the final assistant message.
+          shouldRefreshSnapshot = true;
         } else if (event === 'codex/refreshReady') {
           shouldRefreshThread = true;
         } else if (event === 'thread/status/changed' ||
@@ -277,6 +282,7 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.stopCodexAutoRefresh();
     remoteInputClient.setListener(null);
     speechService.setListener(null);
   }
@@ -343,6 +349,12 @@ struct Index {
       .bindToScrollable([this.pageScroller])
       .width('100%')
       .height('100%')
+      .parallelGesture(
+        PanGesture({ direction: PanDirection.Horizontal, distance: 24 })
+          .onActionEnd((event: GestureEvent) => {
+            this.changeMainSectionBySwipe(event.offsetX);
+          })
+      )
     }
     .width('100%')
     .height('100%')
@@ -548,6 +560,9 @@ struct Index {
         this.mainSection = value;
         if (value === 'codex') {
           this.refreshCodex();
+          this.startCodexAutoRefresh();
+        } else {
+          this.stopCodexAutoRefresh();
         }
       })
   }
@@ -1565,6 +1580,46 @@ struct Index {
       return;
     }
     this.submitTabsController.changeIndex(targetIndex);
+  }
+
+  private changeMainSectionBySwipe(offsetX: number): void {
+    if (Math.abs(offsetX) < 50) {
+      return;
+    }
+    const targetSection = offsetX < 0 ? 'voice' : 'codex';
+    if (targetSection === this.mainSection) {
+      return;
+    }
+    this.mainSection = targetSection;
+    if (targetSection === 'codex') {
+      this.refreshCodex();
+      this.startCodexAutoRefresh();
+    } else {
+      this.stopCodexAutoRefresh();
+    }
+  }
+
+  private startCodexAutoRefresh(): void {
+    if (this.codexAutoRefreshTimer >= 0) {
+      return;
+    }
+    this.codexAutoRefreshTimer = setInterval(() => {
+      if (!this.isConnected || this.mainSection !== 'codex') {
+        return;
+      }
+      remoteInputClient.requestCodexSnapshot();
+      if (this.selectedCodexTaskId.length > 0) {
+        remoteInputClient.requestCodexThread(this.selectedCodexTaskId);
+      }
+    }, 2000);
+  }
+
+  private stopCodexAutoRefresh(): void {
+    if (this.codexAutoRefreshTimer < 0) {
+      return;
+    }
+    clearInterval(this.codexAutoRefreshTimer);
+    this.codexAutoRefreshTimer = -1;
   }
 
   private async sendDraft(): Promise<void> {
