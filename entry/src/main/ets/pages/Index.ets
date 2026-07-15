@@ -102,6 +102,8 @@ struct Index {
   @State lastAction: string = '';
   @State isVoicePressing: boolean = false;
   @State mainSection: string = 'voice';
+  @State mainSectionDragOffset: number = 0;
+  @State mainSectionViewportWidth: number = 360;
   @State codexAvailable: boolean = false;
   @State codexError: string = '';
   @State codexQuota: CodexQuota = new CodexQuota();
@@ -136,7 +138,9 @@ struct Index {
   private codexDetailRequestToken: number = 0;
   private selectedCodexUpdatedAt: number = 0;
   private codexResolvedStatuses: Map<string, string> = new Map<string, string>();
-  private pageScroller: Scroller = new Scroller();
+  private voicePageScroller: Scroller = new Scroller();
+  private codexPageScroller: Scroller = new Scroller();
+  private mainSectionAnimating: boolean = false;
   private submitTabsController: TabsController = new TabsController();
   private voiceRestEffect = new hdsEffect.HdsEffectBuilder()
     .pressShadow(hdsEffect.PressShadowType.BLEND_GRADIENT)
@@ -344,25 +348,19 @@ struct Index {
     Stack({ alignContent: Alignment.TopStart }) {
       this.buildAmbientBackground();
       HdsNavigation() {
-        Scroll(this.pageScroller) {
-          Column({ space: 16 }) {
-            this.buildStatusCard();
-            if (this.isPairingExpanded) {
-              this.buildPairingCard();
-            }
-            this.buildMainSectionTabs();
-            if (this.mainSection === 'voice') {
-              this.buildComposerCard();
-              this.buildSafetyHint();
-            } else {
-              this.buildCodexDashboard();
-            }
-          }
-          .width('100%')
-          .padding({ left: 18, right: 18, top: 12, bottom: 36 })
+        Stack({ alignContent: Alignment.TopStart }) {
+          this.buildMainSectionPage('codex', this.codexPageScroller);
+          this.buildMainSectionPage('voice', this.voicePageScroller);
         }
         .width('100%')
         .height('100%')
+        .clip(true)
+        .onAreaChange((_oldArea: Area, newArea: Area) => {
+          const width = Number(newArea.width);
+          if (width > 0 && Math.abs(width - this.mainSectionViewportWidth) > 0.5) {
+            this.mainSectionViewportWidth = width;
+          }
+        })
       }
       .titleBar({
         content: {
@@ -399,13 +397,22 @@ struct Index {
       .titleMode(HdsNavigationTitleMode.FREE)
       .hideBackButton(true)
       .mode(NavigationMode.Stack)
-      .bindToScrollable([this.pageScroller])
+      .bindToScrollable([this.voicePageScroller, this.codexPageScroller])
       .width('100%')
       .height('100%')
       .parallelGesture(
-        PanGesture({ direction: PanDirection.Horizontal, distance: 24 })
+        PanGesture({ direction: PanDirection.Horizontal, distance: 10 })
+          .onActionStart(() => {
+            this.beginMainSectionSwipe();
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            this.updateMainSectionSwipe(event.offsetX);
+          })
           .onActionEnd((event: GestureEvent) => {
-            this.changeMainSectionBySwipe(event.offsetX);
+            this.finishMainSectionSwipe(event.offsetX);
+          })
+          .onActionCancel(() => {
+            this.cancelMainSectionSwipe();
           })
       )
     }
@@ -415,6 +422,30 @@ struct Index {
     .bindContentCover($$this.isCodexConversationOpen, this.buildCodexConversationCover(), {
       modalTransition: ModalTransition.DEFAULT
     })
+  }
+
+  @Builder
+  buildMainSectionPage(section: string, scroller: Scroller) {
+    Scroll(scroller) {
+      Column({ space: 16 }) {
+        this.buildStatusCard();
+        if (this.isPairingExpanded) {
+          this.buildPairingCard();
+        }
+        this.buildMainSectionTabs(section);
+        if (section === 'voice') {
+          this.buildComposerCard();
+          this.buildSafetyHint();
+        } else {
+          this.buildCodexDashboard();
+        }
+      }
+      .width('100%')
+      .padding({ left: 18, right: 18, top: 12, bottom: 36 })
+    }
+    .width('100%')
+    .height('100%')
+    .translate({ x: this.mainSectionPageTranslate(section) })
   }
 
   @Builder
@@ -570,10 +601,10 @@ struct Index {
   }
 
   @Builder
-  buildMainSectionTabs() {
+  buildMainSectionTabs(activeSection: string) {
     Row() {
-      this.buildMainSectionButton('voice', '语音输入')
-      this.buildMainSectionButton('codex', 'Codex 任务')
+      this.buildMainSectionButton('voice', '语音输入', activeSection)
+      this.buildMainSectionButton('codex', 'Codex 任务', activeSection)
     }
     .width('100%')
     .height(50)
@@ -589,34 +620,28 @@ struct Index {
   }
 
   @Builder
-  buildMainSectionButton(value: string, label: string) {
+  buildMainSectionButton(value: string, label: string, activeSection: string) {
     Text(label)
       .layoutWeight(1)
       .height(40)
       .textAlign(TextAlign.Center)
       .fontSize(15)
-      .fontWeight(this.mainSection === value ? FontWeight.Medium : FontWeight.Regular)
-      .fontColor(this.mainSection === value ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
-      .backgroundColor(this.mainSection === value ? $r('app.color.glass_surface_strong') : Color.Transparent)
+      .fontWeight(activeSection === value ? FontWeight.Medium : FontWeight.Regular)
+      .fontColor(activeSection === value ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
+      .backgroundColor(activeSection === value ? $r('app.color.glass_surface_strong') : Color.Transparent)
       .border({
         width: 1,
-        color: this.mainSection === value ? $r('app.color.glass_border') : Color.Transparent
+        color: activeSection === value ? $r('app.color.glass_border') : Color.Transparent
       })
       .borderRadius(20)
       .shadow({
-        radius: this.mainSection === value ? 12 : 0,
+        radius: activeSection === value ? 12 : 0,
         color: $r('app.color.glass_shadow'),
         offsetY: 4
       })
       .animation({ duration: 260, curve: Curve.EaseOut })
       .onClick(() => {
-        this.mainSection = value;
-        if (value === 'codex') {
-          this.refreshCodex();
-          this.startCodexAutoRefresh();
-        } else {
-          this.stopCodexAutoRefresh();
-        }
+        this.animateMainSectionTo(value);
       })
   }
 
@@ -1636,15 +1661,93 @@ struct Index {
     this.submitTabsController.changeIndex(targetIndex);
   }
 
-  private changeMainSectionBySwipe(offsetX: number): void {
-    if (Math.abs(offsetX) < 50) {
+  private mainSectionPageTranslate(section: string): number {
+    const currentIndex = this.mainSection === 'codex' ? 0 : 1;
+    const pageIndex = section === 'codex' ? 0 : 1;
+    return (pageIndex - currentIndex) * this.mainSectionViewportWidth + this.mainSectionDragOffset;
+  }
+
+  private beginMainSectionSwipe(): void {
+    if (this.mainSectionAnimating || this.isVoicePressing) {
       return;
     }
-    const targetSection = offsetX < 0 ? 'voice' : 'codex';
-    if (targetSection === this.mainSection) {
+    this.mainSectionDragOffset = 0;
+  }
+
+  private updateMainSectionSwipe(offsetX: number): void {
+    if (this.mainSectionAnimating || this.isVoicePressing || this.mainSectionViewportWidth <= 0) {
       return;
     }
-    this.mainSection = targetSection;
+    let nextOffset = offsetX;
+    const isOutsideEdge = (this.mainSection === 'voice' && nextOffset < 0) ||
+      (this.mainSection === 'codex' && nextOffset > 0);
+    if (isOutsideEdge) {
+      nextOffset *= 0.12;
+    }
+    const limit = this.mainSectionViewportWidth;
+    this.mainSectionDragOffset = Math.max(-limit, Math.min(limit, nextOffset));
+  }
+
+  private finishMainSectionSwipe(offsetX: number): void {
+    if (this.mainSectionAnimating || this.isVoicePressing) {
+      return;
+    }
+    this.updateMainSectionSwipe(offsetX);
+    const threshold = Math.min(72, this.mainSectionViewportWidth * 0.2);
+    if (this.mainSection === 'voice' && this.mainSectionDragOffset > threshold) {
+      this.settleMainSection('codex', this.mainSectionViewportWidth);
+      return;
+    }
+    if (this.mainSection === 'codex' && this.mainSectionDragOffset < -threshold) {
+      this.settleMainSection('voice', -this.mainSectionViewportWidth);
+      return;
+    }
+    this.cancelMainSectionSwipe();
+  }
+
+  private cancelMainSectionSwipe(): void {
+    if (this.mainSectionAnimating || this.mainSectionDragOffset === 0) {
+      return;
+    }
+    this.mainSectionAnimating = true;
+    this.getUIContext().animateTo({
+      duration: 220,
+      curve: Curve.Friction,
+      onFinish: () => {
+        this.mainSectionDragOffset = 0;
+        this.mainSectionAnimating = false;
+      }
+    }, () => {
+      this.mainSectionDragOffset = 0;
+    });
+  }
+
+  private animateMainSectionTo(targetSection: string): void {
+    if (targetSection === this.mainSection || this.mainSectionAnimating) {
+      return;
+    }
+    const targetOffset = targetSection === 'codex' ? this.mainSectionViewportWidth :
+      -this.mainSectionViewportWidth;
+    this.settleMainSection(targetSection, targetOffset);
+  }
+
+  private settleMainSection(targetSection: string, targetOffset: number): void {
+    this.mainSectionAnimating = true;
+    this.getUIContext().animateTo({
+      duration: 320,
+      curve: Curve.FastOutSlowIn,
+      onFinish: () => {
+        this.mainSection = targetSection;
+        this.mainSectionDragOffset = 0;
+        this.mainSectionAnimating = false;
+        this.onMainSectionChanged(targetSection);
+      }
+    }, () => {
+      this.mainSectionDragOffset = targetOffset;
+    });
+  }
+
+  private onMainSectionChanged(targetSection: string): void {
     if (targetSection === 'codex') {
       this.refreshCodex();
       this.startCodexAutoRefresh();
