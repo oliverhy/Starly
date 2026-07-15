@@ -1,12 +1,16 @@
 import asyncio
 import json
+import os
 import queue
+import tempfile
 import unittest
 import urllib.parse
+from pathlib import Path
 from unittest import mock
 
 from pc.starly_bridge import BridgeConfig, BridgeServer, MAX_TEXT_LENGTH, WindowsInput, find_available_port
-from pc.codex_client import CodexAppServerClient, _item_content, normalize_snapshot, normalize_thread
+from pc.codex_client import (CodexAppServerClient, _item_content, normalize_snapshot,
+                             normalize_thread, read_rollout_thread_detail)
 
 
 class FakeConnection:
@@ -170,6 +174,44 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(role, "assistant")
         self.assertEqual(text, "结果如下：预览")
         self.assertEqual(images, ["https://example.com/result.png"])
+
+    def test_large_codex_history_uses_recent_local_messages(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            session_dir = codex_home / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                {"timestamp": "2026-07-15T01:00:02Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text": "测试任务"}],
+                             "internal_chat_message_metadata_passthrough": {
+                                 "turn_id": "turn-1"}}},
+                {"timestamp": "2026-07-15T01:00:03Z", "type": "event_msg",
+                 "payload": {"type": "agent_message", "message": "正在处理",
+                             "phase": "commentary"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                           for item in records) + "\n", encoding="utf-8")
+            (codex_home / "session_index.jsonl").write_text(json.dumps({
+                "id": thread_id, "thread_name": "本地大任务",
+            }, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                detail = read_rollout_thread_detail(thread_id)
+
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertEqual(detail["title"], "本地大任务")
+        self.assertEqual(detail["status"], "active")
+        self.assertEqual(detail["activeTurnId"], "turn-1")
+        self.assertEqual([item["text"] for item in detail["messages"]],
+                         ["测试任务", "正在处理"])
 
     def test_desktop_thread_opens_only_after_turn_completed(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
