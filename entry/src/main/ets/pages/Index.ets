@@ -104,6 +104,11 @@ struct Index {
   @State mainSection: string = 'voice';
   @State mainSectionDragOffset: number = 0;
   @State mainSectionViewportWidth: number = 360;
+  @State pageViewportHeight: number = 780;
+  @State isConnectionCapsuleExpanded: boolean = false;
+  @State isConnectionCapsuleDragging: boolean = false;
+  @State connectionCapsuleOffsetX: number = 0;
+  @State connectionCapsuleOffsetY: number = 0;
   @State codexAvailable: boolean = false;
   @State codexError: string = '';
   @State codexQuota: CodexQuota = new CodexQuota();
@@ -141,6 +146,9 @@ struct Index {
   private voicePageScroller: Scroller = new Scroller();
   private codexPageScroller: Scroller = new Scroller();
   private mainSectionAnimating: boolean = false;
+  private connectionCapsuleDragStartX: number = 0;
+  private connectionCapsuleDragStartY: number = 0;
+  private connectionCapsuleLastDragAt: number = 0;
   private submitTabsController: TabsController = new TabsController();
   private voiceRestEffect = new hdsEffect.HdsEffectBuilder()
     .pressShadow(hdsEffect.PressShadowType.BLEND_GRADIENT)
@@ -418,6 +426,12 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+    .onAreaChange((_oldArea: Area, newArea: Area) => {
+      const height = Number(newArea.height);
+      if (height > 0) {
+        this.pageViewportHeight = height;
+      }
+    })
     .backgroundColor($r('app.color.page_background'))
     .bindContentCover($$this.isCodexConversationOpen, this.buildCodexConversationCover(), {
       modalTransition: ModalTransition.DEFAULT
@@ -479,52 +493,82 @@ struct Index {
 
   @Builder
   buildTitleConnectionOverlay() {
-    Row() {
-      this.buildTitleConnectionStatus();
-    }
-    .width('100%')
-    .padding({ left: 104, right: 18 })
-    .position({ x: 0, y: 61 })
-    .zIndex(20)
+    this.buildTitleConnectionStatus();
   }
 
   @Builder
   buildTitleConnectionStatus() {
-    Row() {
-      Text(this.statusIsError ? '!' : (this.isConnected ? '✓' : '•'))
+    Row({ space: 7 }) {
+      Text(this.isConnected ? '✓' : '•')
         .fontSize(13)
         .fontWeight(FontWeight.Bold)
-        .fontColor(this.statusIsError ? '#B42318' : '#175CD3')
-      Text(this.lastAction.length > 0 ? `${this.statusText} · ${this.lastAction}` : this.statusText)
+        .fontColor(this.isConnected ? '#175CD3' : $r('app.color.text_secondary'))
+      Text(this.isConnected ? '已配对' : '未配对')
         .fontSize(12)
         .fontWeight(FontWeight.Medium)
-        .fontColor(this.statusIsError ? '#B42318' : $r('app.color.text_primary'))
+        .fontColor($r('app.color.text_primary'))
         .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-      .layoutWeight(1)
-      .margin({ left: 6, right: 6 })
-      Text(this.isPairingExpanded ? '收起' : '配对')
-        .width(38)
-        .textAlign(TextAlign.End)
-        .maxLines(1)
-        .fontSize(11)
-        .fontColor('#175CD3')
-        .onClick(() => {
-          this.isPairingExpanded = !this.isPairingExpanded;
-        })
+      Row({ space: 7 }) {
+        Text('')
+          .width(1)
+          .height(16)
+          .backgroundColor($r('app.color.glass_border'))
+        Text(this.isPairingExpanded ? '收起设置' : '配对设置')
+          .fontSize(11)
+          .fontColor('#175CD3')
+          .maxLines(1)
+          .onClick(() => {
+            this.togglePairingPanel();
+          })
+      }
+      .opacity(this.isConnectionCapsuleExpanded ? 1 : 0)
+      .translate({ x: this.isConnectionCapsuleExpanded ? 0 : 12 })
+      .animation({ duration: 220, curve: Curve.EaseOut })
     }
-    .width('100%')
-    .height(34)
-    .padding({ left: 10, right: 10 })
-    .backgroundColor(this.statusIsError ? '#D9FEF3F2' : $r('app.color.glass_surface'))
+    .width(this.isConnectionCapsuleExpanded ? 196 : 106)
+    .height(36)
+    .padding({ left: 11, right: 11 })
+    .clip(true)
+    .backgroundColor($r('app.color.glass_surface'))
     .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
       colorMode: ThemeColorMode.SYSTEM,
       adaptiveColor: AdaptiveColor.DEFAULT,
-      scale: 0.82
+      scale: 0.84
     })
     .border({ width: 1, color: $r('app.color.glass_border') })
-    .borderRadius(17)
-    .shadow({ radius: 12, color: $r('app.color.glass_shadow'), offsetY: 4 })
+    .borderRadius(18)
+    .shadow({ radius: 14, color: $r('app.color.glass_shadow'), offsetY: 5 })
+    .position({ x: 104, y: 60 })
+    .translate({ x: this.connectionCapsuleOffsetX, y: this.connectionCapsuleOffsetY })
+    .animation({ duration: this.isConnectionCapsuleDragging ? 0 : 280, curve: Curve.FastOutSlowIn })
+    .zIndex(20)
+    .gesture(
+      GestureGroup(GestureMode.Exclusive,
+        PanGesture({ direction: PanDirection.All, distance: 6 })
+          .onActionStart(() => {
+            this.isConnectionCapsuleDragging = true;
+            this.connectionCapsuleLastDragAt = Date.now();
+            this.mainSectionDragOffset = 0;
+            this.connectionCapsuleDragStartX = this.connectionCapsuleOffsetX;
+            this.connectionCapsuleDragStartY = this.connectionCapsuleOffsetY;
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            this.connectionCapsuleLastDragAt = Date.now();
+            this.updateConnectionCapsuleDrag(event.offsetX, event.offsetY);
+          })
+          .onActionEnd(() => {
+            this.connectionCapsuleLastDragAt = Date.now();
+            this.isConnectionCapsuleDragging = false;
+          })
+          .onActionCancel(() => {
+            this.isConnectionCapsuleDragging = false;
+          }),
+        TapGesture()
+          .onAction(() => {
+            this.toggleConnectionCapsule();
+          })
+      )
+    )
   }
 
   @Builder
@@ -1668,14 +1712,15 @@ struct Index {
   }
 
   private beginMainSectionSwipe(): void {
-    if (this.mainSectionAnimating || this.isVoicePressing) {
+    if (this.mainSectionAnimating || this.isVoicePressing || this.isConnectionCapsuleGestureActive()) {
       return;
     }
     this.mainSectionDragOffset = 0;
   }
 
   private updateMainSectionSwipe(offsetX: number): void {
-    if (this.mainSectionAnimating || this.isVoicePressing || this.mainSectionViewportWidth <= 0) {
+    if (this.mainSectionAnimating || this.isVoicePressing || this.isConnectionCapsuleGestureActive() ||
+      this.mainSectionViewportWidth <= 0) {
       return;
     }
     let nextOffset = offsetX;
@@ -1689,7 +1734,8 @@ struct Index {
   }
 
   private finishMainSectionSwipe(offsetX: number): void {
-    if (this.mainSectionAnimating || this.isVoicePressing) {
+    if (this.mainSectionAnimating || this.isVoicePressing || this.isConnectionCapsuleGestureActive()) {
+      this.mainSectionDragOffset = 0;
       return;
     }
     this.updateMainSectionSwipe(offsetX);
@@ -1754,6 +1800,58 @@ struct Index {
     } else {
       this.stopCodexAutoRefresh();
     }
+  }
+
+  private toggleConnectionCapsule(): void {
+    if (this.isConnectionCapsuleGestureActive()) {
+      return;
+    }
+    const shouldExpand = !this.isConnectionCapsuleExpanded;
+    const targetWidth = shouldExpand ? 196 : 106;
+    const targetX = this.clampConnectionCapsuleX(this.connectionCapsuleOffsetX, targetWidth);
+    this.getUIContext().animateTo({
+      duration: 280,
+      curve: Curve.FastOutSlowIn
+    }, () => {
+      this.isConnectionCapsuleExpanded = shouldExpand;
+      this.connectionCapsuleOffsetX = targetX;
+    });
+  }
+
+  private togglePairingPanel(): void {
+    this.getUIContext().animateTo({
+      duration: 260,
+      curve: Curve.FastOutSlowIn
+    }, () => {
+      this.isPairingExpanded = !this.isPairingExpanded;
+    });
+  }
+
+  private updateConnectionCapsuleDrag(offsetX: number, offsetY: number): void {
+    const width = this.isConnectionCapsuleExpanded ? 196 : 106;
+    const targetX = this.connectionCapsuleDragStartX + offsetX;
+    const targetY = this.connectionCapsuleDragStartY + offsetY;
+    this.connectionCapsuleOffsetX = this.clampConnectionCapsuleX(targetX, width);
+    this.connectionCapsuleOffsetY = this.clampConnectionCapsuleY(targetY);
+  }
+
+  private clampConnectionCapsuleX(offsetX: number, width: number): number {
+    const baseX = 104;
+    const edgePadding = 8;
+    const minX = edgePadding - baseX;
+    const maxX = this.mainSectionViewportWidth - baseX - width - edgePadding;
+    return Math.max(minX, Math.min(maxX, offsetX));
+  }
+
+  private clampConnectionCapsuleY(offsetY: number): number {
+    const baseY = 60;
+    const minY = 8 - baseY;
+    const maxY = this.pageViewportHeight - baseY - 36 - 12;
+    return Math.max(minY, Math.min(maxY, offsetY));
+  }
+
+  private isConnectionCapsuleGestureActive(): boolean {
+    return this.isConnectionCapsuleDragging || Date.now() - this.connectionCapsuleLastDragAt < 320;
   }
 
   private startCodexAutoRefresh(): void {
