@@ -213,6 +213,35 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual([item["text"] for item in detail["messages"]],
                          ["测试任务", "正在处理"])
 
+    def test_persisted_completion_replaces_stale_active_cache(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            session_dir = codex_home / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                {"timestamp": "2026-07-15T01:00:02Z", "type": "event_msg",
+                 "payload": {"type": "agent_message", "message": "completed"}},
+                {"timestamp": "2026-07-15T01:00:03Z", "type": "event_msg",
+                 "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                           for item in records) + "\n", encoding="utf-8")
+            client = CodexAppServerClient()
+            client.thread_status[thread_id] = "active"
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                detail = asyncio.run(client.thread_detail(thread_id))
+
+        self.assertEqual(detail["status"], "idle")
+        self.assertEqual(detail["activeTurnId"], "")
+        self.assertEqual(client.thread_status[thread_id], "idle")
+
     def test_desktop_thread_opens_only_after_turn_completed(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
         server.pending_desktop_open = {"thread-1"}

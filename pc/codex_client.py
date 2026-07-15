@@ -500,11 +500,11 @@ class CodexAppServerClient:
         local_detail = await asyncio.to_thread(
             read_rollout_thread_detail, thread_id, self.thread_metadata.get(thread_id))
         if local_detail is not None:
-            tracked_status = self.thread_status.get(thread_id)
-            if tracked_status:
-                local_detail["status"] = tracked_status
-                if tracked_status != "active":
-                    local_detail["activeTurnId"] = ""
+            # The desktop writes task_started/task_complete to the rollout even
+            # when the bridge-owned app-server does not receive that task's
+            # notifications. Treat the newest persisted event as authoritative;
+            # otherwise an old in-memory "active" value can keep a completed
+            # desktop task running forever on the phone.
             self.thread_status[thread_id] = str(local_detail.get("status", "idle"))
             return local_detail
         response = await self.request("thread/read", {"threadId": thread_id, "includeTurns": True})
