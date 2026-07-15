@@ -276,6 +276,107 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertNotIn("thread-1", server.pending_desktop_open)
         self.assertEqual(broadcasts, ["turn/started", "turn/completed"])
 
+    def test_poll_detects_completion_when_history_stays_capped(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        thread_id = "thread-long-history"
+        old_messages = [
+            {"role": "assistant", "text": f"old-{index}", "timestamp": index,
+             "turnId": f"turn-{index}", "images": []}
+            for index in range(15)
+        ]
+        active_messages = old_messages[1:] + [
+            {"role": "user", "text": "new request", "timestamp": 16,
+             "turnId": "turn-new", "images": []},
+        ]
+        completed_messages = active_messages[1:] + [
+            {"role": "assistant", "text": "new reply", "timestamp": 17,
+             "turnId": "turn-new", "images": []},
+        ]
+
+        class FakeCodex:
+            def __init__(self) -> None:
+                self.details = [
+                    {"id": thread_id, "status": "active", "activeTurnId": "turn-new",
+                     "messages": active_messages},
+                    {"id": thread_id, "status": "idle", "activeTurnId": "",
+                     "messages": completed_messages},
+                ]
+
+            async def thread_detail(self, requested_id: str) -> dict[str, object]:
+                self_test.assertEqual(requested_id, thread_id)
+                return self.details.pop(0)
+
+        self_test = self
+        broadcasts: list[dict[str, object]] = []
+
+        async def fake_broadcast(message: dict[str, object]) -> None:
+            broadcasts.append(message)
+
+        async def fake_refresh() -> None:
+            return None
+
+        async def fake_sleep(_seconds: float) -> None:
+            return None
+
+        server.codex = FakeCodex()
+        server.codex_poll_tasks = {}
+        server._broadcast = fake_broadcast
+        server._schedule_codex_refresh = fake_refresh
+        baseline = BridgeServer._latest_message_signature({"messages": old_messages})
+
+        async def exercise() -> None:
+            server.codex_poll_tasks[thread_id] = asyncio.current_task()
+            await server._poll_desktop_codex_thread(thread_id, baseline)
+
+        with mock.patch("pc.starly_bridge.asyncio.sleep", new=fake_sleep):
+            asyncio.run(exercise())
+
+        self.assertTrue(all(len(item["thread"]["messages"]) == 15
+                            for item in broadcasts if item.get("type") == "codex_thread"))
+        self.assertTrue(any(item.get("event") == "turn/completed" for item in broadcasts))
+        self.assertNotIn(thread_id, server.codex_poll_tasks)
+
+    def test_poll_terminal_event_preserves_failures_and_unknown_states(self) -> None:
+        self.assertEqual(BridgeServer._terminal_poll_event("idle", True), "turn/completed")
+        self.assertEqual(BridgeServer._terminal_poll_event("systemError", True), "turn/failed")
+        self.assertEqual(BridgeServer._terminal_poll_event("idle", False), "")
+        self.assertEqual(BridgeServer._terminal_poll_event("notLoaded", True), "")
+        self.assertEqual(BridgeServer._terminal_poll_event("queued", True), "")
+
+    def test_latest_message_detects_fast_turn_without_assistant_reply(self) -> None:
+        before = {"messages": [
+            {"role": "assistant", "text": "old reply", "timestamp": 1,
+             "turnId": "turn-old", "images": []},
+        ]}
+        after = {"messages": [
+            {"role": "assistant", "text": "old reply", "timestamp": 1,
+             "turnId": "turn-old", "images": []},
+            {"role": "user", "text": "new request", "timestamp": 2,
+             "turnId": "turn-new", "images": []},
+        ]}
+        self.assertNotEqual(BridgeServer._latest_message_signature(before),
+                            BridgeServer._latest_message_signature(after))
+
+    def test_failed_codex_event_is_not_reported_as_success(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        server.pending_desktop_open = set()
+        broadcasts: list[str] = []
+
+        async def fake_broadcast(message: dict[str, object]) -> None:
+            broadcasts.append(str(message.get("event", "")))
+
+        async def fake_refresh() -> None:
+            return None
+
+        server._broadcast = fake_broadcast
+        server._schedule_codex_refresh = fake_refresh
+
+        asyncio.run(server._handle_codex_event("turn/completed", {
+            "threadId": "thread-failed", "turn": {"status": "failed"},
+        }))
+
+        self.assertEqual(broadcasts, ["turn/failed"])
+
     def test_completed_turn_releases_bridge_runtime_before_desktop_open(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
         server.codex_refresh_task = None

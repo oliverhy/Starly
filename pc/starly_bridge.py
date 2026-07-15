@@ -556,7 +556,7 @@ class BridgeServer:
         assert self.codex is not None
         try:
             before = await self.codex.thread_detail(thread_id)
-            baseline_messages = len(before.get("messages", []))
+            baseline_message = self._latest_message_signature(before)
             thread_title = str(before.get("title", "")).strip()
             ok, result = await asyncio.to_thread(
                 self._send_to_codex_desktop, thread_id, thread_title, text, submit_mode)
@@ -575,7 +575,7 @@ class BridgeServer:
             if previous_poll and not previous_poll.done():
                 previous_poll.cancel()
             self.codex_poll_tasks[thread_id] = asyncio.create_task(
-                self._poll_desktop_codex_thread(thread_id, baseline_messages))
+                self._poll_desktop_codex_thread(thread_id, baseline_message))
             await self._schedule_codex_refresh()
         except Exception as error:
             error_text = str(error)
@@ -597,26 +597,33 @@ class BridgeServer:
             return False, input_result
         return True, f"{focus_result}；{input_result}"
 
-    async def _poll_desktop_codex_thread(self, thread_id: str, baseline_messages: int) -> None:
+    async def _poll_desktop_codex_thread(self, thread_id: str,
+                                         baseline_message: str) -> None:
         assert self.codex is not None
-        saw_activity = False
+        saw_active_turn = False
+        saw_new_message = False
         try:
             for _ in range(150):
                 await asyncio.sleep(2)
                 detail = await self.codex.thread_detail(thread_id)
                 active_turn_id = str(detail.get("activeTurnId", ""))
-                messages = detail.get("messages")
-                message_count = len(messages) if isinstance(messages, list) else 0
+                status = str(detail.get("status", "idle"))
+                latest_message = self._latest_message_signature(detail)
                 if active_turn_id:
-                    saw_activity = True
-                if message_count > baseline_messages:
-                    saw_activity = True
+                    saw_active_turn = True
+                if latest_message and latest_message != baseline_message:
+                    saw_new_message = True
                 await self._broadcast({
                     "type": "codex_thread", "thread": self._phone_thread_detail(detail),
                 })
-                if message_count >= baseline_messages + 2 and not active_turn_id and saw_activity:
+                # Local history is intentionally capped, so its length can stay at 15
+                # throughout a whole turn. Detect the active -> idle transition or a
+                # changed newest visible message instead of waiting for the list to grow.
+                terminal_event = self._terminal_poll_event(
+                    status, saw_active_turn or saw_new_message)
+                if not active_turn_id and terminal_event:
                     await self._broadcast({
-                        "type": "codex_event", "event": "turn/completed",
+                        "type": "codex_event", "event": terminal_event,
                         "params": {"threadId": thread_id},
                     })
                     await self._schedule_codex_refresh()
@@ -632,6 +639,33 @@ class BridgeServer:
             current = self.codex_poll_tasks.get(thread_id)
             if current is asyncio.current_task():
                 self.codex_poll_tasks.pop(thread_id, None)
+
+    @staticmethod
+    def _latest_message_signature(detail: dict[str, object]) -> str:
+        messages = detail.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            return json.dumps({
+                "role": str(message.get("role", "")),
+                "text": str(message.get("text", "")),
+                "timestamp": int(message.get("timestamp", 0) or 0),
+                "turnId": str(message.get("turnId", "")),
+                "images": message.get("images") if isinstance(message.get("images"), list) else [],
+            }, ensure_ascii=False, sort_keys=True)
+        return ""
+
+    @staticmethod
+    def _terminal_poll_event(status: str, saw_activity: bool) -> str:
+        if not saw_activity:
+            return ""
+        if status == "idle":
+            return "turn/completed"
+        if status == "systemError":
+            return "turn/failed"
+        return ""
 
     @staticmethod
     def _phone_thread_detail(detail: dict[str, object]) -> dict[str, object]:
@@ -658,7 +692,13 @@ class BridgeServer:
     async def _handle_codex_event(self, method: str, params: dict[str, object]) -> None:
         if method in ("thread/status/changed", "turn/started", "turn/completed",
                       "account/rateLimits/updated"):
-            await self._broadcast({"type": "codex_event", "event": method, "params": params})
+            phone_event = method
+            if method == "turn/completed":
+                turn = params.get("turn")
+                turn_status = str(turn.get("status", "")) if isinstance(turn, dict) else ""
+                if turn_status == "failed":
+                    phone_event = "turn/failed"
+            await self._broadcast({"type": "codex_event", "event": phone_event, "params": params})
             if method == "turn/completed":
                 thread_id = str(params.get("threadId", ""))
                 if thread_id in self.pending_desktop_open:

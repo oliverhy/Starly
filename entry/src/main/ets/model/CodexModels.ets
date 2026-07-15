@@ -40,6 +40,26 @@ export class CodexThreadDetail extends CodexTask {
   activeTurnId: string = '';
 }
 
+export function isCodexTerminalStatus(status: string): boolean {
+  return status === 'idle' || status === 'systemError';
+}
+
+export function resolveCodexDisplayStatus(status: string, isPending: boolean): string {
+  if (isPending && !isCodexTerminalStatus(status)) {
+    return 'active';
+  }
+  return status;
+}
+
+export function normalizeCodexDetailStatus(status: string, activeTurnId: string): string {
+  if (activeTurnId.length > 0) {
+    return 'active';
+  }
+  // A detail without an active turn is authoritative. Older bridge builds
+  // could leave a stale in-memory "active" status after the rollout completed.
+  return status === 'active' ? 'idle' : status;
+}
+
 function recordValue(value: Object | undefined): Record<string, Object> {
   return (value ?? {}) as Record<string, Object>;
 }

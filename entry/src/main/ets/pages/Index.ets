@@ -2,7 +2,10 @@ import { common } from '@kit.AbilityKit';
 import { scanBarcode } from '@kit.ScanKit';
 import { HdsNavigation, HdsNavigationTitleMode, ScrollEffectType, hdsEffect, hdsMaterial } from '@kit.UIDesignKit';
 import { PairingConfig, parsePairingUri } from '../model/PairingConfig';
-import { CodexMessage, CodexQuota, CodexSnapshot, CodexTask, CodexThreadDetail } from '../model/CodexModels';
+import {
+  CodexMessage, CodexQuota, CodexSnapshot, CodexTask, CodexThreadDetail,
+  isCodexTerminalStatus, normalizeCodexDetailStatus, resolveCodexDisplayStatus
+} from '../model/CodexModels';
 import pairingStore from '../service/PairingStore';
 import remoteInputClient, { RemoteClientListener } from '../service/RemoteInputClient';
 import speechService, { SpeechListener } from '../service/SpeechService';
@@ -176,7 +179,13 @@ struct Index {
         this.lastAction = message;
         if (message.startsWith('消息已发送给 Codex')) {
           this.codexCommand = '';
-          this.pendingCodexThreadId = this.selectedCodexTaskId;
+          const acknowledgedThreadId = this.pendingCodexThreadId.length > 0 ?
+            this.pendingCodexThreadId : this.selectedCodexTaskId;
+          this.pendingCodexThreadId = acknowledgedThreadId;
+          this.rememberCodexTaskStatus(acknowledgedThreadId, 'active');
+          if (acknowledgedThreadId === this.selectedCodexTaskId) {
+            this.selectedCodexStatus = 'active';
+          }
         } else {
           this.draft = '';
         }
@@ -209,6 +218,7 @@ struct Index {
         }
         for (let index = 0; index < mergedTasks.length; index += 1) {
           const task = mergedTasks[index];
+          this.clearFinishedCodexActivity(task.id, task.status);
           if (task.id === this.selectedCodexTaskId) {
             const contentChanged = this.selectedCodexUpdatedAt > 0 &&
               task.updatedAt > this.selectedCodexUpdatedAt;
@@ -226,6 +236,7 @@ struct Index {
         }
       },
       (detail: CodexThreadDetail): void => {
+        detail.status = normalizeCodexDetailStatus(detail.status, detail.activeTurnId);
         this.rememberCodexTaskStatus(detail.id, detail.status);
         if (detail.id !== this.selectedCodexTaskId) {
           return;
@@ -278,6 +289,12 @@ struct Index {
           // Refresh the list immediately. The auto-refresh timer below also
           // reads the selected thread again after the desktop has persisted
           // the final assistant message.
+          shouldRefreshSnapshot = true;
+        } else if (event === 'turn/failed' && threadId.length > 0) {
+          this.rememberCodexTaskStatus(threadId, 'systemError');
+          if (threadId === this.selectedCodexTaskId) {
+            this.selectedCodexStatus = 'systemError';
+          }
           shouldRefreshSnapshot = true;
         } else if (event === 'codex/refreshReady') {
           shouldRefreshThread = true;
@@ -1915,6 +1932,7 @@ struct Index {
     if (threadId.length === 0 || status.length === 0) {
       return;
     }
+    this.clearFinishedCodexActivity(threadId, status);
     const cachedStatus = this.codexResolvedStatuses.get(threadId);
     if (status === 'notLoaded' && cachedStatus !== undefined && cachedStatus !== 'notLoaded') {
       return;
@@ -1933,6 +1951,18 @@ struct Index {
     }
   }
 
+  private clearFinishedCodexActivity(threadId: string, status: string): void {
+    if (threadId.length === 0 || !isCodexTerminalStatus(status)) {
+      return;
+    }
+    if (this.pendingCodexThreadId === threadId) {
+      this.pendingCodexThreadId = '';
+    }
+    if (this.selectedCodexTaskId === threadId) {
+      this.selectedCodexActiveTurnId = '';
+    }
+  }
+
   private codexStatusLabel(status: string): string {
     if (status === 'active') {
       return '正在执行';
@@ -1947,18 +1977,16 @@ struct Index {
   }
 
   private effectiveCodexStatus(task: CodexTask): string {
-    if (task.id === this.pendingCodexThreadId) {
-      return 'active';
-    }
     const currentStatus = task.id === this.selectedCodexTaskId ? this.selectedCodexStatus : task.status;
-    return this.resolvedCodexStatus(task.id, currentStatus);
+    const resolvedStatus = this.resolvedCodexStatus(task.id, currentStatus);
+    return resolveCodexDisplayStatus(resolvedStatus, task.id === this.pendingCodexThreadId);
   }
 
   private collapsedSelectedCodexStatus(): string {
-    if (this.selectedCodexTaskId === this.pendingCodexThreadId) {
-      return 'active';
-    }
-    return this.resolvedCodexStatus(this.selectedCodexTaskId, this.selectedCodexStatus);
+    const resolvedStatus = this.resolvedCodexStatus(
+      this.selectedCodexTaskId, this.selectedCodexStatus);
+    return resolveCodexDisplayStatus(
+      resolvedStatus, this.selectedCodexTaskId === this.pendingCodexThreadId);
   }
 
   private selectedCodexTaskSubtitle(): string {
@@ -1981,6 +2009,11 @@ struct Index {
   }
 
   private isSelectedCodexRunning(): boolean {
+    const resolvedStatus = this.resolvedCodexStatus(
+      this.selectedCodexTaskId, this.selectedCodexStatus);
+    if (isCodexTerminalStatus(resolvedStatus)) {
+      return false;
+    }
     return this.selectedCodexActiveTurnId.length > 0 ||
       this.pendingCodexThreadId === this.selectedCodexTaskId;
   }

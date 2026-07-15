@@ -1,5 +1,8 @@
 import { describe, it, expect } from '@ohos/hypium';
 import { PairingConfig, parsePairingUri } from '../main/ets/model/PairingConfig';
+import {
+  isCodexTerminalStatus, normalizeCodexDetailStatus, resolveCodexDisplayStatus
+} from '../main/ets/model/CodexModels';
 
 export default function localUnitTest() {
   describe('PairingConfig', () => {
@@ -24,6 +27,23 @@ export default function localUnitTest() {
     it('rejectsMalformedPairingUri', 0, () => {
       expect(parsePairingUri('https://example.com') === null).assertTrue();
       expect(parsePairingUri('starly://pair?host=1.2.3.4') === null).assertTrue();
+    });
+
+    it('completedCodexStatusOverridesPendingState', 0, () => {
+      expect(isCodexTerminalStatus('idle')).assertTrue();
+      expect(isCodexTerminalStatus('systemError')).assertTrue();
+      expect(isCodexTerminalStatus('active')).assertFalse();
+      expect(isCodexTerminalStatus('notLoaded')).assertFalse();
+      expect(resolveCodexDisplayStatus('idle', true)).assertEqual('idle');
+      expect(resolveCodexDisplayStatus('systemError', true)).assertEqual('systemError');
+      expect(resolveCodexDisplayStatus('notLoaded', true)).assertEqual('active');
+      expect(resolveCodexDisplayStatus('active', true)).assertEqual('active');
+    });
+
+    it('emptyActiveTurnClearsStaleActiveStatus', 0, () => {
+      expect(normalizeCodexDetailStatus('active', '')).assertEqual('idle');
+      expect(normalizeCodexDetailStatus('idle', '')).assertEqual('idle');
+      expect(normalizeCodexDetailStatus('idle', 'turn-1')).assertEqual('active');
     });
   });
 }
