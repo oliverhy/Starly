@@ -131,6 +131,7 @@ struct Index {
   private codexDetailWatchdogTimer: number = -1;
   private codexDetailRetryCount: number = 0;
   private codexDetailRequestToken: number = 0;
+  private selectedCodexUpdatedAt: number = 0;
   private codexResolvedStatuses: Map<string, string> = new Map<string, string>();
   private pageScroller: Scroller = new Scroller();
   private submitTabsController: TabsController = new TabsController();
@@ -199,8 +200,26 @@ struct Index {
       (snapshot: CodexSnapshot): void => {
         this.codexAvailable = snapshot.available;
         this.codexError = snapshot.error;
-        this.codexQuota = snapshot.quota;
-        this.codexTasks = this.mergeCodexTaskStatuses(snapshot.threads);
+        if (!this.sameCodexQuota(this.codexQuota, snapshot.quota)) {
+          this.codexQuota = snapshot.quota;
+        }
+        const mergedTasks = this.mergeCodexTaskStatuses(snapshot.threads);
+        if (!this.sameCodexTasks(this.codexTasks, mergedTasks)) {
+          this.codexTasks = mergedTasks;
+        }
+        for (let index = 0; index < mergedTasks.length; index += 1) {
+          const task = mergedTasks[index];
+          if (task.id === this.selectedCodexTaskId) {
+            const contentChanged = this.selectedCodexUpdatedAt > 0 &&
+              task.updatedAt > this.selectedCodexUpdatedAt;
+            this.selectedCodexUpdatedAt = task.updatedAt;
+            this.selectedCodexStatus = this.resolvedCodexStatus(task.id, task.status);
+            if (contentChanged && !this.isCodexConversationOpen) {
+              this.requestSelectedCodexThread();
+            }
+            break;
+          }
+        }
         this.codexLoading = false;
         if (this.selectedCodexTaskId.length === 0 && snapshot.threads.length > 0) {
           this.selectCodexTask(snapshot.threads[0].id);
@@ -217,13 +236,17 @@ struct Index {
         this.selectedCodexCwd = detail.cwd;
         this.selectedCodexStatus = detail.status;
         this.selectedCodexActiveTurnId = detail.activeTurnId;
-        this.selectedCodexMessages = [...detail.messages];
+        this.selectedCodexUpdatedAt = detail.updatedAt;
+        const messagesChanged = !this.sameCodexMessages(this.selectedCodexMessages, detail.messages);
+        if (messagesChanged) {
+          this.selectedCodexMessages = [...detail.messages];
+          this.codexDetailVersion += 1;
+        }
         if (detail.activeTurnId.length > 0) {
           this.pendingCodexThreadId = detail.id;
         } else if (this.pendingCodexThreadId === detail.id) {
           this.pendingCodexThreadId = '';
         }
-        this.codexDetailVersion += 1;
         this.codexDetailLoading = false;
         this.codexLoading = false;
       },
@@ -1060,6 +1083,7 @@ struct Index {
             .borderRadius(14)
             .onClick(() => {
               this.isCodexConversationOpen = false;
+              this.requestSelectedCodexThread(true);
             })
         }
         .width('100%')
@@ -1621,7 +1645,7 @@ struct Index {
         return;
       }
       this.refreshCodexAutomatically();
-    }, 2000);
+    }, 5000);
   }
 
   private stopCodexAutoRefresh(): void {
@@ -1632,8 +1656,18 @@ struct Index {
     this.codexAutoRefreshTimer = -1;
   }
 
+  private shouldPollSelectedCodexDetail(): boolean {
+    if (this.isCodexConversationOpen || this.selectedCodexTaskId.length === 0) {
+      return false;
+    }
+    return this.selectedCodexStatus === 'active' ||
+      this.selectedCodexActiveTurnId.length > 0 ||
+      this.pendingCodexThreadId === this.selectedCodexTaskId;
+  }
+
   private async refreshCodexAutomatically(): Promise<void> {
-    if (this.codexAutoRefreshInFlight || !this.isConnected || this.mainSection !== 'codex') {
+    if (this.codexAutoRefreshInFlight || !this.isConnected || this.mainSection !== 'codex' ||
+      this.isCodexConversationOpen) {
       return;
     }
     this.codexAutoRefreshInFlight = true;
@@ -1642,7 +1676,7 @@ struct Index {
       // list first, then read the selected task after a short gap so the
       // detail response is not rejected as a burst request.
       await remoteInputClient.requestCodexSnapshot();
-      if (this.selectedCodexTaskId.length > 0) {
+      if (this.shouldPollSelectedCodexDetail()) {
         await new Promise<void>((resolve: () => void) => {
           setTimeout(resolve, 180);
         });
@@ -1660,7 +1694,7 @@ struct Index {
     if (!this.isConnected || this.mainSection !== 'codex' || threadId.length === 0) {
       return;
     }
-    if (!force && this.codexDetailLoading) {
+    if (!force && (this.codexDetailLoading || this.isCodexConversationOpen)) {
       return;
     }
     this.codexDetailLoading = true;
@@ -1784,12 +1818,14 @@ struct Index {
         this.selectedCodexTitle = task.title;
         this.selectedCodexCwd = task.cwd;
         this.selectedCodexStatus = this.resolvedCodexStatus(task.id, task.status);
+        this.selectedCodexUpdatedAt = task.updatedAt;
         return;
       }
     }
     this.selectedCodexTitle = '任务详情';
     this.selectedCodexCwd = '';
     this.selectedCodexStatus = 'notLoaded';
+    this.selectedCodexUpdatedAt = 0;
   }
 
   private toggleCodexTasks(): void {
@@ -1813,6 +1849,53 @@ struct Index {
     if (threadId !== this.selectedCodexTaskId) {
       this.selectCodexTask(threadId);
     }
+  }
+
+  private sameCodexTasks(current: CodexTask[], next: CodexTask[]): boolean {
+    if (current.length !== next.length) {
+      return false;
+    }
+    for (let index = 0; index < current.length; index += 1) {
+      const left = current[index];
+      const right = next[index];
+      if (left.id !== right.id || left.title !== right.title ||
+        left.preview !== right.preview || left.status !== right.status ||
+        left.cwd !== right.cwd) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private sameCodexQuota(current: CodexQuota, next: CodexQuota): boolean {
+    return current.remainingPercent === next.remainingPercent &&
+      current.usedPercent === next.usedPercent && current.resetAt === next.resetAt &&
+      current.windowMinutes === next.windowMinutes &&
+      current.secondaryRemainingPercent === next.secondaryRemainingPercent &&
+      current.secondaryResetAt === next.secondaryResetAt && current.plan === next.plan &&
+      current.credits === next.credits && current.resetCredits === next.resetCredits &&
+      current.lifetimeTokens === next.lifetimeTokens;
+  }
+
+  private sameCodexMessages(current: CodexMessage[], next: CodexMessage[]): boolean {
+    if (current.length !== next.length) {
+      return false;
+    }
+    for (let index = 0; index < current.length; index += 1) {
+      const left = current[index];
+      const right = next[index];
+      if (left.role !== right.role || left.text !== right.text ||
+        left.timestamp !== right.timestamp || left.turnId !== right.turnId ||
+        left.images.length !== right.images.length) {
+        return false;
+      }
+      for (let imageIndex = 0; imageIndex < left.images.length; imageIndex += 1) {
+        if (left.images[imageIndex] !== right.images[imageIndex]) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   private mergeCodexTaskStatuses(tasks: CodexTask[]): CodexTask[] {
