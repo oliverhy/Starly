@@ -162,6 +162,15 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(text, "看看这张图")
         self.assertEqual(images, ["https://example.com/test.png"])
 
+    def test_codex_history_extracts_markdown_images(self) -> None:
+        role, text, images = _item_content({
+            "type": "agentMessage",
+            "text": "结果如下：![预览](https://example.com/result.png)",
+        })
+        self.assertEqual(role, "assistant")
+        self.assertEqual(text, "结果如下：预览")
+        self.assertEqual(images, ["https://example.com/result.png"])
+
     def test_desktop_thread_opens_only_after_turn_completed(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
         server.pending_desktop_open = {"thread-1"}

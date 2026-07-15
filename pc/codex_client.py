@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -111,7 +112,14 @@ def _local_image_data_url(raw_path: str) -> str:
         return ""
     if path_text.startswith("file://"):
         from urllib.parse import unquote, urlparse
-        path_text = unquote(urlparse(path_text).path).lstrip("/") if os.name == "nt" else unquote(urlparse(path_text).path)
+        parsed = urlparse(path_text)
+        decoded_path = unquote(parsed.path)
+        if os.name == "nt":
+            # Handle both file:///C:/... and file://C:/... forms.
+            path_text = (parsed.netloc + decoded_path) if parsed.netloc else decoded_path
+            path_text = path_text.lstrip("/")
+        else:
+            path_text = decoded_path
     path = Path(path_text)
     if not path.is_file():
         return ""
@@ -139,10 +147,43 @@ def _image_source(value: object) -> str:
     return _local_image_data_url(source)
 
 
+_MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\((?:<([^>]+)>|([^\)]+))\)")
+_HTML_IMAGE_PATTERN = re.compile(
+    r"<img\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _extract_inline_images(text: str) -> tuple[str, list[str]]:
+    """Convert Markdown/HTML image references into phone-renderable sources."""
+    images: list[str] = []
+
+    def replace_markdown(match: re.Match[str]) -> str:
+        alt = match.group(1).strip()
+        candidate = (match.group(2) or match.group(3) or "").strip()
+        source = _image_source(candidate)
+        if not source:
+            return match.group(0)
+        images.append(source)
+        return alt or "图片"
+
+    def replace_html(match: re.Match[str]) -> str:
+        source = _image_source(match.group(1).strip())
+        if not source:
+            return match.group(0)
+        images.append(source)
+        return "图片"
+
+    cleaned = _MARKDOWN_IMAGE_PATTERN.sub(replace_markdown, text)
+    cleaned = _HTML_IMAGE_PATTERN.sub(replace_html, cleaned)
+    return cleaned.strip(), images
+
+
 def _item_content(item: JsonObject) -> tuple[str, str, list[str]]:
     item_type = str(item.get("type", ""))
     if item_type == "agentMessage":
-        return "assistant", str(item.get("text", "")), []
+        text, images = _extract_inline_images(_usable_text(item.get("text")))
+        return "assistant", text, images
     if item_type == "userMessage":
         content = item.get("content")
         parts: list[str] = []
@@ -155,14 +196,16 @@ def _item_content(item: JsonObject) -> tuple[str, str, list[str]]:
                 if value_type in ("text", "inputText"):
                     parts.append(str(value.get("text", "")))
                 elif value_type == "image":
-                    source = _image_source(value.get("url"))
+                    source = _image_source(value.get(
+                        "url", value.get("path", value.get("imageUrl"))))
                     if source:
                         images.append(source)
                 elif value_type in ("localImage", "inputImage"):
                     source = _image_source(value.get("path", value.get("imageUrl")))
                     if source:
                         images.append(source)
-        return "user", "\n".join(parts), images
+        text, inline_images = _extract_inline_images("\n".join(parts))
+        return "user", text, images + inline_images
     if item_type == "imageGeneration":
         source = _image_source(item.get("savedPath", item.get("result")))
         return "assistant", "生成的图片", [source] if source else []

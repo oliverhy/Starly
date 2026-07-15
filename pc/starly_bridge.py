@@ -37,6 +37,7 @@ DEFAULT_PORT = 8765
 MAX_TEXT_LENGTH = 8000
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
+LOG_PATH = CONFIG_DIR / "bridge.log"
 SINGLE_INSTANCE_MUTEX = "Local\\StarlyBridge.SingleInstance"
 _single_instance_handle: int | None = None
 
@@ -436,11 +437,11 @@ class BridgeServer:
             return
         self.event_queue.put(("client", f"手机已连接：{remote_ip}"))
         self.connections.add(connection)
-        await connection.send(json.dumps({
+        await self._send_json(connection, {
             "type": "hello",
             "computer": socket.gethostname(),
             "version": "2.0.0",
-        }, ensure_ascii=False))
+        })
         await self._send_codex_snapshot(connection)
         last_action = 0.0
         try:
@@ -461,6 +462,7 @@ class BridgeServer:
         if not isinstance(raw, str):
             await self._send_error(connection, "不支持二进制消息")
             return
+        self._log_wire("手机→电脑", connection, raw)
         try:
             message = json.loads(raw)
         except json.JSONDecodeError:
@@ -520,16 +522,16 @@ class BridgeServer:
             return
         self.event_queue.put(("action" if ok else "error", result))
         response_type = "ack" if ok else "error"
-        await connection.send(json.dumps({
+        await self._send_json(connection, {
             "type": response_type,
             "id": message_id,
             "message": result,
-        }, ensure_ascii=False))
+        })
 
     async def _send_codex_snapshot(self, connection: websockets.ServerConnection) -> None:
         assert self.codex is not None
         snapshot = await self.codex.snapshot()
-        await connection.send(json.dumps({"type": "codex_snapshot", **snapshot}, ensure_ascii=False))
+        await self._send_json(connection, {"type": "codex_snapshot", **snapshot})
 
     async def _send_codex_thread(self, connection: websockets.ServerConnection,
                                  thread_id: str, message_id: str = "") -> None:
@@ -538,9 +540,9 @@ class BridgeServer:
             # Reading history must stay read-only. Resuming here leaves a second
             # app-server owning the same thread and makes the desktop view stale.
             detail = await self.codex.thread_detail(thread_id)
-            await connection.send(json.dumps({
+            await self._send_json(connection, {
                 "type": "codex_thread", "id": message_id, "thread": detail,
-            }, ensure_ascii=False))
+            })
         except Exception as error:
             await self._send_error(connection, f"读取 Codex 任务失败：{error}", message_id)
 
@@ -555,11 +557,11 @@ class BridgeServer:
                 self._send_to_codex_desktop, thread_id, thread_title, text, submit_mode)
             if not ok:
                 raise RuntimeError(result)
-            await connection.send(json.dumps({
+            await self._send_json(connection, {
                 "type": "ack", "id": message_id,
                 "message": "消息已发送给 Codex，电脑端已按" +
                            (" Ctrl+回车" if submit_mode == "ctrl_enter" else "回车"),
-            }, ensure_ascii=False))
+            })
             await self._broadcast({
                 "type": "codex_event", "event": "turn/started",
                 "params": {"threadId": thread_id},
@@ -629,9 +631,9 @@ class BridgeServer:
         assert self.codex is not None
         try:
             await self.codex.interrupt(thread_id, turn_id)
-            await connection.send(json.dumps({
+            await self._send_json(connection, {
                 "type": "ack", "id": message_id, "message": "已请求停止 Codex 任务",
-            }, ensure_ascii=False))
+            })
             await self._schedule_codex_refresh()
         except Exception as error:
             await self._send_error(connection, f"停止 Codex 任务失败：{error}", message_id)
@@ -693,10 +695,53 @@ class BridgeServer:
         raw = json.dumps(message, ensure_ascii=False)
         async def send_one(connection: websockets.ServerConnection) -> None:
             try:
+                self._log_wire("电脑→手机", connection, message)
                 await asyncio.wait_for(connection.send(raw), timeout=2)
             except (websockets.ConnectionClosed, asyncio.TimeoutError):
                 self.connections.discard(connection)
         await asyncio.gather(*(send_one(connection) for connection in list(self.connections)))
+
+    async def _send_json(self, connection: websockets.ServerConnection,
+                         message: dict[str, object]) -> None:
+        self._log_wire("电脑→手机", connection, message)
+        await connection.send(json.dumps(message, ensure_ascii=False))
+
+    def _log_wire(self, direction: str, connection: object, payload: object) -> None:
+        """Send a readable, secret-safe wire record to the desktop log UI."""
+        peer = "未知设备"
+        try:
+            remote = getattr(connection, "remote_address", None)
+            if remote:
+                peer = str(remote[0]) if isinstance(remote, tuple) else str(remote)
+        except (AttributeError, IndexError, TypeError):
+            pass
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                pass
+        safe_payload: object = payload
+        try:
+            safe_payload = self._safe_log_value(payload)
+            detail = json.dumps(safe_payload, ensure_ascii=False, separators=(",", ":")) \
+                if not isinstance(safe_payload, str) else safe_payload
+        except (TypeError, ValueError):
+            detail = str(safe_payload)
+        self.event_queue.put(("wire", f"{direction} [{peer}] {detail}"))
+
+    @classmethod
+    def _safe_log_value(cls, value: object, key: str = "") -> object:
+        key_lower = key.lower()
+        if key_lower in ("token", "authorization", "pairingtoken"):
+            return "[已隐藏]"
+        if isinstance(value, dict):
+            return {str(item_key): cls._safe_log_value(item_value, str(item_key))
+                    for item_key, item_value in value.items()}
+        if isinstance(value, list):
+            return [cls._safe_log_value(item, key) for item in value]
+        if isinstance(value, str) and value.startswith("data:image/"):
+            return f"[图片数据已省略，长度={len(value)}]"
+        return value
 
     async def _send_error(
         self,
@@ -704,7 +749,9 @@ class BridgeServer:
         message: str,
         message_id: str = "",
     ) -> None:
-        await connection.send(json.dumps({"type": "error", "id": message_id, "message": message}, ensure_ascii=False))
+        await self._send_json(connection, {
+            "type": "error", "id": message_id, "message": message,
+        })
 
     @staticmethod
     def _is_allowed_address(value: str) -> bool:
@@ -790,6 +837,7 @@ class BridgeApp:
         ttk.Label(outer, text="运行记录", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor=tk.W)
         self.log_text = tk.Text(outer, height=10, state=tk.DISABLED, wrap=tk.WORD, relief=tk.FLAT, background="#F2F4F7")
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        self._load_existing_log()
         ttk.Label(
             outer,
             text="使用时先最小化本窗口，再点击电脑上的目标输入框。为安全起见，仅接受局域网设备和正确配对密钥。",
@@ -832,8 +880,28 @@ class BridgeApp:
         self.root.after(120, self._poll_events)
 
     def _append_log(self, message: str) -> None:
+        line = time.strftime("%Y-%m-%d %H:%M:%S  ") + message
         self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, time.strftime("%H:%M:%S  ") + message + "\n")
+        self.log_text.insert(tk.END, line + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            # The live UI log remains available even if the disk log cannot be written.
+            pass
+
+    def _load_existing_log(self) -> None:
+        try:
+            lines = LOG_PATH.read_text(encoding="utf-8").splitlines()[-300:]
+        except (OSError, UnicodeError):
+            return
+        if not lines:
+            return
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, "—— 已加载最近运行记录 ——\n" + "\n".join(lines) + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
