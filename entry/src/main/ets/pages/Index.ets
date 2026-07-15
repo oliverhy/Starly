@@ -104,6 +104,7 @@ struct Index {
   @State codexQuota: CodexQuota = new CodexQuota();
   @State codexTasks: CodexTask[] = [];
   @State areCodexTasksExpanded: boolean = true;
+  @State codexTaskDisplayLimit: number = 10;
   @State selectedCodexTaskId: string = '';
   @State selectedCodexTitle: string = '';
   @State selectedCodexCwd: string = '';
@@ -122,6 +123,8 @@ struct Index {
   private voiceStartY: number = 0;
   private voicePressSequence: number = 0;
   private pendingVoiceSend: boolean = false;
+  private lastCodexTaskTapId: string = '';
+  private lastCodexTaskTapAt: number = 0;
   private codexResolvedStatuses: Map<string, string> = new Map<string, string>();
   private pageScroller: Scroller = new Scroller();
   private submitTabsController: TabsController = new TabsController();
@@ -637,6 +640,36 @@ struct Index {
         }
       }
       .width('100%')
+      if (this.areCodexTasksExpanded && this.codexTasks.length > 10) {
+        Row({ space: 5 }) {
+          Text('显示')
+            .fontSize(11)
+            .fontColor($r('app.color.text_secondary'))
+            .margin({ right: 3 })
+          ForEach([10, 20, 30], (limit: number) => {
+            Button(`${limit} 个`)
+              .layoutWeight(1)
+              .height(30)
+              .fontSize(11)
+              .fontWeight(this.codexTaskDisplayLimit === limit ? FontWeight.Bold : FontWeight.Normal)
+              .fontColor(this.codexTaskDisplayLimit === limit ? '#175CD3' :
+                $r('app.color.text_secondary'))
+              .backgroundColor(this.codexTaskDisplayLimit === limit ? '#1A175CD3' : Color.Transparent)
+              .border({
+                width: 1,
+                color: this.codexTaskDisplayLimit === limit ? '#52175CD3' :
+                  $r('app.color.glass_border')
+              })
+              .borderRadius(15)
+              .animation({ duration: 220, curve: Curve.EaseOut })
+              .onClick(() => {
+                this.codexTaskDisplayLimit = limit;
+              })
+          }, (limit: number): string => `codex-task-limit-${limit}`)
+        }
+        .width('100%')
+        .padding({ top: 5, bottom: 7 })
+      }
       if (!this.areCodexTasksExpanded) {
         if (this.selectedCodexTaskId.length > 0) {
           Row({ space: 11 }) {
@@ -695,7 +728,7 @@ struct Index {
           .translate({ y: -2 })
           .scale({ x: 1.015, y: 1.015 })
           .animation({ duration: 260, curve: Curve.EaseOut })
-          .onClick(() => this.toggleCodexTasks())
+          .onClick(() => this.handleCodexTaskTap(this.selectedCodexTaskId))
         } else {
           Row() {
             Text('暂未选择任务')
@@ -718,7 +751,7 @@ struct Index {
           .fontColor($r('app.color.text_secondary'))
           .padding({ top: 24, bottom: 24 })
       } else {
-        ForEach(this.codexTasks.slice(0, 10), (task: CodexTask) => {
+        ForEach(this.codexTasks.slice(0, this.codexTaskDisplayLimit), (task: CodexTask) => {
           Row({ space: 11 }) {
             if (this.selectedCodexTaskId === task.id) {
               Stack({ alignContent: Alignment.Center }) {
@@ -804,7 +837,7 @@ struct Index {
           })
           .zIndex(this.selectedCodexTaskId === task.id ? 2 : 0)
           .animation({ duration: 260, curve: Curve.EaseOut })
-          .onClick(() => this.selectCodexTask(task.id))
+          .onClick(() => this.handleCodexTaskTap(task.id))
         }, (task: CodexTask): string => task.id)
       }
     }
@@ -1611,6 +1644,23 @@ struct Index {
     this.getUIContext().animateTo({ duration: 240, curve: Curve.EaseOut }, () => {
       this.areCodexTasksExpanded = !this.areCodexTasksExpanded;
     });
+  }
+
+  private handleCodexTaskTap(threadId: string): void {
+    const now = Date.now();
+    const isDoubleTap = threadId === this.lastCodexTaskTapId &&
+      now - this.lastCodexTaskTapAt <= 450;
+    this.lastCodexTaskTapId = threadId;
+    this.lastCodexTaskTapAt = now;
+    if (isDoubleTap && threadId === this.selectedCodexTaskId) {
+      this.lastCodexTaskTapId = '';
+      this.lastCodexTaskTapAt = 0;
+      this.toggleCodexTasks();
+      return;
+    }
+    if (threadId !== this.selectedCodexTaskId) {
+      this.selectCodexTask(threadId);
+    }
   }
 
   private mergeCodexTaskStatuses(tasks: CodexTask[]): CodexTask[] {
