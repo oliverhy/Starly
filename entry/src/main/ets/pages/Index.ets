@@ -1695,8 +1695,8 @@ struct Index {
       return;
     }
     let nextOffset = offsetX;
-    const isOutsideEdge = (this.mainSection === 'voice' && nextOffset < 0) ||
-      (this.mainSection === 'codex' && nextOffset > 0);
+    const isOutsideEdge = (this.mainSection === 'voice' && nextOffset > 0) ||
+      (this.mainSection === 'codex' && nextOffset < 0);
     if (isOutsideEdge) {
       nextOffset *= 0.12;
     }
@@ -1711,11 +1711,11 @@ struct Index {
     }
     this.updateMainSectionSwipe(offsetX);
     const threshold = Math.min(72, this.mainSectionViewportWidth * 0.2);
-    if (this.mainSection === 'voice' && this.mainSectionDragOffset > threshold) {
+    if (this.mainSection === 'voice' && this.mainSectionDragOffset < -threshold) {
       this.settleMainSection('codex');
       return;
     }
-    if (this.mainSection === 'codex' && this.mainSectionDragOffset < -threshold) {
+    if (this.mainSection === 'codex' && this.mainSectionDragOffset > threshold) {
       this.settleMainSection('voice');
       return;
     }
@@ -1749,8 +1749,8 @@ struct Index {
   private settleMainSection(targetSection: string): void {
     const currentDragOffset = this.mainSectionDragOffset;
     const adjustedOffset = targetSection === 'codex' ?
-      currentDragOffset - this.mainSectionViewportWidth :
-      currentDragOffset + this.mainSectionViewportWidth;
+      currentDragOffset + this.mainSectionViewportWidth :
+      currentDragOffset - this.mainSectionViewportWidth;
     this.mainSectionAnimating = true;
     this.mainSection = targetSection;
     this.mainSectionDragOffset = adjustedOffset;
