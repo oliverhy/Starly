@@ -474,28 +474,28 @@ struct Index {
           .width(520)
           .height(520)
           .borderRadius(260)
-          .backgroundColor('#525B8CFF')
+          .backgroundColor('#705B8CFF')
           .blur(138)
           .position({ x: -150, y: -170 })
         Column()
           .width(500)
           .height(500)
           .borderRadius(250)
-          .backgroundColor('#48BB84FF')
+          .backgroundColor('#64BB84FF')
           .blur(150)
           .position({ x: '66%', y: 90 })
         Column()
           .width(600)
           .height(600)
           .borderRadius(300)
-          .backgroundColor('#40A36BFF')
+          .backgroundColor('#58A36BFF')
           .blur(160)
           .position({ x: -190, y: 560 })
         Column()
           .width(520)
           .height(520)
           .borderRadius(260)
-          .backgroundColor('#36D4B5FF')
+          .backgroundColor('#4CD4B5FF')
           .blur(155)
           .position({ x: '70%', y: 610 })
       } else {
@@ -895,15 +895,16 @@ struct Index {
     }
     .width('100%')
     .padding(18)
-    .backgroundColor($r('app.color.glass_surface'))
-    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+    .backgroundColor(this.codexGlassSurfaceColor())
+    .backgroundBlurStyle(this.useTwoPaneCodexLayout() ? BlurStyle.NONE :
+      BlurStyle.COMPONENT_ULTRA_THIN, {
       colorMode: ThemeColorMode.SYSTEM,
       adaptiveColor: AdaptiveColor.DEFAULT,
       scale: 0.9
     })
-    .border({ width: 1, color: $r('app.color.glass_border') })
+    .border({ width: 1, color: this.codexGlassBorderColor() })
     .borderRadius(28)
-    .shadow({ radius: 28, color: $r('app.color.glass_shadow'), offsetY: 10 })
+    .shadow({ radius: 28, color: this.codexGlassShadowColor(), offsetY: 10 })
   }
 
   @Builder
@@ -928,36 +929,6 @@ struct Index {
         }
       }
       .width('100%')
-      if (this.areCodexTasksExpanded && this.codexTasks.length > 10) {
-        Row({ space: 5 }) {
-          Text('显示')
-            .fontSize(11)
-            .fontColor($r('app.color.text_secondary'))
-            .margin({ right: 3 })
-          ForEach([10, 20, 30], (limit: number) => {
-            Button(`${limit} 个`)
-              .layoutWeight(1)
-              .height(30)
-              .fontSize(11)
-              .fontWeight(this.codexTaskDisplayLimit === limit ? FontWeight.Bold : FontWeight.Normal)
-              .fontColor(this.codexTaskDisplayLimit === limit ? '#175CD3' :
-                $r('app.color.text_secondary'))
-              .backgroundColor(this.codexTaskDisplayLimit === limit ? '#1A175CD3' : Color.Transparent)
-              .border({
-                width: 1,
-                color: this.codexTaskDisplayLimit === limit ? '#52175CD3' :
-                  $r('app.color.glass_border')
-              })
-              .borderRadius(15)
-              .animation({ duration: 220, curve: Curve.EaseOut })
-              .onClick(() => {
-                this.codexTaskDisplayLimit = limit;
-              })
-          }, (limit: number): string => `codex-task-limit-${limit}`)
-        }
-        .width('100%')
-        .padding({ top: 5, bottom: 7 })
-      }
       if (!this.areCodexTasksExpanded) {
         if (this.selectedCodexTaskId.length > 0) {
           Row({ space: 11 }) {
@@ -1039,8 +1010,10 @@ struct Index {
           .fontColor($r('app.color.text_secondary'))
           .padding({ top: 24, bottom: 24 })
       } else {
-        ForEach(this.codexTasks.slice(0, this.codexTaskDisplayLimit), (task: CodexTask) => {
-          Row({ space: 11 }) {
+        List({ space: 4 }) {
+          ForEach(this.codexTasks.slice(0, this.codexTaskDisplayLimit), (task: CodexTask) => {
+            ListItem() {
+              Row({ space: 11 }) {
             if (this.selectedCodexTaskId === task.id) {
               Stack({ alignContent: Alignment.Center }) {
                 Text('')
@@ -1103,43 +1076,65 @@ struct Index {
                 .fontColor(this.codexStatusColor(this.effectiveCodexStatus(task)))
                 .maxLines(1)
             }
+              }
+              .width(this.selectedCodexTaskId === task.id ? '94%' : '100%')
+              .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+              .backgroundColor(this.selectedCodexTaskId === task.id ?
+                $r('app.color.glass_surface_strong') : Color.Transparent)
+              .border({
+                width: this.selectedCodexTaskId === task.id ? 2 : 1,
+                color: this.selectedCodexTaskId === task.id ? '#73175CD3' : Color.Transparent
+              })
+              .borderRadius(this.selectedCodexTaskId === task.id ? 21 : 17)
+              .shadow({
+                radius: this.selectedCodexTaskId === task.id ? 22 : 0,
+                color: this.selectedCodexTaskId === task.id ? '#4A175CD3' : Color.Transparent,
+                offsetY: this.selectedCodexTaskId === task.id ? 8 : 0
+              })
+              .translate({ y: 0 })
+              .scale({ x: 1, y: 1 })
+              .margin({
+                left: this.selectedCodexTaskId === task.id ? 10 : 0,
+                right: this.selectedCodexTaskId === task.id ? 10 : 0,
+                top: this.selectedCodexTaskId === task.id ? 5 : 0,
+                bottom: this.selectedCodexTaskId === task.id ? 11 : 0
+              })
+              .zIndex(this.selectedCodexTaskId === task.id ? 2 : 0)
+              .animation({ duration: 260, curve: Curve.EaseOut })
+              .onClick(() => this.handleCodexTaskTap(task.id))
+            }
+          }, (task: CodexTask): string => task.id)
+          if (this.codexTaskDisplayLimit < this.codexTasks.length) {
+            ListItem() {
+              Text('继续向下滑动，加载更多')
+                .width('100%')
+                .textAlign(TextAlign.Center)
+                .fontSize(11)
+                .fontColor('#175CD3')
+                .padding({ top: 12, bottom: 12 })
+            }
           }
-          .width(this.selectedCodexTaskId === task.id ? '98%' : '100%')
-          .padding({ left: 12, right: 12, top: 12, bottom: 12 })
-          .backgroundColor(this.selectedCodexTaskId === task.id ?
-            $r('app.color.glass_surface_strong') : Color.Transparent)
-          .border({
-            width: this.selectedCodexTaskId === task.id ? 2 : 1,
-            color: this.selectedCodexTaskId === task.id ? '#73175CD3' : Color.Transparent
-          })
-          .borderRadius(this.selectedCodexTaskId === task.id ? 21 : 17)
-          .shadow({
-            radius: this.selectedCodexTaskId === task.id ? 22 : 0,
-            color: this.selectedCodexTaskId === task.id ? '#4A175CD3' : Color.Transparent,
-            offsetY: this.selectedCodexTaskId === task.id ? 8 : 0
-          })
-          .translate({ y: this.selectedCodexTaskId === task.id ? -2 : 0 })
-          .scale({
-            x: this.selectedCodexTaskId === task.id ? 1.015 : 1,
-            y: this.selectedCodexTaskId === task.id ? 1.015 : 1
-          })
-          .zIndex(this.selectedCodexTaskId === task.id ? 2 : 0)
-          .animation({ duration: 260, curve: Curve.EaseOut })
-          .onClick(() => this.handleCodexTaskTap(task.id))
-        }, (task: CodexTask): string => task.id)
+        }
+        .width('100%')
+        .height(this.codexTaskListViewportHeight())
+        .padding({ left: 5, right: 5, top: 9, bottom: 14 })
+        .scrollBar(BarState.Auto)
+        .edgeEffect(EdgeEffect.Spring)
+        .onReachEnd(() => this.loadMoreCodexTasks())
       }
     }
     .width('100%')
     .padding(16)
-    .backgroundColor($r('app.color.glass_surface'))
-    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+    .backgroundColor(this.codexGlassSurfaceColor())
+    .backgroundBlurStyle(this.useTwoPaneCodexLayout() ? BlurStyle.NONE :
+      BlurStyle.COMPONENT_ULTRA_THIN, {
       colorMode: ThemeColorMode.SYSTEM,
       adaptiveColor: AdaptiveColor.DEFAULT,
       scale: 0.88
     })
-    .border({ width: 1, color: $r('app.color.glass_border') })
+    .border({ width: 1, color: this.codexGlassBorderColor() })
     .borderRadius(28)
-    .shadow({ radius: 28, color: $r('app.color.glass_shadow'), offsetY: 10 })
+    .shadow({ radius: 28, color: this.codexGlassShadowColor(), offsetY: 10 })
   }
 
   @Builder
@@ -1311,7 +1306,7 @@ struct Index {
           .padding({ left: 4, right: 4 })
           .fontSize(this.useTwoPaneCodexLayout() ? 12 : 10)
           .fontColor(this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0 ?
-            '#175CD3' : $r('app.color.text_secondary'))
+            '#175CD3' : '#344054')
           .backgroundColor($r('app.color.glass_surface_strong'))
           .border({ width: 1, color: $r('app.color.glass_border') })
           .borderRadius(14)
@@ -1324,7 +1319,7 @@ struct Index {
           .padding({ left: 4, right: 4 })
           .fontSize(this.useTwoPaneCodexLayout() ? 12 : 10)
           .fontColor(this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0 ?
-            '#175CD3' : $r('app.color.text_secondary'))
+            '#175CD3' : '#344054')
           .backgroundColor($r('app.color.glass_surface_strong'))
           .border({ width: 1, color: $r('app.color.glass_border') })
           .borderRadius(14)
@@ -1350,15 +1345,16 @@ struct Index {
     .width('100%')
     .height(this.codexDetailCardHeight())
     .padding(16)
-    .backgroundColor($r('app.color.glass_surface'))
-    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+    .backgroundColor(this.codexGlassSurfaceColor())
+    .backgroundBlurStyle(this.useTwoPaneCodexLayout() ? BlurStyle.NONE :
+      BlurStyle.COMPONENT_ULTRA_THIN, {
       colorMode: ThemeColorMode.SYSTEM,
       adaptiveColor: AdaptiveColor.DEFAULT,
       scale: 0.9
     })
-    .border({ width: 1, color: $r('app.color.glass_border') })
+    .border({ width: 1, color: this.codexGlassBorderColor() })
     .borderRadius(28)
-    .shadow({ radius: 28, color: $r('app.color.glass_shadow'), offsetY: 10 })
+    .shadow({ radius: 28, color: this.codexGlassShadowColor(), offsetY: 10 })
   }
 
   @Builder
@@ -1574,8 +1570,10 @@ struct Index {
         .id('voiceDraftEditor')
         .height(150)
         .fontSize(17)
-        .backgroundColor($r('app.color.input_background'))
-        .border({ width: 1, color: $r('app.color.glass_border') })
+        .fontColor($r('app.color.text_primary'))
+        .placeholderColor(this.voiceSecondaryTextColor())
+        .backgroundColor(this.voiceInnerSurfaceColor())
+        .border({ width: 1, color: this.codexGlassBorderColor() })
         .borderRadius(20)
         .padding(12)
         .onChange((value: string) => {
@@ -1591,7 +1589,7 @@ struct Index {
                 .fontColor($r('app.color.text_primary'))
               Text('按住说话，松手停止识别')
                 .fontSize(11)
-                .fontColor($r('app.color.text_secondary'))
+                .fontColor(this.voiceSecondaryTextColor())
             }
             .width('100%')
             .justifyContent(FlexAlign.Center)
@@ -1599,13 +1597,13 @@ struct Index {
             .width('100%')
             .height(66)
             .padding(0)
-            .backgroundColor($r('app.color.glass_surface_strong'))
-            .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+            .backgroundColor(this.voiceActionSurfaceColor())
+            .backgroundBlurStyle(this.useTwoPaneCodexLayout() ? BlurStyle.NONE : BlurStyle.COMPONENT_ULTRA_THIN, {
               colorMode: ThemeColorMode.SYSTEM,
               adaptiveColor: AdaptiveColor.DEFAULT,
               scale: 0.82
             })
-            .border({ width: 1, color: $r('app.color.glass_border') })
+            .border({ width: 1, color: this.codexGlassBorderColor() })
             .borderRadius(33)
             .visualEffect(this.isVoicePressing ? this.voiceActiveEffect : this.voiceRestEffect)
             .shadow({
@@ -1627,10 +1625,10 @@ struct Index {
                 .fontSize(15)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_primary'))
-                .backgroundColor($r('app.color.glass_surface_strong'))
+                .backgroundColor(this.voiceActionSurfaceColor())
                 .border({
                   width: this.voiceGestureAction === VoiceGestureAction.Send ? 2 : 1,
-                  color: this.voiceGestureAction === VoiceGestureAction.Send ? '#FFFFFFFF' : $r('app.color.glass_border')
+                  color: this.voiceGestureAction === VoiceGestureAction.Send ? '#FFFFFFFF' : this.codexGlassBorderColor()
                 })
                 .borderRadius(24)
                 .visualEffect(this.voiceGestureAction === VoiceGestureAction.Send ?
@@ -1653,10 +1651,10 @@ struct Index {
                 .fontSize(15)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.text_primary'))
-                .backgroundColor($r('app.color.glass_surface_strong'))
+                .backgroundColor(this.voiceActionSurfaceColor())
                 .border({
                   width: this.voiceGestureAction === VoiceGestureAction.Edit ? 2 : 1,
-                  color: this.voiceGestureAction === VoiceGestureAction.Edit ? '#FFFFFFFF' : $r('app.color.glass_border')
+                  color: this.voiceGestureAction === VoiceGestureAction.Edit ? '#FFFFFFFF' : this.codexGlassBorderColor()
                 })
                 .borderRadius(24)
                 .visualEffect(this.voiceGestureAction === VoiceGestureAction.Edit ?
@@ -1694,7 +1692,7 @@ struct Index {
             .height(30)
             .textAlign(TextAlign.Center)
             .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
+            .fontColor(this.voiceSecondaryTextColor())
         }
         .tabBar(this.buildSubmitModeTab(0, 'Ctrl + 回车'))
 
@@ -1704,7 +1702,7 @@ struct Index {
             .height(30)
             .textAlign(TextAlign.Center)
             .fontSize(12)
-            .fontColor($r('app.color.text_secondary'))
+            .fontColor(this.voiceSecondaryTextColor())
         }
         .tabBar(this.buildSubmitModeTab(1, '回车'))
       }
@@ -1718,27 +1716,27 @@ struct Index {
         this.submitMode = index === 0 ? 'ctrl_enter' : 'enter';
       })
       .padding({ top: 4, bottom: 2, left: 6, right: 6 })
-      .backgroundColor($r('app.color.input_background'))
-      .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+      .backgroundColor(this.voiceInnerSurfaceColor())
+      .backgroundBlurStyle(this.useTwoPaneCodexLayout() ? BlurStyle.NONE : BlurStyle.COMPONENT_ULTRA_THIN, {
         colorMode: ThemeColorMode.SYSTEM,
         adaptiveColor: AdaptiveColor.DEFAULT,
         scale: 0.72
       })
-      .border({ width: 1, color: $r('app.color.glass_border') })
+      .border({ width: 1, color: this.codexGlassBorderColor() })
       .borderRadius(22)
       Row({ space: 10 }) {
         Button('发送文字')
           .layoutWeight(1)
           .height(50)
           .fontSize(16)
-          .fontColor(this.isConnected ? $r('app.color.accent_primary') : $r('app.color.text_secondary'))
-          .backgroundColor(this.isConnected ? $r('app.color.glass_surface_strong') : '#80D0D5DD')
-          .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+          .fontColor(this.isConnected ? $r('app.color.accent_primary') : this.voiceSecondaryTextColor())
+          .backgroundColor(this.isConnected ? this.voiceActionSurfaceColor() : '#80D0D5DD')
+          .backgroundBlurStyle(this.useTwoPaneCodexLayout() ? BlurStyle.NONE : BlurStyle.COMPONENT_ULTRA_THIN, {
             colorMode: ThemeColorMode.SYSTEM,
             adaptiveColor: AdaptiveColor.DEFAULT,
             scale: 0.78
           })
-          .border({ width: 1, color: $r('app.color.glass_border') })
+          .border({ width: 1, color: this.codexGlassBorderColor() })
           .borderRadius(13)
           .shadow({ radius: 14, color: $r('app.color.glass_shadow'), offsetY: 5 })
           .enabled(this.isConnected)
@@ -1748,8 +1746,8 @@ struct Index {
           .height(50)
           .fontSize(15)
           .fontColor($r('app.color.text_primary'))
-          .backgroundColor($r('app.color.glass_surface_strong'))
-          .border({ width: 1, color: $r('app.color.glass_border') })
+          .backgroundColor(this.voiceActionSurfaceColor())
+          .border({ width: 1, color: this.codexGlassBorderColor() })
           .borderRadius(13)
           .enabled(this.isConnected)
           .onClick(() => remoteInputClient.sendEnter())
@@ -1757,15 +1755,15 @@ struct Index {
     }
     .width('100%')
     .padding(16)
-    .backgroundColor($r('app.color.glass_surface'))
-    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+    .backgroundColor(this.codexGlassSurfaceColor())
+    .backgroundBlurStyle(this.useTwoPaneCodexLayout() ? BlurStyle.NONE : BlurStyle.COMPONENT_ULTRA_THIN, {
       colorMode: ThemeColorMode.SYSTEM,
       adaptiveColor: AdaptiveColor.DEFAULT,
       scale: 0.92
     })
-    .border({ width: 1, color: $r('app.color.glass_border') })
+    .border({ width: 1, color: this.codexGlassBorderColor() })
     .borderRadius(28)
-    .shadow({ radius: 30, color: $r('app.color.glass_shadow'), offsetY: 12 })
+    .shadow({ radius: 30, color: this.codexGlassShadowColor(), offsetY: 12 })
   }
 
   @Builder
@@ -1776,23 +1774,23 @@ struct Index {
         .fontWeight(this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ?
           FontWeight.Medium : FontWeight.Regular)
         .fontColor(this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ?
-          $r('app.color.text_primary') : $r('app.color.text_secondary'))
+          $r('app.color.text_primary') : this.voiceSecondaryTextColor())
         .animation({ duration: 240, curve: Curve.EaseOut })
     }
     .width('94%')
     .height(38)
     .justifyContent(FlexAlign.Center)
     .backgroundColor(this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ?
-      $r('app.color.glass_surface_strong') : Color.Transparent)
+      this.voiceActionSurfaceColor() : Color.Transparent)
     .border({
       width: 1,
       color: this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ?
-        $r('app.color.glass_border') : Color.Transparent
+        this.codexGlassBorderColor() : Color.Transparent
     })
     .borderRadius(19)
     .shadow({
       radius: this.submitMode === (index === 0 ? 'ctrl_enter' : 'enter') ? 10 : 0,
-      color: $r('app.color.glass_shadow'),
+      color: this.codexGlassShadowColor(),
       offsetY: 3
     })
     .scale({
@@ -1817,15 +1815,15 @@ struct Index {
     Text('发送前请先在电脑上点中目标输入框。Starly 不会主动切换窗口，也不会读取电脑上的文字。')
       .fontSize(12)
       .lineHeight(19)
-      .fontColor($r('app.color.text_secondary'))
+      .fontColor(this.voiceSecondaryTextColor())
       .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-      .backgroundColor($r('app.color.glass_surface'))
-      .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+      .backgroundColor(this.codexGlassSurfaceColor())
+      .backgroundBlurStyle(this.useTwoPaneCodexLayout() ? BlurStyle.NONE : BlurStyle.COMPONENT_ULTRA_THIN, {
         colorMode: ThemeColorMode.SYSTEM,
         adaptiveColor: AdaptiveColor.DEFAULT,
         scale: 0.7
       })
-      .border({ width: 1, color: $r('app.color.glass_border') })
+      .border({ width: 1, color: this.codexGlassBorderColor() })
       .borderRadius(18)
   }
 
@@ -1862,6 +1860,42 @@ struct Index {
 
   private codexSidebarWidth(): number {
     return this.mainSectionViewportWidth >= 1180 ? 420 : 360;
+  }
+
+  private codexGlassSurfaceColor(): ResourceColor {
+    return this.useTwoPaneCodexLayout() ?
+      $r('app.color.codex_glass_surface_wide') : $r('app.color.glass_surface');
+  }
+
+  private codexGlassBorderColor(): ResourceColor {
+    return this.useTwoPaneCodexLayout() ?
+      $r('app.color.codex_glass_border_wide') : $r('app.color.glass_border');
+  }
+
+  private codexGlassShadowColor(): ResourceColor {
+    return this.useTwoPaneCodexLayout() ?
+      $r('app.color.codex_glass_shadow_wide') : $r('app.color.glass_shadow');
+  }
+
+  private voiceInnerSurfaceColor(): ResourceColor {
+    return this.useTwoPaneCodexLayout() ?
+      $r('app.color.voice_inner_surface_wide') : $r('app.color.input_background');
+  }
+
+  private voiceActionSurfaceColor(): ResourceColor {
+    return this.useTwoPaneCodexLayout() ?
+      $r('app.color.voice_action_surface_wide') : $r('app.color.glass_surface_strong');
+  }
+
+  private voiceSecondaryTextColor(): ResourceColor {
+    return this.useTwoPaneCodexLayout() ?
+      $r('app.color.voice_text_secondary_wide') : $r('app.color.text_secondary');
+  }
+
+  private codexTaskListViewportHeight(): number {
+    const loadedCount = Math.min(this.codexTaskDisplayLimit, this.codexTasks.length);
+    const visibleRows = Math.min(loadedCount, this.useTwoPaneCodexLayout() ? 7 : 5);
+    return Math.max(68, visibleRows * 64);
   }
 
   private codexDetailCardHeight(): number {
@@ -2471,6 +2505,13 @@ struct Index {
     this.getUIContext().animateTo({ duration: 240, curve: Curve.EaseOut }, () => {
       this.areCodexTasksExpanded = !this.areCodexTasksExpanded;
     });
+  }
+
+  private loadMoreCodexTasks(): void {
+    if (!this.areCodexTasksExpanded || this.codexTaskDisplayLimit >= this.codexTasks.length) {
+      return;
+    }
+    this.codexTaskDisplayLimit = Math.min(this.codexTaskDisplayLimit + 10, this.codexTasks.length);
   }
 
   private handleCodexTaskTap(threadId: string): void {
