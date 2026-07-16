@@ -9,6 +9,7 @@ import {
 import pairingStore from '../service/PairingStore';
 import remoteInputClient, { RemoteClientListener } from '../service/RemoteInputClient';
 import speechService, { SpeechListener } from '../service/SpeechService';
+import imageTransferService from '../service/ImageTransferService';
 
 enum VoiceGestureAction {
   Keep,
@@ -123,6 +124,10 @@ struct Index {
   @State codexDetailVersion: number = 0;
   @State codexDetailLoading: boolean = false;
   @State codexCommand: string = '';
+  @State codexImagePreviewUri: string = '';
+  @State codexImageDataUrl: string = '';
+  @State codexImageMimeType: string = '';
+  @State codexImagePicking: boolean = false;
   @State codexLoading: boolean = false;
   @State voiceGestureAction: VoiceGestureAction = VoiceGestureAction.Keep;
   private voiceStartX: number = 0;
@@ -185,6 +190,9 @@ struct Index {
         this.lastAction = message;
         if (message.startsWith('消息已发送给 Codex')) {
           this.codexCommand = '';
+          this.codexImagePreviewUri = '';
+          this.codexImageDataUrl = '';
+          this.codexImageMimeType = '';
           const acknowledgedThreadId = this.pendingCodexThreadId.length > 0 ?
             this.pendingCodexThreadId : this.selectedCodexTaskId;
           this.pendingCodexThreadId = acknowledgedThreadId;
@@ -1058,36 +1066,82 @@ struct Index {
         }
         .width('100%')
       }
-      TextArea({ text: this.codexCommand, placeholder: '继续给这个 Codex 任务发送要求…' })
-        .height(108)
-        .fontSize(15)
-        .backgroundColor($r('app.color.input_background'))
+      Column({ space: 8 }) {
+        if (this.codexImagePreviewUri.length > 0) {
+          Row({ space: 10 }) {
+            Image(this.codexImagePreviewUri)
+              .width(92)
+              .height(72)
+              .objectFit(ImageFit.Contain)
+              .borderRadius(10)
+              .backgroundColor('#12000000')
+            Text(this.codexImagePicking ? '正在处理图片…' : '图片已就绪，可继续输入文字')
+              .layoutWeight(1)
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+            Button('移除')
+              .height(34)
+              .fontSize(12)
+              .fontColor('#B42318')
+              .backgroundColor('#14FEF3F2')
+              .borderRadius(12)
+              .enabled(!this.codexImagePicking)
+              .onClick(() => {
+                this.codexImagePreviewUri = '';
+                this.codexImageDataUrl = '';
+                this.codexImageMimeType = '';
+              })
+          }
+          .width('100%')
+        }
+        TextArea({ text: this.codexCommand, placeholder: '继续给这个 Codex 任务发送要求…' })
+          .height(108)
+          .fontSize(15)
+          .backgroundColor(Color.Transparent)
+          .padding(4)
+          .onChange((value: string) => {
+            this.codexCommand = value;
+          })
+      }
+      .width('100%')
+      .padding(12)
+      .backgroundColor($r('app.color.input_background'))
+      .border({ width: 1, color: $r('app.color.glass_border') })
+      .borderRadius(18)
+      Button(this.codexImagePicking ? '处理图片中…' : '选择图片')
+        .width('100%')
+        .height(38)
+        .fontSize(12)
+        .fontColor('#175CD3')
+        .backgroundColor($r('app.color.glass_surface_strong'))
         .border({ width: 1, color: $r('app.color.glass_border') })
-        .borderRadius(18)
-        .padding(12)
-        .onChange((value: string) => {
-          this.codexCommand = value;
-        })
+        .borderRadius(12)
+        .enabled(this.isConnected && !this.codexImagePicking)
+        .onClick(() => this.chooseCodexImage())
       Row({ space: 10 }) {
         Button('发送后按回车')
           .layoutWeight(1)
           .height(48)
           .fontSize(12)
-          .fontColor(this.codexCommand.trim().length > 0 ? '#175CD3' : $r('app.color.text_secondary'))
+          .fontColor(this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0 ?
+            '#175CD3' : $r('app.color.text_secondary'))
           .backgroundColor($r('app.color.glass_surface_strong'))
           .border({ width: 1, color: $r('app.color.glass_border') })
           .borderRadius(14)
-          .enabled(this.codexCommand.trim().length > 0 && this.isConnected)
+          .enabled((this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0) &&
+            this.isConnected && !this.codexImagePicking)
           .onClick(() => this.sendCodexCommand('enter'))
         Button('发送后按 Ctrl+回车')
           .layoutWeight(1)
           .height(48)
           .fontSize(12)
-          .fontColor(this.codexCommand.trim().length > 0 ? '#175CD3' : $r('app.color.text_secondary'))
+          .fontColor(this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0 ?
+            '#175CD3' : $r('app.color.text_secondary'))
           .backgroundColor($r('app.color.glass_surface_strong'))
           .border({ width: 1, color: $r('app.color.glass_border') })
           .borderRadius(14)
-          .enabled(this.codexCommand.trim().length > 0 && this.isConnected)
+          .enabled((this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0) &&
+            this.isConnected && !this.codexImagePicking)
           .onClick(() => this.sendCodexCommand('ctrl_enter'))
       }
       if (this.selectedCodexActiveTurnId.length > 0) {
@@ -1986,15 +2040,49 @@ struct Index {
   }
 
   private async sendCodexCommand(submitMode: string): Promise<void> {
-    if (this.selectedCodexTaskId.length === 0) {
+    if (this.selectedCodexTaskId.length === 0 || this.codexImagePicking) {
       return;
     }
-    const sent = await remoteInputClient.sendToCodex(
-      this.selectedCodexTaskId, this.codexCommand, submitMode);
+    const sent = this.codexImageDataUrl.length > 0 ?
+      await remoteInputClient.sendImageToCodex(
+        this.selectedCodexTaskId, this.codexCommand, this.codexImageDataUrl,
+        this.codexImageMimeType || 'image/jpeg', submitMode) :
+      await remoteInputClient.sendToCodex(this.selectedCodexTaskId, this.codexCommand, submitMode);
     if (sent) {
       this.pendingCodexThreadId = this.selectedCodexTaskId;
       this.statusText = '正在恢复任务并发送…';
       this.statusIsError = false;
+    }
+  }
+
+  private async chooseCodexImage(): Promise<void> {
+    if (!this.isConnected || this.codexImagePicking) {
+      return;
+    }
+    this.codexImagePicking = true;
+    try {
+      const uri = await imageTransferService.pickImage();
+      if (uri === null) {
+        return;
+      }
+      this.codexImagePreviewUri = uri;
+      this.codexImageDataUrl = '';
+      this.codexImageMimeType = '';
+      this.statusText = '正在处理所选图片…';
+      this.statusIsError = false;
+      const encoded = await imageTransferService.encodeImage(uri);
+      this.codexImageDataUrl = encoded.dataUrl;
+      this.codexImageMimeType = encoded.mimeType;
+      this.statusText = `图片已就绪（${Math.ceil(encoded.byteLength / 1024)} KB），可继续输入文字`;
+      this.statusIsError = false;
+    } catch (error) {
+      this.codexImagePreviewUri = '';
+      this.codexImageDataUrl = '';
+      this.codexImageMimeType = '';
+      this.statusText = `读取图片失败：${JSON.stringify(error)}`;
+      this.statusIsError = true;
+    } finally {
+      this.codexImagePicking = false;
     }
   }
 

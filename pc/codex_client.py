@@ -332,7 +332,8 @@ def read_rollout_thread_detail(thread_id: str,
         is_agent = b'agent_message' in raw_line
         is_user = b'response_item' in raw_line and b'"role"' in raw_line and \
             b'"user"' in raw_line
-        is_task_event = b'task_started' in raw_line or b'task_complete' in raw_line
+        is_task_event = b'task_started' in raw_line or b'task_complete' in raw_line or \
+            b'turn_aborted' in raw_line
         if not (is_agent or is_user or is_task_event):
             continue
         try:
@@ -343,7 +344,8 @@ def read_rollout_thread_detail(thread_id: str,
         if not isinstance(payload, dict):
             continue
         payload_type = str(payload.get("type", ""))
-        if payload_type in ("task_started", "task_complete") and not latest_task_event:
+        if payload_type in ("task_started", "task_complete", "turn_aborted") and \
+                not latest_task_event:
             latest_task_event = payload_type
             latest_turn_id = str(payload.get("turn_id", ""))
         if len(newest_first) < LOCAL_DETAIL_MESSAGE_LIMIT and is_agent and \

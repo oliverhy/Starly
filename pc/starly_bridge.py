@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import ctypes
 import hmac
+import io
 import ipaddress
 import json
 import os
 import queue
 import secrets
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -35,6 +39,7 @@ APP_NAME = "StarlyBridge"
 APP_TITLE = "Starly 电脑端"
 DEFAULT_PORT = 8765
 MAX_TEXT_LENGTH = 8000
+MAX_IMAGE_BYTES = 6 * 1024 * 1024
 MAX_PHONE_DETAIL_MESSAGES = 15
 MAX_WIRE_MESSAGE_SIZE = 16 * 1024 * 1024
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
@@ -72,7 +77,7 @@ public static class StarlyCodexUi {
 }
 '@
 $root = [System.Windows.Automation.AutomationElement]::RootElement
-$expectedTitle = $env:STARLY_CODEX_THREAD_TITLE
+$threadLabel = $env:STARLY_CODEX_THREAD_TITLE
 $deadline = [DateTime]::UtcNow.AddSeconds(27)
 $mainWindow = $null
 while ($null -eq $mainWindow -and [DateTime]::UtcNow -lt $deadline) {
@@ -117,35 +122,36 @@ while ([DateTime]::UtcNow -lt $deadline) {
   $controls = $mainWindow.FindAll(
     [System.Windows.Automation.TreeScope]::Descendants,
     [System.Windows.Automation.Condition]::TrueCondition)
-  $titleLoaded = $false
   $composer = $null
   foreach ($control in $controls) {
     $current = $control.Current
     $rect = $current.BoundingRectangle
-    if ($current.ControlType -eq [System.Windows.Automation.ControlType]::Text -and
-        $current.Name -eq $expectedTitle -and
-        $rect.Top -ge $windowRect.Top -and
-        $rect.Top -lt ($windowRect.Top + 105) -and
-        $rect.Left -gt ($windowRect.Left + 150)) {
-      $titleLoaded = $true
-    }
-    if ($current.IsEnabled -and $current.ClassName -match '(^| )ProseMirror( |$)') {
+    if ($current.IsEnabled -and
+        $current.ClassName -match '(^| )ProseMirror( |$)' -and
+        $rect.Width -gt 240 -and
+        $rect.Top -gt ($windowRect.Top + $windowRect.Height * 0.5) -and
+        $rect.Bottom -lt ($windowRect.Bottom + 2)) {
       $composer = $control
     }
   }
-  if ($titleLoaded -and $null -ne $composer) {
+  # The app-server's thread name can fall back to the workspace name (for
+  # example "Starly"), while the desktop header shows the user task title.
+  # The codex:// deep link is keyed by thread id, so waiting for an exact title
+  # match rejects the correct task. Treat the bottom composer becoming
+  # focusable as the navigation-ready signal instead.
+  if ($null -ne $composer) {
     $composer.SetFocus()
     Start-Sleep -Milliseconds 180
     $focused = [System.Windows.Automation.AutomationElement]::FocusedElement.Current
     if ($focused.ProcessId -eq $mainWindow.Current.ProcessId -and
         $focused.ClassName -match '(^| )ProseMirror( |$)') {
-      Write-Output ('FOCUSED|' + $expectedTitle + '|' + $focused.ClassName)
+      Write-Output ('FOCUSED|' + $threadLabel + '|' + $focused.ClassName)
       exit 0
     }
   }
   Start-Sleep -Milliseconds 400
 }
-Write-Output ('TASK_NOT_READY|' + $expectedTitle)
+Write-Output ('TASK_NOT_READY|' + $threadLabel)
 exit 3
 """
 
@@ -289,12 +295,30 @@ class WindowsInput:
     KEYEVENTF_KEYUP = 0x0002
     KEYEVENTF_UNICODE = 0x0004
     VK_CONTROL = 0x11
+    VK_V = 0x56
     VK_RETURN = 0x0D
     SCAN_CONTROL = 0x1D
+    SCAN_V = 0x2F
     SCAN_RETURN = 0x1C
+    CF_DIB = 8
+    GMEM_MOVEABLE = 0x0002
 
     def __init__(self) -> None:
         self.user32 = ctypes.windll.user32
+        self.kernel32 = ctypes.windll.kernel32
+        # ctypes assumes a 32-bit int return value unless a prototype is set.
+        # HGLOBAL and the pointer returned by GlobalLock are 64-bit on this
+        # build, so leaving the defaults truncates valid handles.
+        self.kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        self.kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        self.kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        self.kernel32.GlobalLock.restype = ctypes.c_void_p
+        self.kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        self.kernel32.GlobalUnlock.restype = wintypes.BOOL
+        self.kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        self.kernel32.GlobalFree.restype = wintypes.HGLOBAL
+        self.user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        self.user32.SetClipboardData.restype = wintypes.HANDLE
 
     def foreground_window(self) -> tuple[int, str, int]:
         hwnd = int(self.user32.GetForegroundWindow())
@@ -349,6 +373,98 @@ class WindowsInput:
                 return False, "Windows 拒绝了 Ctrl+回车操作"
             return True, f"已向“{title}”按 Ctrl+回车"
         return self.press_enter()
+
+    def paste_image(self, image_bytes: bytes, text: str,
+                    submit_mode: str) -> tuple[bool, str]:
+        hwnd, title, process_id = self.foreground_window()
+        if hwnd == 0:
+            return False, "No active desktop window"
+        if process_id == os.getpid():
+            return False, "Minimize Starly and focus the Codex composer first"
+        try:
+            self._set_clipboard_image(image_bytes)
+        except (OSError, ValueError, RuntimeError) as error:
+            return False, f"Cannot put image on the Windows clipboard: {error}"
+        paste_inputs = [
+            self._keyboard_input(self.VK_CONTROL, self.SCAN_CONTROL, 0),
+            self._keyboard_input(self.VK_V, self.SCAN_V, 0),
+            self._keyboard_input(self.VK_V, self.SCAN_V, self.KEYEVENTF_KEYUP),
+            self._keyboard_input(self.VK_CONTROL, self.SCAN_CONTROL, self.KEYEVENTF_KEYUP),
+        ]
+        if not self._send(paste_inputs):
+            return False, "Windows rejected the image paste"
+        time.sleep(0.45)
+        if text:
+            encoded = text.encode("utf-16-le")
+            units = [int.from_bytes(encoded[index:index + 2], "little")
+                     for index in range(0, len(encoded), 2)]
+            inputs: list[INPUT] = []
+            for unit in units:
+                inputs.append(self._keyboard_input(0, unit, self.KEYEVENTF_UNICODE))
+                inputs.append(self._keyboard_input(0, unit,
+                                                    self.KEYEVENTF_UNICODE | self.KEYEVENTF_KEYUP))
+            if not self._send(inputs):
+                return False, "Image pasted, but text input was rejected"
+            time.sleep(min(1.2, 0.3 + len(units) * 0.006))
+        if submit_mode in ("enter", "ctrl_enter") and not self.press_submit(submit_mode)[0]:
+            return False, "Image pasted, but submit was rejected"
+        action = "image"
+        if text:
+            action += " and text"
+        if submit_mode == "ctrl_enter":
+            action += " with Ctrl+Enter"
+        elif submit_mode == "enter":
+            action += " with Enter"
+        return True, f"Sent {action} to {title}"
+
+    def _set_clipboard_image(self, image_bytes: bytes) -> None:
+        if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+            raise ValueError(f"图片大小必须不超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            source.load()
+            source.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
+            bitmap = source.convert("RGB")
+        width, height = bitmap.size
+        if width <= 0 or height <= 0 or width * height > 25_000_000:
+            raise ValueError("图片尺寸过大")
+        row_size = (width * 3 + 3) & ~3
+        raw = bitmap.tobytes("raw", "BGR")
+        pixels = bytearray(row_size * height)
+        for row in range(height):
+            source_start = row * width * 3
+            target_start = (height - row - 1) * row_size
+            pixels[target_start:target_start + width * 3] = \
+                raw[source_start:source_start + width * 3]
+        header = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 24, 0,
+                             len(pixels), 0, 0, 0, 0)
+        dib = header + pixels
+        kernel32 = self.kernel32
+        user32 = self.user32
+        handle = int(kernel32.GlobalAlloc(self.GMEM_MOVEABLE, len(dib)))
+        if handle == 0:
+            raise OSError("GlobalAlloc failed")
+        locked = int(kernel32.GlobalLock(handle))
+        if locked == 0:
+            kernel32.GlobalFree(handle)
+            raise OSError("GlobalLock failed")
+        try:
+            ctypes.memmove(locked, dib, len(dib))
+        finally:
+            kernel32.GlobalUnlock(handle)
+        if not user32.OpenClipboard(0):
+            kernel32.GlobalFree(handle)
+            raise OSError("OpenClipboard failed")
+        clipboard_owns_handle = False
+        try:
+            if not user32.EmptyClipboard():
+                raise OSError("EmptyClipboard failed")
+            if not user32.SetClipboardData(self.CF_DIB, handle):
+                raise OSError("SetClipboardData failed")
+            clipboard_owns_handle = True
+        finally:
+            user32.CloseClipboard()
+            if not clipboard_owns_handle:
+                kernel32.GlobalFree(handle)
 
     def press_enter(self) -> tuple[bool, str]:
         _, title, process_id = self.foreground_window()
@@ -503,6 +619,22 @@ class BridgeServer:
                 return
             await self._send_codex_thread(connection, thread_id, message_id)
             return
+        elif message_type == "codex_image_send":
+            thread_id = str(message.get("threadId", ""))
+            text = str(message.get("text", "")).strip()
+            submit_mode = str(message.get("submitMode", "enter"))
+            try:
+                image_bytes = self._decode_image_data(message.get("imageData", ""))
+            except ValueError as error:
+                await self._send_error(connection, str(error), message_id)
+                return
+            if (not thread_id or len(text) > MAX_TEXT_LENGTH or
+                    submit_mode not in ("enter", "ctrl_enter")):
+                await self._send_error(connection, "Codex 浠诲姟鎴栨秷鎭唴瀹规棤鏁?", message_id)
+                return
+            await self._codex_image_send(connection, thread_id, text, submit_mode,
+                                         image_bytes, message_id)
+            return
         elif message_type == "codex_send":
             thread_id = str(message.get("threadId", ""))
             text = str(message.get("text", "")).strip()
@@ -531,6 +663,53 @@ class BridgeServer:
             "id": message_id,
             "message": result,
         })
+
+    @staticmethod
+    def _decode_image_data(value: object) -> bytes:
+        data = str(value or "").strip()
+        if not data.startswith("data:image/") or "," not in data:
+            raise ValueError("鍥剧墖鏁版嵁鏍煎紡鏃犳硶璇嗗埆")
+        _, encoded = data.split(",", 1)
+        if len(encoded) > ((MAX_IMAGE_BYTES + 2) // 3) * 4 + 4:
+            raise ValueError("鍥剧墖鏁版嵁瓒呭嚭澶у皬闄愬埗")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("鍥剧墖鏁版嵁鏃犳硶瑙ｇ爜") from None
+        if not decoded or len(decoded) > MAX_IMAGE_BYTES:
+            raise ValueError(f"图片大小必须不超过 {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
+        return decoded
+
+    async def _codex_image_send(self, connection: websockets.ServerConnection,
+                                thread_id: str, text: str, submit_mode: str,
+                                image_bytes: bytes, message_id: str) -> None:
+        assert self.codex is not None
+        try:
+            before = await self.codex.thread_detail(thread_id)
+            baseline_message = self._latest_message_signature(before)
+            thread_title = str(before.get("title", "")).strip()
+            ok, result = await asyncio.to_thread(
+                self._send_image_to_codex_desktop, thread_id, thread_title,
+                text, submit_mode, image_bytes)
+            if not ok:
+                raise RuntimeError(result)
+            await self._send_json(connection, {
+                "type": "ack", "id": message_id,
+                "message": "消息已发送给 Codex，电脑端已粘贴图片并按" +
+                           (" Ctrl+回车" if submit_mode == "ctrl_enter" else "回车"),
+            })
+            await self._broadcast({
+                "type": "codex_event", "event": "turn/started",
+                "params": {"threadId": thread_id},
+            })
+            previous_poll = self.codex_poll_tasks.get(thread_id)
+            if previous_poll and not previous_poll.done():
+                previous_poll.cancel()
+            self.codex_poll_tasks[thread_id] = asyncio.create_task(
+                self._poll_desktop_codex_thread(thread_id, baseline_message))
+            await self._schedule_codex_refresh()
+        except Exception as error:
+            await self._send_error(connection, f"发送图片给 Codex 失败：{error}", message_id)
 
     async def _send_codex_snapshot(self, connection: websockets.ServerConnection) -> None:
         assert self.codex is not None
@@ -596,6 +775,21 @@ class BridgeServer:
         if not ok:
             return False, input_result
         return True, f"{focus_result}；{input_result}"
+
+    def _send_image_to_codex_desktop(self, thread_id: str, thread_title: str,
+                                     text: str, submit_mode: str,
+                                     image_bytes: bytes) -> tuple[bool, str]:
+        if not thread_title:
+            return False, "无法确认 Codex 任务标题"
+        if not open_codex_thread(thread_id):
+            return False, "无法打开电脑端 Codex 任务"
+        focused, focus_result = focus_codex_composer(thread_title)
+        if not focused:
+            return False, focus_result
+        ok, input_result = self.input.paste_image(image_bytes, text, submit_mode)
+        if not ok:
+            return False, input_result
+        return True, f"{focus_result}，{input_result}"
 
     async def _poll_desktop_codex_thread(self, thread_id: str,
                                          baseline_message: str) -> None:

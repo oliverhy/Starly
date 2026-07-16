@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import ctypes
 import json
 import os
 import queue
@@ -6,9 +8,12 @@ import tempfile
 import unittest
 import urllib.parse
 from pathlib import Path
+from ctypes import wintypes
 from unittest import mock
 
-from pc.starly_bridge import BridgeConfig, BridgeServer, MAX_TEXT_LENGTH, WindowsInput, find_available_port
+from pc.starly_bridge import (BridgeConfig, BridgeServer, CODEX_COMPOSER_FOCUS_SCRIPT,
+                              MAX_IMAGE_BYTES, MAX_TEXT_LENGTH, WindowsInput,
+                              find_available_port)
 from pc.codex_client import (CodexAppServerClient, _item_content, normalize_snapshot,
                              normalize_thread, read_rollout_thread_detail)
 
@@ -41,6 +46,16 @@ class BridgeProtocolTests(unittest.TestCase):
     def test_text_limit_is_bounded(self) -> None:
         self.assertEqual(MAX_TEXT_LENGTH, 8000)
 
+    def test_codex_image_payload_decodes_with_size_limit(self) -> None:
+        encoded = base64.b64encode(b"test-image").decode("ascii")
+        decoded = BridgeServer._decode_image_data(f"data:image/jpeg;base64,{encoded}")
+        self.assertEqual(decoded, b"test-image")
+        self.assertEqual(MAX_IMAGE_BYTES, 6 * 1024 * 1024)
+
+    def test_codex_image_payload_rejects_non_image_data(self) -> None:
+        with self.assertRaises(ValueError):
+            BridgeServer._decode_image_data("not-an-image")
+
     def test_port_selection_returns_valid_port(self) -> None:
         selected = find_available_port()
         self.assertGreater(selected, 0)
@@ -63,6 +78,13 @@ class BridgeProtocolTests(unittest.TestCase):
             (WindowsInput.VK_CONTROL, WindowsInput.SCAN_CONTROL, WindowsInput.KEYEVENTF_KEYUP),
         ])
 
+    @unittest.skipUnless(os.name == "nt", "Windows API prototype test")
+    def test_windows_clipboard_uses_pointer_sized_memory_handles(self) -> None:
+        windows_input = WindowsInput()
+        self.assertIs(windows_input.kernel32.GlobalAlloc.restype, wintypes.HGLOBAL)
+        self.assertIs(windows_input.kernel32.GlobalLock.restype, ctypes.c_void_p)
+        self.assertIs(windows_input.user32.SetClipboardData.restype, wintypes.HANDLE)
+
     def test_codex_desktop_send_opens_focuses_types_and_submits(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
 
@@ -84,6 +106,10 @@ class BridgeProtocolTests(unittest.TestCase):
         opened.assert_called_once_with("thread-1")
         focused.assert_called_once_with("指定任务")
         self.assertEqual(fake_input.received, ("继续处理这个要求", "ctrl_enter"))
+
+    def test_codex_composer_focus_does_not_require_workspace_title_in_header(self) -> None:
+        self.assertNotIn("$titleLoaded", CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertIn("if ($null -ne $composer)", CODEX_COMPOSER_FOCUS_SCRIPT)
 
     def test_protocol_rejects_non_object_json(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
@@ -241,6 +267,32 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(detail["status"], "idle")
         self.assertEqual(detail["activeTurnId"], "")
         self.assertEqual(client.thread_status[thread_id], "idle")
+
+    def test_persisted_aborted_turn_is_idle(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            session_dir = codex_home / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                {"timestamp": "2026-07-15T01:00:02Z", "type": "event_msg",
+                 "payload": {"type": "turn_aborted", "turn_id": "turn-1"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                            for item in records) + "\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                detail = read_rollout_thread_detail(thread_id)
+
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertEqual(detail["status"], "idle")
+        self.assertEqual(detail["activeTurnId"], "")
 
     def test_desktop_thread_opens_only_after_turn_completed(self) -> None:
         server = BridgeServer.__new__(BridgeServer)

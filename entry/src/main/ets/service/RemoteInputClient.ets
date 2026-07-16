@@ -9,6 +9,8 @@ class CodexWireMessage {
   turnId: string = '';
   text: string = '';
   submitMode: string = 'enter';
+  imageData: string = '';
+  imageMimeType: string = '';
 }
 
 export interface RemoteClientListener {
@@ -137,6 +139,24 @@ class RemoteInputClient {
     message.id = `${Date.now()}`;
     message.threadId = threadId;
     message.text = trimmed;
+    message.submitMode = submitMode;
+    return await this.enqueueCodexRequest(message);
+  }
+
+  async sendImageToCodex(threadId: string, text: string, dataUrl: string,
+    mimeType: string, submitMode: string): Promise<boolean> {
+    const trimmed = text.trim();
+    if (dataUrl.trim().length === 0) {
+      this.listener?.onError('请先选择要发送的图片');
+      return false;
+    }
+    const message = new CodexWireMessage();
+    message.type = 'codex_image_send';
+    message.id = `${Date.now()}`;
+    message.threadId = threadId;
+    message.text = trimmed;
+    message.imageData = dataUrl;
+    message.imageMimeType = mimeType;
     message.submitMode = submitMode;
     return await this.enqueueCodexRequest(message);
   }
