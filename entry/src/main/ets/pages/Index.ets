@@ -361,15 +361,20 @@ struct Index {
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
       this.buildAmbientBackground();
-      Column({ space: 12 }) {
-        this.buildFixedHeader();
-        this.buildMainSectionTabs();
+      Column() {
         Stack({ alignContent: Alignment.TopStart }) {
           this.buildMainSectionPage('codex', this.codexPageScroller);
           this.buildMainSectionPage('voice', this.voicePageScroller);
+          Column({ space: 12 }) {
+            this.buildFixedHeader();
+            this.buildMainSectionTabs();
+          }
+          .width('100%')
+          .padding({ top: 8, bottom: 12 })
+          .zIndex(10)
         }
         .width('100%')
-        .layoutWeight(1)
+        .height('100%')
         .clip(true)
         .onAreaChange((_oldArea: Area, newArea: Area) => {
           const width = Number(newArea.width);
@@ -395,7 +400,7 @@ struct Index {
       }
       .width('100%')
       .height('100%')
-      .padding({ left: 18, right: 18, top: 8 })
+      .padding({ left: 18, right: 18 })
       if (this.isPairingOverlayMounted) {
         this.buildPairingOverlay();
       }
@@ -420,7 +425,7 @@ struct Index {
         }
       }
       .width('100%')
-      .padding({ bottom: 36 })
+      .padding({ top: 134, bottom: 36 })
     }
     .width('100%')
     .height('100%')
@@ -464,6 +469,12 @@ struct Index {
         .fontSize(26)
         .fontWeight(FontWeight.Bold)
         .fontColor($r('app.color.text_primary'))
+        .backgroundEffect({
+          radius: 20,
+          saturation: 1.1,
+          brightness: 1.03,
+          adaptiveColor: AdaptiveColor.DEFAULT
+        })
       Blank()
       this.buildTitleConnectionStatus();
     }
@@ -635,11 +646,12 @@ struct Index {
     .width('100%')
     .height(50)
     .padding(5)
-    .backgroundColor($r('app.color.input_background'))
-    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
-      colorMode: ThemeColorMode.SYSTEM,
-      adaptiveColor: AdaptiveColor.DEFAULT,
-      scale: 0.76
+    .backgroundEffect({
+      radius: 28,
+      saturation: 1.12,
+      brightness: 1.04,
+      color: $r('app.color.top_overlay_surface'),
+      adaptiveColor: AdaptiveColor.DEFAULT
     })
     .border({ width: 1, color: $r('app.color.glass_border') })
     .borderRadius(25)
