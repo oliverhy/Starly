@@ -21,11 +21,13 @@ export class CodexTask {
 }
 
 export class CodexMessage {
+  id: string = '';
   role: string = '';
   text: string = '';
   images: string[] = [];
   timestamp: number = 0;
   turnId: string = '';
+  deliveryState: string = '';
 }
 
 export class CodexSnapshot {
@@ -38,6 +40,8 @@ export class CodexSnapshot {
 export class CodexThreadDetail extends CodexTask {
   messages: CodexMessage[] = [];
   activeTurnId: string = '';
+  hasMoreBefore: boolean = false;
+  updateMode: string = 'latest';
 }
 
 export function isCodexTerminalStatus(status: string): boolean {
@@ -111,15 +115,22 @@ export function parseCodexThread(value: Object): CodexThreadDetail {
   detail.cwd = basic.cwd;
   detail.updatedAt = basic.updatedAt;
   detail.activeTurnId = String(source['activeTurnId'] ?? '');
+  detail.hasMoreBefore = Boolean(source['hasMoreBefore'] ?? false);
+  detail.updateMode = String(source['updateMode'] ?? 'latest');
   const rawMessages = (source['messages'] ?? []) as Object[];
-  detail.messages = rawMessages.map((item: Object): CodexMessage => {
+  detail.messages = rawMessages.map((item: Object, index: number): CodexMessage => {
     const raw = recordValue(item);
     const message = new CodexMessage();
+    message.id = String(raw['id'] ?? '');
     message.role = String(raw['role'] ?? '');
     message.text = String(raw['text'] ?? '');
     message.images = (raw['images'] ?? []) as string[];
     message.timestamp = numeric(raw['timestamp']);
     message.turnId = String(raw['turnId'] ?? '');
+    message.deliveryState = String(raw['deliveryState'] ?? '');
+    if (message.id.length === 0) {
+      message.id = `${message.role}-${message.turnId}-${message.timestamp}-${index}`;
+    }
     return message;
   });
   return detail;

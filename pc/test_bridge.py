@@ -239,6 +239,53 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual([item["text"] for item in detail["messages"]],
                          ["测试任务", "正在处理"])
 
+    def test_codex_history_pages_backward_in_stable_groups_of_fifteen(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            session_dir = codex_home / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+            ]
+            for index in range(35):
+                records.append({
+                    "timestamp": f"2026-07-15T01:{index + 1:02d}:02Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": f"消息-{index}",
+                                "turn_id": "turn-1"},
+                })
+            records.append({
+                "timestamp": "2026-07-15T02:00:00Z", "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-1"},
+            })
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                            for item in records) + "\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                latest = read_rollout_thread_detail(thread_id)
+                assert latest is not None
+                older = read_rollout_thread_detail(
+                    thread_id, before_message_id=latest["messages"][0]["id"])
+                assert older is not None
+                oldest = read_rollout_thread_detail(
+                    thread_id, before_message_id=older["messages"][0]["id"])
+
+        assert oldest is not None
+        self.assertEqual([item["text"] for item in latest["messages"]],
+                         [f"消息-{index}" for index in range(20, 35)])
+        self.assertEqual([item["text"] for item in older["messages"]],
+                         [f"消息-{index}" for index in range(5, 20)])
+        self.assertEqual([item["text"] for item in oldest["messages"]],
+                         [f"消息-{index}" for index in range(5)])
+        self.assertTrue(latest["hasMoreBefore"])
+        self.assertTrue(older["hasMoreBefore"])
+        self.assertFalse(oldest["hasMoreBefore"])
+
     def test_persisted_completion_replaces_stale_active_cache(self) -> None:
         thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -374,7 +421,10 @@ class BridgeProtocolTests(unittest.TestCase):
         server.codex_poll_tasks = {}
         server._broadcast = fake_broadcast
         server._schedule_codex_refresh = fake_refresh
-        baseline = BridgeServer._latest_message_signature({"messages": old_messages})
+        baseline = {
+            "id": thread_id, "status": "idle", "activeTurnId": "",
+            "messages": old_messages,
+        }
 
         async def exercise() -> None:
             server.codex_poll_tasks[thread_id] = asyncio.current_task()
@@ -383,8 +433,11 @@ class BridgeProtocolTests(unittest.TestCase):
         with mock.patch("pc.starly_bridge.asyncio.sleep", new=fake_sleep):
             asyncio.run(exercise())
 
-        self.assertTrue(all(len(item["thread"]["messages"]) == 15
-                            for item in broadcasts if item.get("type") == "codex_thread"))
+        deltas = [item["thread"] for item in broadcasts
+                  if item.get("type") == "codex_thread"]
+        self.assertTrue(deltas)
+        self.assertTrue(all(item.get("updateMode") == "delta" for item in deltas))
+        self.assertTrue(all(len(item["messages"]) == 1 for item in deltas))
         self.assertTrue(any(item.get("event") == "turn/completed" for item in broadcasts))
         self.assertNotIn(thread_id, server.codex_poll_tasks)
 

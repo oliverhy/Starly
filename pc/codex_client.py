@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import os
@@ -304,8 +305,10 @@ def _rollout_user_message(payload: JsonObject) -> tuple[str, list[str]]:
 
 
 def read_rollout_thread_detail(thread_id: str,
-                               metadata: JsonObject | None = None) -> JsonObject | None:
-    """Read recent visible messages directly from Codex's append-only history."""
+                               metadata: JsonObject | None = None,
+                               before_message_id: str = "",
+                               limit: int = LOCAL_DETAIL_MESSAGE_LIMIT) -> JsonObject | None:
+    """Read a stable page of visible messages from Codex's append-only history."""
     path = _find_rollout_file(thread_id)
     if path is None:
         return None
@@ -325,9 +328,11 @@ def read_rollout_thread_detail(thread_id: str,
     meta["name"] = str(meta.get("title", ""))
     meta["updatedAt"] = int(path.stat().st_mtime)
 
+    page_limit = max(1, min(int(limit or LOCAL_DETAIL_MESSAGE_LIMIT), 100))
     newest_first: list[JsonObject] = []
     latest_task_event = ""
     latest_turn_id = ""
+    cursor_found = not before_message_id
     for raw_line in _reverse_jsonl_lines(path):
         is_agent = b'agent_message' in raw_line
         is_user = b'response_item' in raw_line and b'"role"' in raw_line and \
@@ -348,32 +353,44 @@ def read_rollout_thread_detail(thread_id: str,
                 not latest_task_event:
             latest_task_event = payload_type
             latest_turn_id = str(payload.get("turn_id", ""))
-        if len(newest_first) < LOCAL_DETAIL_MESSAGE_LIMIT and is_agent and \
-                payload_type == "agent_message":
+        visible_message: JsonObject | None = None
+        if is_agent and payload_type == "agent_message":
             text, images = _extract_inline_images(str(payload.get("message", "")))
             if text or images:
-                newest_first.append({
+                visible_message = {
+                    "id": hashlib.sha1(raw_line).hexdigest()[:24],
                     "role": "assistant", "text": text, "images": images,
                     "timestamp": _timestamp_value(record.get("timestamp")),
                     "turnId": str(payload.get("turn_id", "")) or
                               str(record.get("timestamp", "")),
-                })
-        elif len(newest_first) < LOCAL_DETAIL_MESSAGE_LIMIT and is_user and \
-                payload_type == "message" and str(payload.get("role", "")) == "user":
+                }
+        elif is_user and payload_type == "message" and \
+                str(payload.get("role", "")) == "user":
             text, images = _rollout_user_message(payload)
             if text or images:
                 passthrough = payload.get("internal_chat_message_metadata_passthrough")
                 turn_id = str(passthrough.get("turn_id", "")) \
                     if isinstance(passthrough, dict) else ""
-                newest_first.append({
+                visible_message = {
+                    "id": hashlib.sha1(raw_line).hexdigest()[:24],
                     "role": "user", "text": text, "images": images,
                     "timestamp": _timestamp_value(record.get("timestamp")),
                     "turnId": turn_id or str(record.get("timestamp", "")),
-                })
-        if len(newest_first) >= LOCAL_DETAIL_MESSAGE_LIMIT and latest_task_event:
+                }
+        if visible_message is not None:
+            message_id = str(visible_message.get("id", ""))
+            if not cursor_found:
+                if message_id == before_message_id:
+                    cursor_found = True
+            elif len(newest_first) <= page_limit:
+                newest_first.append(visible_message)
+        if cursor_found and len(newest_first) > page_limit and latest_task_event:
             break
 
-    messages = list(reversed(newest_first))
+    if before_message_id and not cursor_found:
+        newest_first = []
+    has_more_before = len(newest_first) > page_limit
+    messages = list(reversed(newest_first[:page_limit]))
     status = "active" if latest_task_event == "task_started" else "idle"
     normalized = normalize_thread({
         "id": thread_id,
@@ -385,6 +402,8 @@ def read_rollout_thread_detail(thread_id: str,
     })
     normalized["messages"] = messages
     normalized["activeTurnId"] = latest_turn_id if status == "active" else ""
+    normalized["hasMoreBefore"] = has_more_before
+    normalized["updateMode"] = "older" if before_message_id else "latest"
     return normalized
 
 
@@ -498,9 +517,11 @@ class CodexAppServerClient:
             error_text = type(last_error).__name__
         return {"available": False, "error": error_text, "quota": {}, "threads": []}
 
-    async def thread_detail(self, thread_id: str) -> JsonObject:
+    async def thread_detail(self, thread_id: str, before_message_id: str = "",
+                            limit: int = LOCAL_DETAIL_MESSAGE_LIMIT) -> JsonObject:
         local_detail = await asyncio.to_thread(
-            read_rollout_thread_detail, thread_id, self.thread_metadata.get(thread_id))
+            read_rollout_thread_detail, thread_id, self.thread_metadata.get(thread_id),
+            before_message_id, limit)
         if local_detail is not None:
             # The desktop writes task_started/task_complete to the rollout even
             # when the bridge-owned app-server does not receive that task's
@@ -513,7 +534,8 @@ class CodexAppServerClient:
         thread = response.get("thread")
         if not isinstance(thread, dict):
             raise RuntimeError("Codex 没有返回任务详情")
-        return self._normalize_thread_detail(thread)
+        return self._page_thread_detail(
+            self._normalize_thread_detail(thread), before_message_id, limit)
 
     async def resume_thread_detail(self, thread_id: str) -> JsonObject:
         async with self._thread_lock(thread_id):
@@ -545,7 +567,16 @@ class CodexAppServerClient:
                     role, text, images = _item_content(item)
                     if role and (text.strip() or images):
                         timestamp = started_at if role == "user" else (completed_at or started_at)
+                        message_id_source = json.dumps({
+                            "threadId": str(thread.get("id", "")),
+                            "turnId": str(turn.get("id", "")),
+                            "role": role,
+                            "timestamp": timestamp,
+                            "index": len(messages),
+                            "text": text.strip(),
+                        }, ensure_ascii=False, sort_keys=True)
                         messages.append({
+                            "id": hashlib.sha1(message_id_source.encode("utf-8")).hexdigest()[:24],
                             "role": role,
                             "text": text.strip(),
                             "images": images,
@@ -560,6 +591,26 @@ class CodexAppServerClient:
             normalized["status"] = "idle"
         self.thread_status[str(normalized.get("id", ""))] = normalized["status"]
         return normalized
+
+    @staticmethod
+    def _page_thread_detail(detail: JsonObject, before_message_id: str,
+                            limit: int) -> JsonObject:
+        page_limit = max(1, min(int(limit or LOCAL_DETAIL_MESSAGE_LIMIT), 100))
+        raw_messages = detail.get("messages")
+        messages = raw_messages if isinstance(raw_messages, list) else []
+        cursor_index = len(messages)
+        if before_message_id:
+            cursor_index = next((index for index, message in enumerate(messages)
+                                 if isinstance(message, dict) and
+                                 str(message.get("id", "")) == before_message_id), -1)
+            if cursor_index < 0:
+                cursor_index = 0
+        start_index = max(0, cursor_index - page_limit)
+        payload = dict(detail)
+        payload["messages"] = messages[start_index:cursor_index]
+        payload["hasMoreBefore"] = start_index > 0
+        payload["updateMode"] = "older" if before_message_id else "latest"
+        return payload
 
     async def send_message(self, thread_id: str, text: str) -> JsonObject:
         # thread/list and thread/read can see persisted history without loading

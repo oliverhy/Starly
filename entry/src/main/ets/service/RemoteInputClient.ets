@@ -11,6 +11,8 @@ class CodexWireMessage {
   submitMode: string = 'enter';
   imageData: string = '';
   imageMimeType: string = '';
+  beforeMessageId: string = '';
+  limit: number = 15;
 }
 
 export interface RemoteClientListener {
@@ -120,11 +122,13 @@ class RemoteInputClient {
     return await this.enqueueCodexRequest(message);
   }
 
-  async requestCodexThread(threadId: string): Promise<boolean> {
+  async requestCodexThread(threadId: string, beforeMessageId: string = '', limit: number = 15): Promise<boolean> {
     const message = new CodexWireMessage();
     message.type = 'codex_thread_request';
     message.id = `${Date.now()}`;
     message.threadId = threadId;
+    message.beforeMessageId = beforeMessageId;
+    message.limit = limit;
     return await this.enqueueCodexRequest(message);
   }
 

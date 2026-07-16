@@ -98,6 +98,9 @@ struct Index {
   @State isConnected: boolean = false;
   @State isPairingExpanded: boolean = false;
   @State isPairingOverlayMounted: boolean = false;
+  @State pairingPanelOffsetX: number = 0;
+  @State pairingPanelOffsetY: number = 0;
+  @State pairingPanelHeight: number = 320;
   @State submitMode: string = 'ctrl_enter';
   @State statusText: string = '请先与电脑配对';
   @State statusIsError: boolean = false;
@@ -106,6 +109,9 @@ struct Index {
   @State mainSection: string = 'voice';
   @State mainSectionDragOffset: number = 0;
   @State mainSectionViewportWidth: number = 360;
+  @State mainSectionTabsViewportWidth: number = 360;
+  @State layoutViewportWidth: number = 360;
+  @State layoutViewportHeight: number = 720;
   @State codexAvailable: boolean = false;
   @State codexError: string = '';
   @State codexQuota: CodexQuota = new CodexQuota();
@@ -123,6 +129,11 @@ struct Index {
   @State codexConversationLimit: number = 5;
   @State codexDetailVersion: number = 0;
   @State codexDetailLoading: boolean = false;
+  @State codexHistoryHasMore: boolean = false;
+  @State codexHistoryLoadingOlder: boolean = false;
+  @State codexHistoryReady: boolean = false;
+  @State codexChatPinnedToBottom: boolean = true;
+  @State codexUnreadMessages: number = 0;
   @State codexCommand: string = '';
   @State codexImagePreviewUri: string = '';
   @State codexImageDataUrl: string = '';
@@ -146,8 +157,12 @@ struct Index {
   private codexResolvedStatuses: Map<string, string> = new Map<string, string>();
   private voicePageScroller: Scroller = new Scroller();
   private codexPageScroller: Scroller = new Scroller();
+  private codexChatScroller: Scroller = new Scroller();
+  private codexChatScrollTimer: number = -1;
   private mainSectionAnimating: boolean = false;
   private pairingOverlayShowTimer: number = -1;
+  private pairingPanelDragStartX: number = 0;
+  private pairingPanelDragStartY: number = 0;
   private submitTabsController: TabsController = new TabsController();
   private voiceRestEffect = new hdsEffect.HdsEffectBuilder()
     .pressShadow(hdsEffect.PressShadowType.BLEND_GRADIENT)
@@ -189,6 +204,7 @@ struct Index {
       (message: string): void => {
         this.lastAction = message;
         if (message.startsWith('消息已发送给 Codex')) {
+          this.updateLatestPendingCodexMessage('sent');
           this.codexCommand = '';
           this.codexImagePreviewUri = '';
           this.codexImageDataUrl = '';
@@ -213,7 +229,9 @@ struct Index {
         this.statusIsError = true;
         if (message.includes('Codex')) {
           this.pendingCodexThreadId = '';
+          this.updateLatestPendingCodexMessage('failed');
         }
+        this.codexHistoryLoadingOlder = false;
         this.codexDetailLoading = false;
         this.codexLoading = false;
         if (shouldRetryCodexDetail) {
@@ -250,30 +268,7 @@ struct Index {
         }
       },
       (detail: CodexThreadDetail): void => {
-        detail.status = normalizeCodexDetailStatus(detail.status, detail.activeTurnId);
-        this.rememberCodexTaskStatus(detail.id, detail.status);
-        if (detail.id !== this.selectedCodexTaskId) {
-          return;
-        }
-        this.clearCodexDetailTimers();
-        this.codexDetailRetryCount = 0;
-        this.selectedCodexTitle = detail.title;
-        this.selectedCodexCwd = detail.cwd;
-        this.selectedCodexStatus = detail.status;
-        this.selectedCodexActiveTurnId = detail.activeTurnId;
-        this.selectedCodexUpdatedAt = detail.updatedAt;
-        const messagesChanged = !this.sameCodexMessages(this.selectedCodexMessages, detail.messages);
-        if (messagesChanged) {
-          this.selectedCodexMessages = [...detail.messages];
-          this.codexDetailVersion += 1;
-        }
-        if (detail.activeTurnId.length > 0) {
-          this.pendingCodexThreadId = detail.id;
-        } else if (this.pendingCodexThreadId === detail.id) {
-          this.pendingCodexThreadId = '';
-        }
-        this.codexDetailLoading = false;
-        this.codexLoading = false;
+        this.applyCodexThreadDetail(detail);
       },
       (event: string, threadId: string): void => {
         let shouldRefreshSnapshot = false;
@@ -354,6 +349,10 @@ struct Index {
       clearTimeout(this.pairingOverlayShowTimer);
       this.pairingOverlayShowTimer = -1;
     }
+    if (this.codexChatScrollTimer >= 0) {
+      clearTimeout(this.codexChatScrollTimer);
+      this.codexChatScrollTimer = -1;
+    }
     remoteInputClient.setListener(null);
     speechService.setListener(null);
   }
@@ -361,53 +360,69 @@ struct Index {
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
       this.buildAmbientBackground();
-      Column() {
-        Stack({ alignContent: Alignment.TopStart }) {
-          this.buildMainSectionPage('codex', this.codexPageScroller);
-          this.buildMainSectionPage('voice', this.voicePageScroller);
-          Column({ space: 12 }) {
-            this.buildFixedHeader();
-            this.buildMainSectionTabs();
+      Row() {
+        Column() {
+          Stack({ alignContent: Alignment.TopStart }) {
+            this.buildMainSectionPage('codex', this.codexPageScroller);
+            this.buildMainSectionPage('voice', this.voicePageScroller);
+            Column({ space: 12 }) {
+              this.buildFixedHeader();
+              this.buildMainSectionTabs();
+            }
+            .width('100%')
+            .alignItems(HorizontalAlign.Center)
+            .padding({ top: 8, bottom: 12 })
+            .zIndex(10)
           }
           .width('100%')
-          .padding({ top: 8, bottom: 12 })
-          .zIndex(10)
+          .height('100%')
+          .clip(true)
+          .onAreaChange((_oldArea: Area, newArea: Area) => {
+            const width = Number(newArea.width);
+            if (width > 0 && Math.abs(width - this.mainSectionViewportWidth) > 0.5) {
+              this.mainSectionViewportWidth = width;
+            }
+          })
+          .parallelGesture(
+            PanGesture({ direction: PanDirection.Horizontal, distance: 10 })
+              .onActionStart(() => {
+                this.beginMainSectionSwipe();
+              })
+              .onActionUpdate((event: GestureEvent) => {
+                this.updateMainSectionSwipe(event.offsetX);
+              })
+              .onActionEnd((event: GestureEvent) => {
+                this.finishMainSectionSwipe(event.offsetX);
+              })
+              .onActionCancel(() => {
+                this.cancelMainSectionSwipe();
+              })
+          )
         }
-        .width('100%')
+        .width(this.mainShellWidth())
         .height('100%')
-        .clip(true)
-        .onAreaChange((_oldArea: Area, newArea: Area) => {
-          const width = Number(newArea.width);
-          if (width > 0 && Math.abs(width - this.mainSectionViewportWidth) > 0.5) {
-            this.mainSectionViewportWidth = width;
-          }
-        })
-        .parallelGesture(
-          PanGesture({ direction: PanDirection.Horizontal, distance: 10 })
-            .onActionStart(() => {
-              this.beginMainSectionSwipe();
-            })
-            .onActionUpdate((event: GestureEvent) => {
-              this.updateMainSectionSwipe(event.offsetX);
-            })
-            .onActionEnd((event: GestureEvent) => {
-              this.finishMainSectionSwipe(event.offsetX);
-            })
-            .onActionCancel(() => {
-              this.cancelMainSectionSwipe();
-            })
-        )
       }
       .width('100%')
       .height('100%')
-      .padding({ left: 18, right: 18 })
+      .justifyContent(FlexAlign.Center)
       if (this.isPairingOverlayMounted) {
         this.buildPairingOverlay();
       }
     }
     .width('100%')
     .height('100%')
-    .backgroundColor($r('app.color.page_background'))
+    .backgroundColor(this.useTwoPaneCodexLayout() ?
+      $r('app.color.wide_page_background') : $r('app.color.page_background'))
+    .onAreaChange((_oldArea: Area, newArea: Area) => {
+      const width = Number(newArea.width);
+      const height = Number(newArea.height);
+      if (width > 0 && Math.abs(width - this.layoutViewportWidth) > 0.5) {
+        this.layoutViewportWidth = width;
+      }
+      if (height > 0 && Math.abs(height - this.layoutViewportHeight) > 0.5) {
+        this.layoutViewportHeight = height;
+      }
+    })
     .bindContentCover($$this.isCodexConversationOpen, this.buildCodexConversationCover(), {
       modalTransition: ModalTransition.DEFAULT
     })
@@ -415,47 +430,97 @@ struct Index {
 
   @Builder
   buildMainSectionPage(section: string, scroller: Scroller) {
-    Scroll(scroller) {
-      Column({ space: 16 }) {
-        if (section === 'voice') {
-          this.buildComposerCard();
-          this.buildSafetyHint();
-        } else {
-          this.buildCodexDashboard();
-        }
+    if (section === 'codex' && this.useTwoPaneCodexLayout() && this.selectedCodexTaskId.length > 0) {
+      Row() {
+        this.buildFixedWideCodexDashboard();
       }
       .width('100%')
-      .padding({ top: 134, bottom: 36 })
+      .height('100%')
+      .alignItems(VerticalAlign.Top)
+      .padding({ top: 134, bottom: 18 })
+      .translate({ x: this.mainSectionPageTranslate(section) })
+    } else {
+      Scroll(scroller) {
+        Row() {
+          if (section === 'voice') {
+            Column({ space: 16 }) {
+              this.buildComposerCard();
+              this.buildSafetyHint();
+            }
+            .width(this.voiceContentWidth())
+          } else {
+            Column({ space: 16 }) {
+              this.buildCodexDashboard();
+            }
+            .width('100%')
+          }
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Top)
+        .justifyContent(FlexAlign.Center)
+        .padding({ top: 134, bottom: 36 })
+      }
+      .width('100%')
+      .height('100%')
+      .translate({ x: this.mainSectionPageTranslate(section) })
     }
-    .width('100%')
-    .height('100%')
-    .translate({ x: this.mainSectionPageTranslate(section) })
   }
 
   @Builder
   buildAmbientBackground() {
     Stack() {
-      Column()
-        .width(260)
-        .height(260)
-        .borderRadius(130)
-        .backgroundColor('#475B8CFF')
-        .blur(72)
-        .position({ x: -72, y: -48 })
-      Column()
-        .width(230)
-        .height(230)
-        .borderRadius(115)
-        .backgroundColor('#3DBB84FF')
-        .blur(82)
-        .position({ x: '68%', y: 250 })
-      Column()
-        .width(280)
-        .height(280)
-        .borderRadius(140)
-        .backgroundColor('#35A36BFF')
-        .blur(92)
-        .position({ x: -92, y: 760 })
+      if (this.useTwoPaneCodexLayout()) {
+        Column()
+          .width(520)
+          .height(520)
+          .borderRadius(260)
+          .backgroundColor('#525B8CFF')
+          .blur(138)
+          .position({ x: -150, y: -170 })
+        Column()
+          .width(500)
+          .height(500)
+          .borderRadius(250)
+          .backgroundColor('#48BB84FF')
+          .blur(150)
+          .position({ x: '66%', y: 90 })
+        Column()
+          .width(600)
+          .height(600)
+          .borderRadius(300)
+          .backgroundColor('#40A36BFF')
+          .blur(160)
+          .position({ x: -190, y: 560 })
+        Column()
+          .width(520)
+          .height(520)
+          .borderRadius(260)
+          .backgroundColor('#36D4B5FF')
+          .blur(155)
+          .position({ x: '70%', y: 610 })
+      } else {
+        Column()
+          .width(260)
+          .height(260)
+          .borderRadius(130)
+          .backgroundColor('#475B8CFF')
+          .blur(72)
+          .position({ x: -72, y: -48 })
+        Column()
+          .width(230)
+          .height(230)
+          .borderRadius(115)
+          .backgroundColor('#3DBB84FF')
+          .blur(82)
+          .position({ x: '68%', y: 250 })
+        Column()
+          .width(280)
+          .height(280)
+          .borderRadius(140)
+          .backgroundColor('#35A36BFF')
+          .blur(92)
+          .position({ x: -92, y: 760 })
+      }
     }
     .width('100%')
     .height('100%')
@@ -465,16 +530,23 @@ struct Index {
   @Builder
   buildFixedHeader() {
     Row() {
-      Text('Starly')
-        .fontSize(26)
-        .fontWeight(FontWeight.Bold)
-        .fontColor($r('app.color.text_primary'))
-        .backgroundEffect({
-          radius: 20,
-          saturation: 1.1,
-          brightness: 1.03,
-          adaptiveColor: AdaptiveColor.DEFAULT
-        })
+      if (this.useTwoPaneCodexLayout()) {
+        Text('Starly')
+          .fontSize(26)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+      } else {
+        Text('Starly')
+          .fontSize(26)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .backgroundEffect({
+            radius: 20,
+            saturation: 1.1,
+            brightness: 1.03,
+            adaptiveColor: AdaptiveColor.DEFAULT
+          })
+      }
       Blank()
       this.buildTitleConnectionStatus();
     }
@@ -517,7 +589,7 @@ struct Index {
 
   @Builder
   buildPairingOverlay() {
-    Stack({ alignContent: Alignment.Top }) {
+    Stack({ alignContent: Alignment.Center }) {
       Column()
         .width('100%')
         .height('100%')
@@ -528,11 +600,19 @@ struct Index {
       Column() {
         this.buildPairingCard();
       }
-      .width('100%')
-      .padding({ left: 18, right: 18 })
-      .position({ x: 0, y: 108 })
+      .width(this.pairingPanelWidth())
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        const height = Number(newArea.height);
+        if (height > 0 && Math.abs(height - this.pairingPanelHeight) > 0.5) {
+          this.pairingPanelHeight = height;
+          this.clampPairingPanelOffset();
+        }
+      })
       .scale({ x: this.isPairingExpanded ? 1 : 0.94, y: this.isPairingExpanded ? 1 : 0.94 })
-      .translate({ y: this.isPairingExpanded ? 0 : -14 })
+      .translate({
+        x: this.pairingPanelOffsetX,
+        y: this.pairingPanelOffsetY + (this.isPairingExpanded ? 0 : -14)
+      })
     }
     .width('100%')
     .height('100%')
@@ -545,19 +625,27 @@ struct Index {
   buildPairingCard() {
     Column({ space: 12 }) {
       Row() {
-        Text('连接电脑')
-          .fontSize(18)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.text_primary'))
+        Column({ space: 2 }) {
+          Text('连接电脑')
+            .fontSize(18)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.text_primary'))
+          Text('按住标题栏可拖动')
+            .fontSize(10)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .alignItems(HorizontalAlign.Start)
         Blank()
         Row({ space: 8 }) {
-          Button('扫码配对')
-            .height(36)
-            .fontSize(13)
-            .fontColor('#175CD3')
-            .backgroundColor('#EAF2FF')
-            .borderRadius(18)
-            .onClick(() => this.scanPairingCode())
+          if (canIUse('SystemCapability.Multimedia.Scan.ScanBarcode')) {
+            Button('扫码配对')
+              .height(36)
+              .fontSize(13)
+              .fontColor('#175CD3')
+              .backgroundColor('#EAF2FF')
+              .borderRadius(18)
+              .onClick(() => this.scanPairingCode())
+          }
           Button('关闭')
             .height(36)
             .fontSize(13)
@@ -567,6 +655,19 @@ struct Index {
             .onClick(() => this.closePairingPanel())
         }
       }
+      .width('100%')
+      .parallelGesture(
+        PanGesture({ direction: PanDirection.All, distance: 5 })
+          .onActionStart(() => {
+            this.beginPairingPanelDrag();
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            this.updatePairingPanelDrag(event.offsetX, event.offsetY);
+          })
+          .onActionEnd((event: GestureEvent) => {
+            this.updatePairingPanelDrag(event.offsetX, event.offsetY);
+          })
+      )
       TextInput({ text: this.host, placeholder: '电脑 IP，例如 192.168.1.20' })
         .height(48)
         .backgroundColor($r('app.color.input_background'))
@@ -633,7 +734,7 @@ struct Index {
         .border({ width: 1, color: $r('app.color.glass_border') })
         .borderRadius(20)
         .shadow({ radius: 12, color: $r('app.color.glass_shadow'), offsetY: 4 })
-        .translate({ x: this.mainSection === 'codex' ? (this.mainSectionViewportWidth - 10) / 2 : 0 })
+        .translate({ x: this.mainSection === 'codex' ? (this.mainSectionTabsViewportWidth - 10) / 2 : 0 })
         .animation({ duration: 320, curve: Curve.FastOutSlowIn })
       Row() {
         this.buildMainSectionButton('voice', '语音输入')
@@ -643,7 +744,7 @@ struct Index {
       .height(40)
       .zIndex(1)
     }
-    .width('100%')
+    .width(this.mainTabsWidth())
     .height(50)
     .padding(5)
     .backgroundEffect({
@@ -655,6 +756,12 @@ struct Index {
     })
     .border({ width: 1, color: $r('app.color.glass_border') })
     .borderRadius(25)
+    .onAreaChange((_oldArea: Area, newArea: Area) => {
+      const width = Number(newArea.width);
+      if (width > 0 && Math.abs(width - this.mainSectionTabsViewportWidth) > 0.5) {
+        this.mainSectionTabsViewportWidth = width;
+      }
+    })
   }
 
   @Builder
@@ -682,14 +789,67 @@ struct Index {
 
   @Builder
   buildCodexDashboard() {
-    Column({ space: 16 }) {
-      this.buildCodexQuotaCard();
-      this.buildCodexTaskCard();
-      if (this.selectedCodexTaskId.length > 0) {
-        this.buildCodexDetailCard();
+    if (this.useTwoPaneCodexLayout() && this.selectedCodexTaskId.length > 0) {
+      Row({ space: 18 }) {
+        Column({ space: 16 }) {
+          this.buildCodexQuotaCard();
+          this.buildCodexTaskCard();
+        }
+        .width(this.codexSidebarWidth())
+        Column() {
+          this.buildCodexDetailCard();
+        }
+        .layoutWeight(1)
       }
+      .width('100%')
+      .alignItems(VerticalAlign.Top)
+    } else {
+      Column({ space: 16 }) {
+        this.buildCodexQuotaCard();
+        this.buildCodexTaskCard();
+        if (this.selectedCodexTaskId.length > 0) {
+          this.buildCodexDetailCard();
+        }
+      }
+      .width('100%')
+    }
+  }
+
+  @Builder
+  buildFixedWideCodexDashboard() {
+    Row({ space: 18 }) {
+      Column({ space: 16 }) {
+        this.buildCodexQuotaCard();
+        Scroll() {
+          Column() {
+            this.buildCodexTaskCard();
+          }
+          .width('100%')
+          .padding({ bottom: 2 })
+        }
+        .layoutWeight(1)
+        .width('100%')
+        .align(Alignment.TopStart)
+        .scrollBar(BarState.Auto)
+        .edgeEffect(EdgeEffect.Spring)
+        .clip(true)
+        .borderRadius(28)
+      }
+      .width(this.codexSidebarWidth())
+      .height('100%')
+
+      Column() {
+        Column() {
+          this.buildCodexDetailCard();
+        }
+        .width('100%')
+      }
+      .layoutWeight(1)
+      .height('100%')
     }
     .width('100%')
+    .height('100%')
+    .alignItems(VerticalAlign.Top)
   }
 
   @Builder
@@ -1008,75 +1168,87 @@ struct Index {
         }
       }
       .width('100%')
-      if (this.codexDetailLoading) {
-        Text('正在加载任务内容…')
-          .width('100%')
-          .textAlign(TextAlign.Center)
-          .fontSize(13)
+      Row() {
+        Text(`聊天记录 · 已加载 ${this.selectedCodexMessages.length} 条`)
+          .fontSize(12)
           .fontColor($r('app.color.text_secondary'))
-          .padding({ top: 18, bottom: 18 })
-      } else if (this.selectedCodexMessages.length > 0) {
-        Column({ space: 8 }) {
-          Row() {
-            Text(`最近对话 · 共 ${this.selectedCodexMessages.length} 条`)
-              .fontSize(12)
-              .fontColor($r('app.color.text_secondary'))
-            Blank()
-            Text('展开完整对话')
-              .fontSize(12)
-              .fontWeight(FontWeight.Medium)
-              .fontColor('#175CD3')
-          }
-          .width('100%')
-          .onClick(() => {
-            this.openCodexConversation();
-          })
-          ForEach(this.selectedCodexMessages.slice(-5), (message: CodexMessage, index: number) => {
-            Column({ space: 5 }) {
-              Row() {
-                Text(message.role === 'user' ? '你' : 'Codex')
-                  .fontSize(11)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor(message.role === 'user' ? '#175CD3' : '#067647')
-                Blank()
-                Text(this.formatMessageTimestamp(message.timestamp))
-                  .fontSize(10)
-                  .fontColor($r('app.color.text_secondary'))
-              }
+        Blank()
+        if (this.codexHistoryLoadingOlder) {
+          Text('正在加载更早记录…')
+            .fontSize(11)
+            .fontColor('#175CD3')
+        } else if (this.codexHistoryHasMore) {
+          Text('滑到顶部加载前 15 条')
+            .fontSize(11)
+            .fontColor('#175CD3')
+        }
+      }
+      .width('100%')
+      List({ space: 10, scroller: this.codexChatScroller }) {
+        if (this.codexDetailLoading && this.selectedCodexMessages.length === 0) {
+          ListItem() {
+            Text('正在加载聊天记录…')
               .width('100%')
-              Text(message.text)
-                .fontSize(13)
-                .lineHeight(19)
-                .fontColor($r('app.color.text_primary'))
-                .maxLines(4)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-              if (message.images.length > 0) {
-                ForEach(message.images, (source: string, imageIndex: number) => {
-                  Image(source)
-                    .width('100%')
-                    .height(150)
-                    .objectFit(ImageFit.Contain)
-                    .backgroundColor('#12000000')
-                    .borderRadius(12)
-                }, (_source: string, imageIndex: number): string =>
-                  `${message.turnId}-preview-image-${imageIndex}`)
-              }
-              Text('点击查看全文')
-                .fontSize(10)
-                .fontColor('#175CD3')
+              .textAlign(TextAlign.Center)
+              .fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+              .padding({ top: 28, bottom: 28 })
+          }
+        } else if (this.selectedCodexMessages.length === 0) {
+          ListItem() {
+            Text('还没有聊天记录')
+              .width('100%')
+              .textAlign(TextAlign.Center)
+              .fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+              .padding({ top: 28, bottom: 28 })
+          }
+        }
+        ForEach(this.selectedCodexMessages, (message: CodexMessage) => {
+          ListItem() {
+            this.buildCodexMessageBubble(message)
+          }
+        }, (message: CodexMessage): string => message.id)
+        if (this.isSelectedCodexRunning()) {
+          ListItem() {
+            Row() {
+              Text('Codex 正在输入…')
+                .fontSize(12)
+                .fontColor('#067647')
+                .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+                .backgroundColor($r('app.color.glass_surface_strong'))
+                .border({ width: 1, color: $r('app.color.glass_border') })
+                .borderRadius(18)
+              Blank()
             }
             .width('100%')
-            .alignItems(HorizontalAlign.Start)
-            .padding(11)
-            .backgroundColor($r('app.color.input_background'))
-            .borderRadius(14)
-            .onClick(() => {
-              this.openCodexConversation();
-            })
-          }, (_message: CodexMessage, index: number): string =>
-            `${this.selectedCodexTaskId}-${this.codexDetailVersion}-${index}`)
+          }
         }
-        .width('100%')
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring)
+      .onScrollStart(() => {
+        if (this.codexHistoryReady) {
+          this.codexChatPinnedToBottom = false;
+        }
+      })
+      .onReachStart(() => {
+        this.loadOlderCodexMessages();
+      })
+      .onReachEnd(() => {
+        this.codexChatPinnedToBottom = true;
+        this.codexUnreadMessages = 0;
+      })
+      if (this.codexUnreadMessages > 0) {
+        Button(`↓ ${this.codexUnreadMessages} 条新消息`)
+          .height(34)
+          .fontSize(11)
+          .fontColor('#175CD3')
+          .backgroundColor('#EAF2FF')
+          .borderRadius(17)
+          .onClick(() => this.scrollCodexChatToBottom(true))
       }
       Column({ space: 8 }) {
         if (this.codexImagePreviewUri.length > 0) {
@@ -1107,7 +1279,7 @@ struct Index {
           .width('100%')
         }
         TextArea({ text: this.codexCommand, placeholder: '继续给这个 Codex 任务发送要求…' })
-          .height(108)
+          .height(72)
           .fontSize(15)
           .backgroundColor(Color.Transparent)
           .padding(4)
@@ -1120,21 +1292,24 @@ struct Index {
       .backgroundColor($r('app.color.input_background'))
       .border({ width: 1, color: $r('app.color.glass_border') })
       .borderRadius(18)
-      Button(this.codexImagePicking ? '处理图片中…' : '选择图片')
-        .width('100%')
-        .height(38)
-        .fontSize(12)
-        .fontColor('#175CD3')
-        .backgroundColor($r('app.color.glass_surface_strong'))
-        .border({ width: 1, color: $r('app.color.glass_border') })
-        .borderRadius(12)
-        .enabled(this.isConnected && !this.codexImagePicking)
-        .onClick(() => this.chooseCodexImage())
-      Row({ space: 10 }) {
+      Row({ space: 8 }) {
+        Button('+')
+          .width(48)
+          .height(48)
+          .padding(0)
+          .fontSize(25)
+          .fontWeight(FontWeight.Normal)
+          .fontColor('#175CD3')
+          .backgroundColor($r('app.color.glass_surface_strong'))
+          .border({ width: 1, color: $r('app.color.glass_border') })
+          .borderRadius(24)
+          .enabled(this.isConnected && !this.codexImagePicking)
+          .onClick(() => this.chooseCodexImage())
         Button('发送后按回车')
           .layoutWeight(1)
           .height(48)
-          .fontSize(12)
+          .padding({ left: 4, right: 4 })
+          .fontSize(this.useTwoPaneCodexLayout() ? 12 : 10)
           .fontColor(this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0 ?
             '#175CD3' : $r('app.color.text_secondary'))
           .backgroundColor($r('app.color.glass_surface_strong'))
@@ -1143,10 +1318,11 @@ struct Index {
           .enabled((this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0) &&
             this.isConnected && !this.codexImagePicking)
           .onClick(() => this.sendCodexCommand('enter'))
-        Button('发送后按 Ctrl+回车')
+        Button('发送后按Ctrl+回车')
           .layoutWeight(1)
           .height(48)
-          .fontSize(12)
+          .padding({ left: 4, right: 4 })
+          .fontSize(this.useTwoPaneCodexLayout() ? 12 : 10)
           .fontColor(this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0 ?
             '#175CD3' : $r('app.color.text_secondary'))
           .backgroundColor($r('app.color.glass_surface_strong'))
@@ -1155,18 +1331,24 @@ struct Index {
           .enabled((this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0) &&
             this.isConnected && !this.codexImagePicking)
           .onClick(() => this.sendCodexCommand('ctrl_enter'))
-      }
-      if (this.selectedCodexActiveTurnId.length > 0) {
-        Button('停止当前任务')
-          .width('100%')
-          .height(42)
-          .fontColor('#B42318')
-          .backgroundColor('#CCFEF3F2')
-          .borderRadius(14)
+        if (this.selectedCodexActiveTurnId.length > 0) {
+          Button() {
+            Text('■')
+              .fontSize(17)
+              .fontColor('#D92D20')
+          }
+          .width(48)
+          .height(48)
+          .padding(0)
+          .backgroundColor('#24F04438')
+          .border({ width: 1, color: '#55F04438' })
+          .borderRadius(24)
           .onClick(() => this.stopCodexTask())
+        }
       }
     }
     .width('100%')
+    .height(this.codexDetailCardHeight())
     .padding(16)
     .backgroundColor($r('app.color.glass_surface'))
     .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
@@ -1180,10 +1362,76 @@ struct Index {
   }
 
   @Builder
+  buildCodexMessageBubble(message: CodexMessage) {
+    Row() {
+      if (message.role === 'user') {
+        Blank()
+      }
+      Column({ space: 7 }) {
+        Row() {
+          Text(message.role === 'user' ? '你' : 'Codex')
+            .fontSize(11)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(message.role === 'user' ? '#E6FFFFFF' : '#067647')
+          Blank()
+          Text(this.formatMessageTimestamp(message.timestamp))
+            .fontSize(9)
+            .fontColor(message.role === 'user' ? '#BFFFFFFF' : $r('app.color.text_secondary'))
+        }
+        .width('100%')
+        if (message.text.trim().length > 0) {
+          Text(message.text)
+            .width('100%')
+            .fontSize(13)
+            .lineHeight(20)
+            .fontColor(message.role === 'user' ? Color.White : $r('app.color.text_primary'))
+        }
+        if (message.images.length > 0) {
+          ForEach(message.images, (source: string, imageIndex: number) => {
+            Image(source)
+              .width('100%')
+              .height(this.useTwoPaneCodexLayout() ? 190 : 150)
+              .objectFit(ImageFit.Contain)
+              .backgroundColor('#16000000')
+              .borderRadius(12)
+          }, (_source: string, imageIndex: number): string => `${message.id}-image-${imageIndex}`)
+        }
+        if (message.deliveryState.length > 0) {
+          Text(message.deliveryState === 'failed' ? '发送失败' :
+            (message.deliveryState === 'sent' ? '已发送' : '发送中…'))
+            .width('100%')
+            .textAlign(TextAlign.End)
+            .fontSize(9)
+            .fontColor(message.deliveryState === 'failed' ? '#FFD7D3' : '#BFFFFFFF')
+        }
+      }
+      .width(this.codexChatBubbleWidth())
+      .alignItems(HorizontalAlign.Start)
+      .padding({ left: 14, right: 14, top: 11, bottom: 11 })
+      .backgroundColor(message.role === 'user' ? '#E65B5CE2' : $r('app.color.glass_surface_strong'))
+      .border({
+        width: 1,
+        color: message.role === 'user' ? '#66FFFFFF' : $r('app.color.glass_border')
+      })
+      .borderRadius(19)
+      .shadow({
+        radius: 16,
+        color: message.role === 'user' ? '#365B5CE2' : $r('app.color.glass_shadow'),
+        offsetY: 5
+      })
+      if (message.role !== 'user') {
+        Blank()
+      }
+    }
+    .width('100%')
+  }
+
+  @Builder
   buildCodexConversationCover() {
     Stack({ alignContent: Alignment.TopStart }) {
       this.buildAmbientBackground();
-      Column({ space: 14 }) {
+      Row() {
+        Column({ space: 14 }) {
         Row({ space: 12 }) {
           Column({ space: 3 }) {
             Text(this.selectedCodexTitle || 'Codex 完整对话')
@@ -1290,10 +1538,14 @@ struct Index {
         .layoutWeight(1)
         .width('100%')
         .scrollBar(BarState.Auto)
+        }
+        .width(this.conversationPanelWidth())
+        .height('100%')
+        .padding({ top: 58, bottom: 12 })
       }
       .width('100%')
       .height('100%')
-      .padding({ left: 18, right: 18, top: 58, bottom: 12 })
+      .justifyContent(FlexAlign.Center)
     }
     .width('100%')
     .height('100%')
@@ -1577,6 +1829,56 @@ struct Index {
       .borderRadius(18)
   }
 
+  private mainShellWidth(): number {
+    if (this.layoutViewportWidth < 600) {
+      return Math.max(280, this.layoutViewportWidth - 36);
+    }
+    if (this.layoutViewportWidth < 1100) {
+      return Math.min(960, Math.max(520, this.layoutViewportWidth - 48));
+    }
+    return Math.min(1280, Math.max(760, this.layoutViewportWidth - 72));
+  }
+
+  private voiceContentWidth(): number {
+    return Math.min(this.mainSectionViewportWidth, this.layoutViewportWidth >= 1100 ? 820 : 760);
+  }
+
+  private mainTabsWidth(): number {
+    return Math.min(this.mainSectionViewportWidth, 480);
+  }
+
+  private pairingPanelWidth(): number {
+    return Math.min(520, Math.max(280, this.layoutViewportWidth - 36));
+  }
+
+  private conversationPanelWidth(): number {
+    const outerPadding = this.layoutViewportWidth < 600 ? 36 : 72;
+    return Math.min(960, Math.max(280, this.layoutViewportWidth - outerPadding));
+  }
+
+  private useTwoPaneCodexLayout(): boolean {
+    return this.mainSectionViewportWidth >= 900;
+  }
+
+  private codexSidebarWidth(): number {
+    return this.mainSectionViewportWidth >= 1180 ? 420 : 360;
+  }
+
+  private codexDetailCardHeight(): number {
+    if (this.useTwoPaneCodexLayout()) {
+      return Math.max(500, this.layoutViewportHeight - 152);
+    }
+    return 720;
+  }
+
+  private codexChatBubbleWidth(): number {
+    if (this.useTwoPaneCodexLayout()) {
+      const detailWidth = this.mainSectionViewportWidth - this.codexSidebarWidth() - 68;
+      return Math.min(680, Math.max(240, detailWidth * 0.78));
+    }
+    return Math.min(560, Math.max(220, (this.mainSectionViewportWidth - 32) * 0.82));
+  }
+
   private getContext(): common.UIAbilityContext {
     return this.getUIContext().getHostContext() as common.UIAbilityContext;
   }
@@ -1596,6 +1898,11 @@ struct Index {
   }
 
   private async scanPairingCode(): Promise<void> {
+    if (!canIUse('SystemCapability.Multimedia.Scan.ScanBarcode')) {
+      this.statusText = '当前设备不支持扫码，请手动填写配对信息';
+      this.statusIsError = false;
+      return;
+    }
     try {
       const result = await scanBarcode.startScanForResult(this.getContext());
       const config = parsePairingUri(result.originalValue);
@@ -1856,6 +2163,8 @@ struct Index {
       this.closePairingPanel();
       return;
     }
+    this.pairingPanelOffsetX = 0;
+    this.pairingPanelOffsetY = 0;
     this.isPairingOverlayMounted = true;
     if (this.pairingOverlayShowTimer >= 0) {
       clearTimeout(this.pairingOverlayShowTimer);
@@ -1895,6 +2204,33 @@ struct Index {
     }, () => {
       this.isPairingExpanded = false;
     });
+  }
+
+  private beginPairingPanelDrag(): void {
+    this.pairingPanelDragStartX = this.pairingPanelOffsetX;
+    this.pairingPanelDragStartY = this.pairingPanelOffsetY;
+  }
+
+  private updatePairingPanelDrag(offsetX: number, offsetY: number): void {
+    const horizontalLimit = Math.max(0,
+      (this.layoutViewportWidth - this.pairingPanelWidth()) / 2 - 12);
+    const verticalLimit = Math.max(0,
+      (this.layoutViewportHeight - this.pairingPanelHeight) / 2 - 12);
+    this.pairingPanelOffsetX = Math.max(-horizontalLimit,
+      Math.min(horizontalLimit, this.pairingPanelDragStartX + offsetX));
+    this.pairingPanelOffsetY = Math.max(-verticalLimit,
+      Math.min(verticalLimit, this.pairingPanelDragStartY + offsetY));
+  }
+
+  private clampPairingPanelOffset(): void {
+    const horizontalLimit = Math.max(0,
+      (this.layoutViewportWidth - this.pairingPanelWidth()) / 2 - 12);
+    const verticalLimit = Math.max(0,
+      (this.layoutViewportHeight - this.pairingPanelHeight) / 2 - 12);
+    this.pairingPanelOffsetX = Math.max(-horizontalLimit,
+      Math.min(horizontalLimit, this.pairingPanelOffsetX));
+    this.pairingPanelOffsetY = Math.max(-verticalLimit,
+      Math.min(verticalLimit, this.pairingPanelOffsetY));
   }
 
   private startCodexAutoRefresh(): void {
@@ -1958,7 +2294,7 @@ struct Index {
     if (!force && (this.codexDetailLoading || this.isCodexConversationOpen)) {
       return;
     }
-    this.codexDetailLoading = true;
+    this.codexDetailLoading = this.selectedCodexMessages.length === 0;
     this.codexLoading = true;
     const requestToken = ++this.codexDetailRequestToken;
     this.clearCodexDetailWatchdog();
@@ -1974,7 +2310,7 @@ struct Index {
       this.statusIsError = true;
       this.scheduleCodexDetailRetry(threadId, 300);
     }, 12000);
-    const requested = await remoteInputClient.requestCodexThread(threadId);
+    const requested = await remoteInputClient.requestCodexThread(threadId, '', 15);
     if (!requested && requestToken === this.codexDetailRequestToken &&
       this.selectedCodexTaskId === threadId) {
       this.clearCodexDetailWatchdog();
@@ -2045,6 +2381,11 @@ struct Index {
     this.prepareSelectedCodexTask(threadId);
     this.selectedCodexMessages = [];
     this.selectedCodexActiveTurnId = '';
+    this.codexHistoryHasMore = false;
+    this.codexHistoryLoadingOlder = false;
+    this.codexHistoryReady = false;
+    this.codexChatPinnedToBottom = true;
+    this.codexUnreadMessages = 0;
     this.codexDetailVersion += 1;
     this.codexDetailLoading = false;
     this.codexLoading = false;
@@ -2055,12 +2396,15 @@ struct Index {
     if (this.selectedCodexTaskId.length === 0 || this.codexImagePicking) {
       return;
     }
+    const pendingText = this.codexCommand.trim();
+    const pendingImage = this.codexImagePreviewUri;
     const sent = this.codexImageDataUrl.length > 0 ?
       await remoteInputClient.sendImageToCodex(
         this.selectedCodexTaskId, this.codexCommand, this.codexImageDataUrl,
         this.codexImageMimeType || 'image/jpeg', submitMode) :
       await remoteInputClient.sendToCodex(this.selectedCodexTaskId, this.codexCommand, submitMode);
     if (sent) {
+      this.appendPendingCodexMessage(pendingText, pendingImage);
       this.pendingCodexThreadId = this.selectedCodexTaskId;
       this.statusText = '正在恢复任务并发送…';
       this.statusIsError = false;
@@ -2144,6 +2488,236 @@ struct Index {
     if (threadId !== this.selectedCodexTaskId) {
       this.selectCodexTask(threadId);
     }
+  }
+
+  private applyCodexThreadDetail(detail: CodexThreadDetail): void {
+    detail.status = normalizeCodexDetailStatus(detail.status, detail.activeTurnId);
+    this.rememberCodexTaskStatus(detail.id, detail.status);
+    if (detail.id !== this.selectedCodexTaskId) {
+      return;
+    }
+    this.selectedCodexTitle = detail.title;
+    this.selectedCodexCwd = detail.cwd;
+    this.selectedCodexStatus = detail.status;
+    this.selectedCodexActiveTurnId = detail.activeTurnId;
+    this.selectedCodexUpdatedAt = detail.updatedAt;
+    if (detail.updateMode === 'older') {
+      this.prependOlderCodexMessages(detail.messages, detail.hasMoreBefore);
+    } else {
+      if (detail.updateMode !== 'delta') {
+        this.clearCodexDetailTimers();
+        this.codexDetailRetryCount = 0;
+      }
+      if (detail.updateMode === 'latest' && !this.codexHistoryReady) {
+        this.selectedCodexMessages = [...detail.messages];
+        this.codexHistoryHasMore = detail.hasMoreBefore;
+        this.codexDetailVersion += 1;
+        this.scheduleInitialCodexChatScroll();
+      } else {
+        this.mergeLatestCodexMessages(detail.messages);
+      }
+    }
+    if (detail.activeTurnId.length > 0) {
+      this.pendingCodexThreadId = detail.id;
+    } else if (this.pendingCodexThreadId === detail.id) {
+      this.pendingCodexThreadId = '';
+    }
+    this.codexDetailLoading = false;
+    this.codexLoading = false;
+  }
+
+  private mergeLatestCodexMessages(incoming: CodexMessage[]): void {
+    if (incoming.length === 0) {
+      return;
+    }
+    const merged = [...this.selectedCodexMessages];
+    let changed = false;
+    let appended = 0;
+    for (let incomingIndex = 0; incomingIndex < incoming.length; incomingIndex += 1) {
+      const next = incoming[incomingIndex];
+      let existingIndex = this.codexMessageIndexById(merged, next.id);
+      if (existingIndex < 0 && next.role === 'user') {
+        existingIndex = this.matchPendingCodexMessage(merged, next);
+      }
+      if (existingIndex >= 0) {
+        if (!this.sameCodexMessage(merged[existingIndex], next)) {
+          merged[existingIndex] = next;
+          changed = true;
+        }
+      } else {
+        merged.push(next);
+        appended += 1;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      return;
+    }
+    const keepPinned = this.codexChatPinnedToBottom;
+    this.selectedCodexMessages = merged;
+    this.codexDetailVersion += 1;
+    if (keepPinned) {
+      this.scrollCodexChatToBottom(true);
+    } else if (appended > 0) {
+      this.codexUnreadMessages += appended;
+    }
+  }
+
+  private prependOlderCodexMessages(older: CodexMessage[], hasMoreBefore: boolean): void {
+    this.codexHistoryLoadingOlder = false;
+    this.codexHistoryHasMore = hasMoreBefore;
+    const uniqueOlder: CodexMessage[] = [];
+    for (let index = 0; index < older.length; index += 1) {
+      if (this.codexMessageIndexById(this.selectedCodexMessages, older[index].id) < 0) {
+        uniqueOlder.push(older[index]);
+      }
+    }
+    if (uniqueOlder.length === 0) {
+      return;
+    }
+    this.selectedCodexMessages = [...uniqueOlder, ...this.selectedCodexMessages];
+    this.codexDetailVersion += 1;
+    this.scheduleCodexChatAnchorRestore(uniqueOlder.length);
+  }
+
+  private async loadOlderCodexMessages(): Promise<void> {
+    if (!this.codexHistoryReady || !this.codexHistoryHasMore || this.codexHistoryLoadingOlder ||
+      this.selectedCodexMessages.length === 0 || !this.isConnected) {
+      return;
+    }
+    let firstMessageId = '';
+    for (let index = 0; index < this.selectedCodexMessages.length; index += 1) {
+      const message = this.selectedCodexMessages[index];
+      if (!message.id.startsWith('local-')) {
+        firstMessageId = message.id;
+        break;
+      }
+    }
+    if (firstMessageId.length === 0) {
+      return;
+    }
+    this.codexHistoryLoadingOlder = true;
+    this.codexChatPinnedToBottom = false;
+    const requested = await remoteInputClient.requestCodexThread(
+      this.selectedCodexTaskId, firstMessageId, 15);
+    if (!requested) {
+      this.codexHistoryLoadingOlder = false;
+    }
+  }
+
+  private appendPendingCodexMessage(text: string, previewImage: string): void {
+    const pending = new CodexMessage();
+    pending.id = `local-${Date.now()}`;
+    pending.role = 'user';
+    pending.text = text.length > 0 ? text : '图片';
+    pending.images = previewImage.length > 0 ? [previewImage] : [];
+    pending.timestamp = Math.floor(Date.now() / 1000);
+    pending.turnId = pending.id;
+    pending.deliveryState = 'sending';
+    this.selectedCodexMessages = [...this.selectedCodexMessages, pending];
+    this.codexDetailVersion += 1;
+    this.scrollCodexChatToBottom(true);
+  }
+
+  private updateLatestPendingCodexMessage(deliveryState: string): void {
+    const messages = [...this.selectedCodexMessages];
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].id.startsWith('local-')) {
+        messages[index].deliveryState = deliveryState;
+        this.selectedCodexMessages = messages;
+        this.codexDetailVersion += 1;
+        return;
+      }
+    }
+  }
+
+  private matchPendingCodexMessage(messages: CodexMessage[], incoming: CodexMessage): number {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const pending = messages[index];
+      if (!pending.id.startsWith('local-') || pending.role !== 'user') {
+        continue;
+      }
+      const pendingText = pending.text.trim();
+      const incomingText = incoming.text.trim();
+      const textMatches = pendingText === incomingText || pendingText === '图片' ||
+        (pendingText.length > 0 && incomingText.includes(pendingText));
+      if (textMatches && Math.abs(incoming.timestamp - pending.timestamp) <= 180) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  private codexMessageIndexById(messages: CodexMessage[], messageId: string): number {
+    for (let index = 0; index < messages.length; index += 1) {
+      if (messages[index].id === messageId) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  private scheduleInitialCodexChatScroll(): void {
+    this.codexHistoryReady = false;
+    this.codexChatPinnedToBottom = true;
+    this.codexUnreadMessages = 0;
+    if (this.codexChatScrollTimer >= 0) {
+      clearTimeout(this.codexChatScrollTimer);
+    }
+    this.codexChatScrollTimer = setTimeout(() => {
+      this.codexChatScrollTimer = -1;
+      const typingOffset = this.isSelectedCodexRunning() ? 1 : 0;
+      const targetIndex = Math.max(0, this.selectedCodexMessages.length - 1 + typingOffset);
+      try {
+        this.codexChatScroller.scrollToIndex(targetIndex, false, ScrollAlign.END);
+      } catch (_error) {
+      }
+      this.codexHistoryReady = true;
+    }, 72);
+  }
+
+  private scheduleCodexChatAnchorRestore(prependedCount: number): void {
+    if (this.codexChatScrollTimer >= 0) {
+      clearTimeout(this.codexChatScrollTimer);
+    }
+    this.codexChatScrollTimer = setTimeout(() => {
+      this.codexChatScrollTimer = -1;
+      try {
+        this.codexChatScroller.scrollToIndex(prependedCount, false, ScrollAlign.START);
+      } catch (_error) {
+      }
+    }, 32);
+  }
+
+  private scrollCodexChatToBottom(smooth: boolean): void {
+    if (this.codexChatScrollTimer >= 0) {
+      clearTimeout(this.codexChatScrollTimer);
+    }
+    this.codexChatPinnedToBottom = true;
+    this.codexUnreadMessages = 0;
+    this.codexChatScrollTimer = setTimeout(() => {
+      this.codexChatScrollTimer = -1;
+      const typingOffset = this.isSelectedCodexRunning() ? 1 : 0;
+      const targetIndex = Math.max(0, this.selectedCodexMessages.length - 1 + typingOffset);
+      try {
+        this.codexChatScroller.scrollToIndex(targetIndex, smooth, ScrollAlign.END);
+      } catch (_error) {
+      }
+    }, 24);
+  }
+
+  private sameCodexMessage(left: CodexMessage, right: CodexMessage): boolean {
+    if (left.id !== right.id || left.role !== right.role || left.text !== right.text ||
+      left.timestamp !== right.timestamp || left.turnId !== right.turnId ||
+      left.images.length !== right.images.length || left.deliveryState !== right.deliveryState) {
+      return false;
+    }
+    for (let imageIndex = 0; imageIndex < left.images.length; imageIndex += 1) {
+      if (left.images[imageIndex] !== right.images[imageIndex]) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private sameCodexTasks(current: CodexTask[], next: CodexTask[]): boolean {

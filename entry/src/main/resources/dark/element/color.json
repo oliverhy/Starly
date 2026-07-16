@@ -2,6 +2,7 @@
   "color": [
     { "name": "start_window_background", "value": "#080C18" },
     { "name": "page_background", "value": "#080C18" },
+    { "name": "wide_page_background", "value": "#080C18" },
     { "name": "card_background", "value": "#B31B2333" },
     { "name": "input_background", "value": "#99232D42" },
     { "name": "top_overlay_surface", "value": "#3D080C18" },

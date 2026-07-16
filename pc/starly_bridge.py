@@ -614,10 +614,17 @@ class BridgeServer:
             return
         elif message_type == "codex_thread_request":
             thread_id = str(message.get("threadId", ""))
+            before_message_id = str(message.get("beforeMessageId", ""))
+            try:
+                limit = max(1, min(int(message.get("limit", MAX_PHONE_DETAIL_MESSAGES)),
+                                   MAX_PHONE_DETAIL_MESSAGES))
+            except (TypeError, ValueError):
+                limit = MAX_PHONE_DETAIL_MESSAGES
             if not thread_id:
                 await self._send_error(connection, "缺少 Codex 任务编号", message_id)
                 return
-            await self._send_codex_thread(connection, thread_id, message_id)
+            await self._send_codex_thread(
+                connection, thread_id, message_id, before_message_id, limit)
             return
         elif message_type == "codex_image_send":
             thread_id = str(message.get("threadId", ""))
@@ -686,7 +693,6 @@ class BridgeServer:
         assert self.codex is not None
         try:
             before = await self.codex.thread_detail(thread_id)
-            baseline_message = self._latest_message_signature(before)
             thread_title = str(before.get("title", "")).strip()
             ok, result = await asyncio.to_thread(
                 self._send_image_to_codex_desktop, thread_id, thread_title,
@@ -706,7 +712,7 @@ class BridgeServer:
             if previous_poll and not previous_poll.done():
                 previous_poll.cancel()
             self.codex_poll_tasks[thread_id] = asyncio.create_task(
-                self._poll_desktop_codex_thread(thread_id, baseline_message))
+                self._poll_desktop_codex_thread(thread_id, before))
             await self._schedule_codex_refresh()
         except Exception as error:
             await self._send_error(connection, f"发送图片给 Codex 失败：{error}", message_id)
@@ -717,12 +723,14 @@ class BridgeServer:
         await self._send_json(connection, {"type": "codex_snapshot", **snapshot})
 
     async def _send_codex_thread(self, connection: websockets.ServerConnection,
-                                 thread_id: str, message_id: str = "") -> None:
+                                 thread_id: str, message_id: str = "",
+                                 before_message_id: str = "",
+                                 limit: int = MAX_PHONE_DETAIL_MESSAGES) -> None:
         assert self.codex is not None
         try:
             # Reading history must stay read-only. Resuming here leaves a second
             # app-server owning the same thread and makes the desktop view stale.
-            detail = await self.codex.thread_detail(thread_id)
+            detail = await self.codex.thread_detail(thread_id, before_message_id, limit)
             await self._send_json(connection, {
                 "type": "codex_thread", "id": message_id,
                 "thread": self._phone_thread_detail(detail),
@@ -735,7 +743,6 @@ class BridgeServer:
         assert self.codex is not None
         try:
             before = await self.codex.thread_detail(thread_id)
-            baseline_message = self._latest_message_signature(before)
             thread_title = str(before.get("title", "")).strip()
             ok, result = await asyncio.to_thread(
                 self._send_to_codex_desktop, thread_id, thread_title, text, submit_mode)
@@ -754,7 +761,7 @@ class BridgeServer:
             if previous_poll and not previous_poll.done():
                 previous_poll.cancel()
             self.codex_poll_tasks[thread_id] = asyncio.create_task(
-                self._poll_desktop_codex_thread(thread_id, baseline_message))
+                self._poll_desktop_codex_thread(thread_id, before))
             await self._schedule_codex_refresh()
         except Exception as error:
             error_text = str(error)
@@ -792,24 +799,45 @@ class BridgeServer:
         return True, f"{focus_result}，{input_result}"
 
     async def _poll_desktop_codex_thread(self, thread_id: str,
-                                         baseline_message: str) -> None:
+                                         baseline_detail: dict[str, object]) -> None:
         assert self.codex is not None
         saw_active_turn = False
         saw_new_message = False
+        baseline_message = self._latest_message_signature(baseline_detail)
+        known_messages = self._message_signatures(baseline_detail)
+        last_status = str(baseline_detail.get("status", ""))
+        last_active_turn_id = str(baseline_detail.get("activeTurnId", ""))
         try:
-            for _ in range(150):
-                await asyncio.sleep(2)
+            for _ in range(300):
+                await asyncio.sleep(1)
                 detail = await self.codex.thread_detail(thread_id)
                 active_turn_id = str(detail.get("activeTurnId", ""))
                 status = str(detail.get("status", "idle"))
                 latest_message = self._latest_message_signature(detail)
                 if active_turn_id:
                     saw_active_turn = True
-                if latest_message and latest_message != baseline_message:
+                changed_messages: list[dict[str, object]] = []
+                messages = detail.get("messages")
+                if isinstance(messages, list):
+                    for message in messages:
+                        if not isinstance(message, dict):
+                            continue
+                        message_id = self._message_id(message)
+                        signature = self._message_signature(message)
+                        if known_messages.get(message_id) != signature:
+                            changed_messages.append(message)
+                            known_messages[message_id] = signature
+                if changed_messages or (latest_message and latest_message != baseline_message):
                     saw_new_message = True
-                await self._broadcast({
-                    "type": "codex_thread", "thread": self._phone_thread_detail(detail),
-                })
+                status_changed = status != last_status or active_turn_id != last_active_turn_id
+                if changed_messages or status_changed:
+                    delta = dict(self._phone_thread_detail(detail))
+                    delta["messages"] = changed_messages
+                    delta["updateMode"] = "delta"
+                    await self._broadcast({"type": "codex_thread", "thread": delta})
+                baseline_message = latest_message or baseline_message
+                last_status = status
+                last_active_turn_id = active_turn_id
                 # Local history is intentionally capped, so its length can stay at 15
                 # throughout a whole turn. Detect the active -> idle transition or a
                 # changed newest visible message instead of waiting for the list to grow.
@@ -852,6 +880,33 @@ class BridgeServer:
         return ""
 
     @staticmethod
+    def _message_id(message: dict[str, object]) -> str:
+        message_id = str(message.get("id", ""))
+        return message_id or BridgeServer._message_signature(message)
+
+    @staticmethod
+    def _message_signature(message: dict[str, object]) -> str:
+        return json.dumps({
+            "id": str(message.get("id", "")),
+            "role": str(message.get("role", "")),
+            "text": str(message.get("text", "")),
+            "timestamp": int(message.get("timestamp", 0) or 0),
+            "turnId": str(message.get("turnId", "")),
+            "images": message.get("images") if isinstance(message.get("images"), list) else [],
+        }, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def _message_signatures(cls, detail: dict[str, object]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        messages = detail.get("messages")
+        if not isinstance(messages, list):
+            return result
+        for message in messages:
+            if isinstance(message, dict):
+                result[cls._message_id(message)] = cls._message_signature(message)
+        return result
+
+    @staticmethod
     def _terminal_poll_event(status: str, saw_activity: bool) -> str:
         if not saw_activity:
             return ""
@@ -865,10 +920,12 @@ class BridgeServer:
     def _phone_thread_detail(detail: dict[str, object]) -> dict[str, object]:
         """Trim only the phone payload; keep the full detail for bridge logic."""
         messages = detail.get("messages")
-        if not isinstance(messages, list) or len(messages) <= MAX_PHONE_DETAIL_MESSAGES:
-            return detail
         payload = dict(detail)
-        payload["messages"] = messages[-MAX_PHONE_DETAIL_MESSAGES:]
+        payload.setdefault("updateMode", "latest")
+        payload.setdefault("hasMoreBefore", False)
+        if isinstance(messages, list) and len(messages) > MAX_PHONE_DETAIL_MESSAGES:
+            payload["messages"] = messages[-MAX_PHONE_DETAIL_MESSAGES:]
+            payload["hasMoreBefore"] = True
         return payload
 
     async def _codex_interrupt(self, connection: websockets.ServerConnection, thread_id: str,
