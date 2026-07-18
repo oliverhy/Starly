@@ -7,6 +7,7 @@ import {
   isCodexTerminalStatus, normalizeCodexDetailStatus, resolveCodexDisplayStatus
 } from '../model/CodexModels';
 import pairingStore from '../service/PairingStore';
+import pairingDiscoveryService, { DiscoveredComputer } from '../service/PairingDiscoveryService';
 import remoteInputClient, { RemoteClientListener } from '../service/RemoteInputClient';
 import speechService, { SpeechListener } from '../service/SpeechService';
 import imageTransferService from '../service/ImageTransferService';
@@ -101,6 +102,13 @@ struct Index {
   @State pairingPanelOffsetX: number = 0;
   @State pairingPanelOffsetY: number = 0;
   @State pairingPanelHeight: number = 320;
+  @State discoveredComputers: DiscoveredComputer[] = [];
+  @State selectedComputerKey: string = '';
+  @State pairingCode: string = '';
+  @State isDiscoveringComputers: boolean = false;
+  @State isPairingWithCode: boolean = false;
+  @State pairingDiscoveryMessage: string = '正在查找同一局域网内的电脑…';
+  @State showManualPairing: boolean = false;
   @State submitMode: string = 'ctrl_enter';
   @State statusText: string = '请先与电脑配对';
   @State statusIsError: boolean = false;
@@ -160,6 +168,8 @@ struct Index {
   private codexChatScroller: Scroller = new Scroller();
   private codexChatScrollTimer: number = -1;
   private mainSectionAnimating: boolean = false;
+  private isCodexDetailTouching: boolean = false;
+  private isMainSectionSwipeBlocked: boolean = false;
   private pairingOverlayShowTimer: number = -1;
   private pairingPanelDragStartX: number = 0;
   private pairingPanelDragStartY: number = 0;
@@ -637,15 +647,6 @@ struct Index {
         .alignItems(HorizontalAlign.Start)
         Blank()
         Row({ space: 8 }) {
-          if (canIUse('SystemCapability.Multimedia.Scan.ScanBarcode')) {
-            Button('扫码配对')
-              .height(36)
-              .fontSize(13)
-              .fontColor('#175CD3')
-              .backgroundColor('#EAF2FF')
-              .borderRadius(18)
-              .onClick(() => this.scanPairingCode())
-          }
           Button('关闭')
             .height(36)
             .fontSize(13)
@@ -668,48 +669,174 @@ struct Index {
             this.updatePairingPanelDrag(event.offsetX, event.offsetY);
           })
       )
-      TextInput({ text: this.host, placeholder: '电脑 IP，例如 192.168.1.20' })
-        .height(48)
-        .backgroundColor($r('app.color.input_background'))
-        .border({ width: 1, color: $r('app.color.glass_border') })
-        .borderRadius(12)
-        .onChange((value: string) => {
-          this.host = value;
-        })
-      TextInput({ text: this.portText, placeholder: '端口' })
-        .height(48)
-        .type(InputType.Number)
-        .backgroundColor($r('app.color.input_background'))
-        .border({ width: 1, color: $r('app.color.glass_border') })
-        .borderRadius(12)
-        .onChange((value: string) => {
-          this.portText = value;
-        })
-      TextInput({ text: this.token, placeholder: '配对密钥' })
-        .height(48)
-        .type(InputType.Password)
-        .backgroundColor($r('app.color.input_background'))
-        .border({ width: 1, color: $r('app.color.glass_border') })
-        .borderRadius(12)
-        .onChange((value: string) => {
-          this.token = value;
-        })
-      Row({ space: 10 }) {
-        Button('保存并连接')
-          .layoutWeight(1)
-          .height(46)
-          .fontColor(Color.White)
-          .backgroundColor('#175CD3')
-          .borderRadius(12)
-          .onClick(() => this.saveAndConnect())
-        Button('清除')
-          .width(82)
-          .height(46)
-          .fontColor('#B42318')
-          .backgroundColor('#FEF3F2')
-          .borderRadius(12)
-          .onClick(() => this.clearPairing())
+      Scroll() {
+        Column({ space: 10 }) {
+          Row({ space: 8 }) {
+            Text(this.pairingDiscoveryMessage)
+              .layoutWeight(1)
+              .fontSize(12)
+              .fontColor(this.isDiscoveringComputers ? '#175CD3' : $r('app.color.text_secondary'))
+              .maxLines(2)
+            Button(this.isDiscoveringComputers ? '搜索中…' : '重新搜索')
+              .height(34)
+              .fontSize(12)
+              .fontColor('#175CD3')
+              .backgroundColor('#EAF2FF')
+              .borderRadius(17)
+              .enabled(!this.isDiscoveringComputers && !this.isPairingWithCode)
+              .onClick(() => this.discoverPairingComputers())
+          }
+          .width('100%')
+
+          if (this.discoveredComputers.length === 0 && !this.isDiscoveringComputers) {
+            Text('暂未发现电脑。请确认桥接程序已启动，并且双方连接同一个局域网。')
+              .width('100%')
+              .padding(12)
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+              .backgroundColor($r('app.color.input_background'))
+              .borderRadius(12)
+          }
+          ForEach(this.discoveredComputers, (computer: DiscoveredComputer) => {
+            Row({ space: 10 }) {
+              Stack({ alignContent: Alignment.Center }) {
+                Text('')
+                  .width(18)
+                  .height(18)
+                  .borderRadius(9)
+                  .border({ width: 1, color: '#75175CD3' })
+                if (this.selectedComputerKey === computer.key()) {
+                  Text('')
+                    .width(9)
+                    .height(9)
+                    .borderRadius(5)
+                    .backgroundColor('#175CD3')
+                }
+              }
+              Column({ space: 2 }) {
+                Text(computer.name)
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                Text(`${computer.host}:${computer.port}`)
+                  .fontSize(11)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .alignItems(HorizontalAlign.Start)
+              Blank()
+              Text(this.selectedComputerKey === computer.key() ? '已选择' : '选择')
+                .fontSize(11)
+                .fontColor('#175CD3')
+            }
+            .width('100%')
+            .padding(12)
+            .backgroundColor(this.selectedComputerKey === computer.key() ? '#DDEBFF' :
+              $r('app.color.input_background'))
+            .border({ width: 1, color: this.selectedComputerKey === computer.key() ? '#73175CD3' :
+              $r('app.color.glass_border') })
+            .borderRadius(14)
+            .onClick(() => {
+              this.selectedComputerKey = computer.key();
+            })
+          }, (computer: DiscoveredComputer): string => computer.key())
+
+          TextInput({ text: this.pairingCode, placeholder: '输入电脑端显示的 6 位配对码' })
+            .height(48)
+            .type(InputType.Number)
+            .maxLength(6)
+            .fontSize(18)
+            .letterSpacing(4)
+            .backgroundColor($r('app.color.input_background'))
+            .border({ width: 1, color: $r('app.color.glass_border') })
+            .borderRadius(12)
+            .onChange((value: string) => {
+              this.pairingCode = value;
+            })
+          Button(this.isPairingWithCode ? '正在配对…' : '配对并连接')
+            .width('100%')
+            .height(46)
+            .fontColor(Color.White)
+            .backgroundColor('#175CD3')
+            .borderRadius(12)
+            .enabled(this.selectedComputerKey.length > 0 && this.pairingCode.length === 6 &&
+              !this.isPairingWithCode && !this.isDiscoveringComputers)
+            .onClick(() => this.pairSelectedComputer())
+
+          Row() {
+            Text('扫码或手动输入')
+              .fontSize(12)
+              .fontColor('#175CD3')
+            Blank()
+            Text(this.showManualPairing ? '收起⌃' : '展开⌄')
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+          }
+          .width('100%')
+          .padding({ top: 6, bottom: 6 })
+          .onClick(() => {
+            this.showManualPairing = !this.showManualPairing;
+          })
+
+          if (this.showManualPairing) {
+            if (canIUse('SystemCapability.Multimedia.Scan.ScanBarcode')) {
+              Button('扫描原有配对二维码')
+                .width('100%')
+                .height(40)
+                .fontSize(13)
+                .fontColor('#175CD3')
+                .backgroundColor('#EAF2FF')
+                .borderRadius(12)
+                .onClick(() => this.scanPairingCode())
+            }
+            TextInput({ text: this.host, placeholder: '电脑 IP，例如 192.168.1.20' })
+              .height(44)
+              .backgroundColor($r('app.color.input_background'))
+              .border({ width: 1, color: $r('app.color.glass_border') })
+              .borderRadius(12)
+              .onChange((value: string) => {
+                this.host = value;
+              })
+            TextInput({ text: this.portText, placeholder: '端口' })
+              .height(44)
+              .type(InputType.Number)
+              .backgroundColor($r('app.color.input_background'))
+              .border({ width: 1, color: $r('app.color.glass_border') })
+              .borderRadius(12)
+              .onChange((value: string) => {
+                this.portText = value;
+              })
+            TextInput({ text: this.token, placeholder: '长期配对密钥' })
+              .height(44)
+              .type(InputType.Password)
+              .backgroundColor($r('app.color.input_background'))
+              .border({ width: 1, color: $r('app.color.glass_border') })
+              .borderRadius(12)
+              .onChange((value: string) => {
+                this.token = value;
+              })
+            Row({ space: 10 }) {
+              Button('保存并连接')
+                .layoutWeight(1)
+                .height(44)
+                .fontColor(Color.White)
+                .backgroundColor('#175CD3')
+                .borderRadius(12)
+                .onClick(() => this.saveAndConnect())
+              Button('清除')
+                .width(82)
+                .height(44)
+                .fontColor('#B42318')
+                .backgroundColor('#FEF3F2')
+                .borderRadius(12)
+                .onClick(() => this.clearPairing())
+            }
+          }
+        }
+        .width('100%')
       }
+      .width('100%')
+      .constraintSize({ maxHeight: Math.max(280, this.layoutViewportHeight - 190) })
+      .scrollBar(BarState.Auto)
     }
     .width('100%')
     .padding(16)
@@ -1355,6 +1482,9 @@ struct Index {
     .border({ width: 1, color: this.codexGlassBorderColor() })
     .borderRadius(28)
     .shadow({ radius: 28, color: this.codexGlassShadowColor(), offsetY: 10 })
+    .onTouch((event: TouchEvent) => {
+      this.handleCodexDetailTouch(event);
+    })
   }
 
   @Builder
@@ -1381,6 +1511,7 @@ struct Index {
             .fontSize(13)
             .lineHeight(20)
             .fontColor(message.role === 'user' ? Color.White : $r('app.color.text_primary'))
+            .copyOption(CopyOptions.LocalDevice)
         }
         if (message.images.length > 0) {
           ForEach(message.images, (source: string, imageIndex: number) => {
@@ -1502,6 +1633,7 @@ struct Index {
                   .fontSize(15)
                   .lineHeight(23)
                   .fontColor($r('app.color.text_primary'))
+                  .copyOption(CopyOptions.LocalDevice)
                 if (message.images.length > 0) {
                   ForEach(message.images, (source: string, imageIndex: number) => {
                     Image(source)
@@ -1931,6 +2063,84 @@ struct Index {
     }
   }
 
+  private async discoverPairingComputers(): Promise<void> {
+    if (this.isDiscoveringComputers || this.isPairingWithCode) {
+      return;
+    }
+    this.isDiscoveringComputers = true;
+    this.pairingDiscoveryMessage = '正在查找同一局域网内的电脑…';
+    try {
+      const computers = await pairingDiscoveryService.discover();
+      this.discoveredComputers = [...computers];
+      if (computers.length === 0) {
+        this.selectedComputerKey = '';
+        this.pairingDiscoveryMessage = '没有发现电脑';
+      } else {
+        let selectionStillExists = false;
+        for (let index = 0; index < computers.length; index += 1) {
+          if (computers[index].key() === this.selectedComputerKey) {
+            selectionStillExists = true;
+            break;
+          }
+        }
+        if (!selectionStillExists) {
+          this.selectedComputerKey = computers[0].key();
+        }
+        this.pairingDiscoveryMessage = `已发现 ${computers.length} 台电脑`;
+      }
+    } catch (error) {
+      this.discoveredComputers = [];
+      this.selectedComputerKey = '';
+      this.pairingDiscoveryMessage = `搜索失败：${error}`;
+    } finally {
+      this.isDiscoveringComputers = false;
+    }
+  }
+
+  private selectedPairingComputer(): DiscoveredComputer | null {
+    for (let index = 0; index < this.discoveredComputers.length; index += 1) {
+      const computer = this.discoveredComputers[index];
+      if (computer.key() === this.selectedComputerKey) {
+        return computer;
+      }
+    }
+    return null;
+  }
+
+  private async pairSelectedComputer(): Promise<void> {
+    if (this.isPairingWithCode) {
+      return;
+    }
+    const computer = this.selectedPairingComputer();
+    if (computer === null) {
+      this.pairingDiscoveryMessage = '请先选择要连接的电脑';
+      return;
+    }
+    this.isPairingWithCode = true;
+    this.pairingDiscoveryMessage = `正在与 ${computer.name} 配对…`;
+    try {
+      const config = await pairingDiscoveryService.pair(computer, this.pairingCode);
+      this.applyConfig(config);
+      await pairingStore.save(this.getContext(), config);
+      this.pairingCode = '';
+      this.statusText = '配对成功，正在连接电脑…';
+      this.statusIsError = false;
+      const connected = await remoteInputClient.connect(config);
+      if (connected) {
+        this.pairingDiscoveryMessage = `已与 ${computer.name} 配对`;
+        this.closePairingPanel();
+      } else {
+        this.pairingDiscoveryMessage = '配对信息已保存，但连接电脑失败';
+      }
+    } catch (error) {
+      this.pairingDiscoveryMessage = `${error}`.replace('Error: ', '');
+      this.statusText = this.pairingDiscoveryMessage;
+      this.statusIsError = true;
+    } finally {
+      this.isPairingWithCode = false;
+    }
+  }
+
   private async scanPairingCode(): Promise<void> {
     if (!canIUse('SystemCapability.Multimedia.Scan.ScanBarcode')) {
       this.statusText = '当前设备不支持扫码，请手动填写配对信息';
@@ -2090,6 +2300,11 @@ struct Index {
   }
 
   private beginMainSectionSwipe(): void {
+    this.isMainSectionSwipeBlocked = this.mainSection === 'codex' && this.isCodexDetailTouching;
+    if (this.isMainSectionSwipeBlocked) {
+      this.mainSectionDragOffset = 0;
+      return;
+    }
     if (this.mainSectionAnimating || this.isVoicePressing || this.isPairingExpanded) {
       return;
     }
@@ -2097,7 +2312,7 @@ struct Index {
   }
 
   private updateMainSectionSwipe(offsetX: number): void {
-    if (this.mainSectionAnimating || this.isVoicePressing || this.isPairingExpanded ||
+    if (this.isMainSectionSwipeBlocked || this.mainSectionAnimating || this.isVoicePressing || this.isPairingExpanded ||
       this.mainSectionViewportWidth <= 0) {
       return;
     }
@@ -2112,6 +2327,11 @@ struct Index {
   }
 
   private finishMainSectionSwipe(offsetX: number): void {
+    if (this.isMainSectionSwipeBlocked) {
+      this.isMainSectionSwipeBlocked = false;
+      this.mainSectionDragOffset = 0;
+      return;
+    }
     if (this.mainSectionAnimating || this.isVoicePressing || this.isPairingExpanded) {
       this.mainSectionDragOffset = 0;
       return;
@@ -2130,6 +2350,11 @@ struct Index {
   }
 
   private cancelMainSectionSwipe(): void {
+    if (this.isMainSectionSwipeBlocked) {
+      this.isMainSectionSwipeBlocked = false;
+      this.mainSectionDragOffset = 0;
+      return;
+    }
     if (this.mainSectionAnimating || this.mainSectionDragOffset === 0) {
       return;
     }
@@ -2200,6 +2425,7 @@ struct Index {
     this.pairingPanelOffsetX = 0;
     this.pairingPanelOffsetY = 0;
     this.isPairingOverlayMounted = true;
+    this.discoverPairingComputers();
     if (this.pairingOverlayShowTimer >= 0) {
       clearTimeout(this.pairingOverlayShowTimer);
     }
@@ -2238,6 +2464,14 @@ struct Index {
     }, () => {
       this.isPairingExpanded = false;
     });
+  }
+
+  private handleCodexDetailTouch(event: TouchEvent): void {
+    if (event.type === TouchType.Down) {
+      this.isCodexDetailTouching = true;
+    } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+      this.isCodexDetailTouching = false;
+    }
   }
 
   private beginPairingPanelDrag(): void {

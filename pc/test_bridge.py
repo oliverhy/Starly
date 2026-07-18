@@ -12,8 +12,9 @@ from ctypes import wintypes
 from unittest import mock
 
 from pc.starly_bridge import (BridgeConfig, BridgeServer, CODEX_COMPOSER_FOCUS_SCRIPT,
-                              MAX_IMAGE_BYTES, MAX_TEXT_LENGTH, WindowsInput,
-                              find_available_port)
+                              DEFAULT_DISCOVERY_PORT, DISCOVERY_PROTOCOL_VERSION,
+                              DiscoveryProtocol, MAX_IMAGE_BYTES, MAX_TEXT_LENGTH,
+                              WindowsInput, find_available_port)
 from pc.codex_client import (CodexAppServerClient, _item_content, normalize_snapshot,
                              normalize_thread, read_rollout_thread_detail)
 
@@ -30,6 +31,72 @@ class BridgeProtocolTests(unittest.TestCase):
     def test_token_is_delivery_strength(self) -> None:
         config = BridgeConfig()
         self.assertGreaterEqual(len(config.token), 32)
+
+    def test_pairing_code_has_exactly_six_digits(self) -> None:
+        config = BridgeConfig()
+        self.assertRegex(config.pairing_code, r"^\d{6}$")
+        previous = config.pairing_code
+        config.rotate_pairing_code()
+        self.assertRegex(config.pairing_code, r"^\d{6}$")
+        self.assertNotEqual(config.pairing_code, previous)
+
+    def test_discovery_offer_never_exposes_long_token_or_pairing_code(self) -> None:
+        class FakeTransport:
+            def __init__(self) -> None:
+                self.packets: list[tuple[bytes, tuple[str, int]]] = []
+
+            def sendto(self, data: bytes, addr: tuple[str, int]) -> None:
+                self.packets.append((data, addr))
+
+        server = BridgeServer.__new__(BridgeServer)
+        server.config = BridgeConfig()
+        server.event_queue = queue.Queue()
+        protocol = DiscoveryProtocol(server)
+        transport = FakeTransport()
+        protocol.transport = transport
+        request = json.dumps({
+            "type": "starly_discover",
+            "version": DISCOVERY_PROTOCOL_VERSION,
+            "nonce": "discovery-test",
+        }).encode("utf-8")
+
+        protocol.datagram_received(request, ("192.168.1.20", 40123))
+
+        self.assertEqual(len(transport.packets), 1)
+        offer = json.loads(transport.packets[0][0].decode("utf-8"))
+        self.assertEqual(offer["type"], "starly_offer")
+        self.assertEqual(offer["pairingPort"], DEFAULT_DISCOVERY_PORT)
+        self.assertNotIn("token", offer)
+        self.assertNotIn("code", offer)
+
+    @mock.patch.object(BridgeConfig, "save")
+    def test_six_digit_pairing_returns_long_token_then_rotates_code(self, _save: mock.Mock) -> None:
+        class FakeTransport:
+            def __init__(self) -> None:
+                self.packets: list[tuple[bytes, tuple[str, int]]] = []
+
+            def sendto(self, data: bytes, addr: tuple[str, int]) -> None:
+                self.packets.append((data, addr))
+
+        server = BridgeServer.__new__(BridgeServer)
+        server.config = BridgeConfig(pairing_code="123456")
+        server.event_queue = queue.Queue()
+        protocol = DiscoveryProtocol(server)
+        transport = FakeTransport()
+        protocol.transport = transport
+        request = json.dumps({
+            "type": "starly_pair",
+            "version": DISCOVERY_PROTOCOL_VERSION,
+            "nonce": "pairing-test",
+            "code": "123456",
+        }).encode("utf-8")
+
+        protocol.datagram_received(request, ("192.168.1.20", 40123))
+
+        response = json.loads(transport.packets[0][0].decode("utf-8"))
+        self.assertEqual(response["type"], "starly_paired")
+        self.assertEqual(response["token"], server.config.token)
+        self.assertNotEqual(server.config.pairing_code, "123456")
 
     def test_private_network_filter(self) -> None:
         self.assertTrue(BridgeServer._is_allowed_address("192.168.1.8"))
@@ -109,7 +176,45 @@ class BridgeProtocolTests(unittest.TestCase):
 
     def test_codex_composer_focus_does_not_require_workspace_title_in_header(self) -> None:
         self.assertNotIn("$titleLoaded", CODEX_COMPOSER_FOCUS_SCRIPT)
-        self.assertIn("if ($null -ne $composer)", CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertIn("FocusedElement.Current", CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertNotIn("TreeScope]::Descendants", CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertNotIn("AutomationElement]::RootElement", CODEX_COMPOSER_FOCUS_SCRIPT)
+
+    def test_codex_send_falls_back_when_desktop_composer_is_unavailable(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        sent: list[tuple[str, str]] = []
+        responses: list[dict[str, object]] = []
+        refreshes = 0
+
+        class FakeCodex:
+            async def thread_detail(self, _thread_id: str) -> dict[str, object]:
+                return {"title": "指定任务"}
+
+            async def send_message(self, thread_id: str, text: str) -> dict[str, object]:
+                sent.append((thread_id, text))
+                return {}
+
+        async def fake_send_json(_connection: object, message: dict[str, object]) -> None:
+            responses.append(message)
+
+        async def fake_refresh() -> None:
+            nonlocal refreshes
+            refreshes += 1
+
+        server.codex = FakeCodex()
+        server.pending_desktop_open = set()
+        server._send_to_codex_desktop = lambda *_args: (False, "composer unavailable")
+        server._send_json = fake_send_json
+        server._schedule_codex_refresh = fake_refresh
+
+        asyncio.run(server._codex_send(
+            object(), "thread-1", "继续处理", "enter", "message-1"))
+
+        self.assertEqual(sent, [("thread-1", "继续处理")])
+        self.assertIn("thread-1", server.pending_desktop_open)
+        self.assertEqual(responses[0]["type"], "ack")
+        self.assertIn("后台可靠通道", str(responses[0]["message"]))
+        self.assertEqual(refreshes, 1)
 
     def test_protocol_rejects_non_object_json(self) -> None:
         server = BridgeServer.__new__(BridgeServer)

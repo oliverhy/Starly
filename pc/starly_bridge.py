@@ -38,6 +38,10 @@ except ImportError:
 APP_NAME = "StarlyBridge"
 APP_TITLE = "Starly 电脑端"
 DEFAULT_PORT = 8765
+DEFAULT_DISCOVERY_PORT = 8766
+DISCOVERY_PROTOCOL_VERSION = 1
+PAIRING_FAILURE_LIMIT = 5
+PAIRING_FAILURE_WINDOW_SECONDS = 60
 MAX_TEXT_LENGTH = 8000
 MAX_IMAGE_BYTES = 6 * 1024 * 1024
 MAX_PHONE_DETAIL_MESSAGES = 15
@@ -69,87 +73,72 @@ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public static class StarlyCodexUi {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RECT { public int Left, Top, Right, Bottom; }
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(
     uint flags, uint dx, uint dy, uint data, UIntPtr extra);
 }
 '@
-$root = [System.Windows.Automation.AutomationElement]::RootElement
 $threadLabel = $env:STARLY_CODEX_THREAD_TITLE
-$deadline = [DateTime]::UtcNow.AddSeconds(27)
-$mainWindow = $null
-while ($null -eq $mainWindow -and [DateTime]::UtcNow -lt $deadline) {
-  $mainArea = 0.0
+$deadline = [DateTime]::UtcNow.AddSeconds(12)
+while ([DateTime]::UtcNow -lt $deadline) {
+  # Reading Chromium's UI Automation tree can block while navigation is in
+  # progress. Get the native top-level handle directly from the process.
+  $handle = [IntPtr]::Zero
+  $mainProcessId = 0
+  $windowRect = [StarlyCodexUi+RECT]::new()
+  $mainArea = 0
   $processes = @(Get-Process ChatGPT -ErrorAction SilentlyContinue | Where-Object {
     try { $_.Path -like '*OpenAI.Codex_*' } catch { $false }
   })
   foreach ($process in $processes) {
-    $condition = New-Object System.Windows.Automation.PropertyCondition(
-      [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $process.Id)
-    $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)
-    foreach ($window in $windows) {
-      $rect = $window.Current.BoundingRectangle
-      $area = $rect.Width * $rect.Height
-      if ($window.Current.ClassName -eq 'Chrome_WidgetWin_1' -and $area -gt $mainArea) {
-        $mainWindow = $window
-        $mainArea = $area
-      }
+    $candidateHandle = [IntPtr]$process.MainWindowHandle
+    if ($candidateHandle -eq [IntPtr]::Zero) { continue }
+    $candidateRect = [StarlyCodexUi+RECT]::new()
+    if (-not [StarlyCodexUi]::GetWindowRect($candidateHandle, [ref]$candidateRect)) { continue }
+    $area = ($candidateRect.Right - $candidateRect.Left) * ($candidateRect.Bottom - $candidateRect.Top)
+    if ($area -gt $mainArea) {
+      $handle = $candidateHandle
+      $mainProcessId = $process.Id
+      $windowRect = $candidateRect
+      $mainArea = $area
     }
   }
-  if ($null -eq $mainWindow) { Start-Sleep -Milliseconds 400 }
-}
-if ($null -eq $mainWindow -or $mainArea -lt 300000) {
-  Write-Output 'WINDOW_NOT_FOUND'
-  exit 2
-}
-$windowRect = $mainWindow.Current.BoundingRectangle
-$handle = [IntPtr]$mainWindow.Current.NativeWindowHandle
-[StarlyCodexUi]::ShowWindow($handle, 9) | Out-Null
-[StarlyCodexUi]::SetForegroundWindow($handle) | Out-Null
-Start-Sleep -Milliseconds 250
-$windowRect = $mainWindow.Current.BoundingRectangle
+  if ($handle -eq [IntPtr]::Zero -or $mainArea -lt 300000) {
+    Start-Sleep -Milliseconds 350
+    continue
+  }
 
-# Clicking the composer once enables Chromium's full accessibility tree.
-$clickX = [int]($windowRect.X + $windowRect.Width * 0.57)
-$clickY = [int]($windowRect.Bottom - 72)
-[StarlyCodexUi]::SetCursorPos($clickX, $clickY) | Out-Null
-[StarlyCodexUi]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
-[StarlyCodexUi]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+  [StarlyCodexUi]::ShowWindow($handle, 9) | Out-Null
+  [StarlyCodexUi]::SetForegroundWindow($handle) | Out-Null
+  Start-Sleep -Milliseconds 160
+  [StarlyCodexUi]::GetWindowRect($handle, [ref]$windowRect) | Out-Null
+  $windowWidth = $windowRect.Right - $windowRect.Left
 
-while ([DateTime]::UtcNow -lt $deadline) {
-  $controls = $mainWindow.FindAll(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    [System.Windows.Automation.Condition]::TrueCondition)
-  $composer = $null
-  foreach ($control in $controls) {
-    $current = $control.Current
-    $rect = $current.BoundingRectangle
-    if ($current.IsEnabled -and
-        $current.ClassName -match '(^| )ProseMirror( |$)' -and
-        $rect.Width -gt 240 -and
-        $rect.Top -gt ($windowRect.Top + $windowRect.Height * 0.5) -and
-        $rect.Bottom -lt ($windowRect.Bottom + 2)) {
-      $composer = $control
+  # A real click plus FocusedElement verifies the exact state SendInput needs.
+  foreach ($bottomOffset in @(72, 108)) {
+    foreach ($widthFactor in @(0.57, 0.70)) {
+      $clickX = [int]($windowRect.Left + $windowWidth * $widthFactor)
+      $clickY = [int]($windowRect.Bottom - $bottomOffset)
+      [StarlyCodexUi]::SetCursorPos($clickX, $clickY) | Out-Null
+      [StarlyCodexUi]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+      [StarlyCodexUi]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+      Start-Sleep -Milliseconds 160
+      try {
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement.Current
+        if ($focused.ProcessId -eq $mainProcessId -and
+            $focused.ClassName -match '(^| )ProseMirror( |$)') {
+          Write-Output ('FOCUSED|' + $threadLabel + '|' + $focused.ClassName)
+          exit 0
+        }
+      } catch {}
     }
   }
-  # The app-server's thread name can fall back to the workspace name (for
-  # example "Starly"), while the desktop header shows the user task title.
-  # The codex:// deep link is keyed by thread id, so waiting for an exact title
-  # match rejects the correct task. Treat the bottom composer becoming
-  # focusable as the navigation-ready signal instead.
-  if ($null -ne $composer) {
-    $composer.SetFocus()
-    Start-Sleep -Milliseconds 180
-    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement.Current
-    if ($focused.ProcessId -eq $mainWindow.Current.ProcessId -and
-        $focused.ClassName -match '(^| )ProseMirror( |$)') {
-      Write-Output ('FOCUSED|' + $threadLabel + '|' + $focused.ClassName)
-      exit 0
-    }
-  }
-  Start-Sleep -Milliseconds 400
+  Start-Sleep -Milliseconds 300
 }
 Write-Output ('TASK_NOT_READY|' + $threadLabel)
 exit 3
@@ -167,7 +156,7 @@ def focus_codex_composer(thread_title: str) -> tuple[bool, str]:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=32,
+            timeout=16,
             creationflags=flags,
             env=environment,
             check=False,
@@ -219,9 +208,24 @@ def find_available_port(preferred: int = DEFAULT_PORT) -> int:
 
 
 class BridgeConfig:
-    def __init__(self, port: int = DEFAULT_PORT, token: str = "") -> None:
+    def __init__(self, port: int = DEFAULT_PORT, token: str = "",
+                 pairing_code: str = "") -> None:
         self.port = port
         self.token = token or secrets.token_urlsafe(32)
+        self.pairing_code = pairing_code if self._is_valid_pairing_code(pairing_code) else self.new_pairing_code()
+
+    @staticmethod
+    def _is_valid_pairing_code(value: str) -> bool:
+        return len(value) == 6 and value.isascii() and value.isdigit()
+
+    @staticmethod
+    def new_pairing_code() -> str:
+        return f"{secrets.randbelow(1_000_000):06d}"
+
+    def rotate_pairing_code(self) -> None:
+        previous = self.pairing_code
+        while self.pairing_code == previous:
+            self.pairing_code = self.new_pairing_code()
 
     @classmethod
     def load(cls) -> "BridgeConfig":
@@ -229,9 +233,13 @@ class BridgeConfig:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             port = int(data.get("port", DEFAULT_PORT))
             token = str(data.get("token", ""))
+            pairing_code = str(data.get("pairing_code", ""))
             if not 1 <= port <= 65535 or len(token) < 32:
                 raise ValueError("invalid config")
-            return cls(port, token)
+            config = cls(port, token, pairing_code)
+            if pairing_code != config.pairing_code:
+                config.save()
+            return config
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             config = cls()
             config.save()
@@ -240,7 +248,11 @@ class BridgeConfig:
     def save(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(
-            json.dumps({"port": self.port, "token": self.token}, ensure_ascii=False, indent=2),
+            json.dumps({
+                "port": self.port,
+                "token": self.token,
+                "pairing_code": self.pairing_code,
+            }, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -492,6 +504,107 @@ class WindowsInput:
         return sent == len(inputs)
 
 
+class DiscoveryProtocol(asyncio.DatagramProtocol):
+    """Small LAN-only bootstrap protocol for discovering and pairing Starly."""
+
+    def __init__(self, server: "BridgeServer") -> None:
+        self.server = server
+        self.transport: asyncio.DatagramTransport | None = None
+        self.failed_attempts: dict[str, list[float]] = {}
+        self.successful_pairings: dict[tuple[str, str], tuple[float, dict[str, object]]] = {}
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        remote_ip = str(addr[0])
+        if not self.server._is_allowed_address(remote_ip) or len(data) > 4096:
+            return
+        try:
+            message = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(message, dict) or message.get("version") != DISCOVERY_PROTOCOL_VERSION:
+            return
+        message_type = str(message.get("type", ""))
+        nonce = str(message.get("nonce", ""))[:64]
+        if not nonce:
+            return
+        if message_type == "starly_discover":
+            self._send({
+                "type": "starly_offer",
+                "version": DISCOVERY_PROTOCOL_VERSION,
+                "nonce": nonce,
+                "computer": socket.gethostname(),
+                "host": get_lan_ip(),
+                "port": self.server.config.port,
+                "pairingPort": DEFAULT_DISCOVERY_PORT,
+            }, addr)
+            return
+        if message_type == "starly_pair":
+            self._handle_pair(message, nonce, remote_ip, addr)
+
+    def error_received(self, error: Exception) -> None:
+        self.server.event_queue.put(("error", f"局域网发现异常：{error}"))
+
+    def _handle_pair(self, message: dict[str, object], nonce: str,
+                     remote_ip: str, addr: tuple[str, int]) -> None:
+        now = time.monotonic()
+        pairing_key = (remote_ip, nonce)
+        cached = self.successful_pairings.get(pairing_key)
+        if cached is not None and now - cached[0] < 30:
+            self._send(cached[1], addr)
+            return
+        self.successful_pairings = {
+            key: value for key, value in self.successful_pairings.items()
+            if now - value[0] < 30
+        }
+        failures = [attempt for attempt in self.failed_attempts.get(remote_ip, [])
+                    if now - attempt < PAIRING_FAILURE_WINDOW_SECONDS]
+        self.failed_attempts[remote_ip] = failures
+        if len(failures) >= PAIRING_FAILURE_LIMIT:
+            self._send_pairing_error(nonce, "尝试次数过多，请一分钟后再试", addr)
+            return
+        supplied_code = str(message.get("code", ""))
+        if not hmac.compare_digest(supplied_code, self.server.config.pairing_code):
+            failures.append(now)
+            self._send_pairing_error(nonce, "配对码不正确", addr)
+            self.server.event_queue.put(("error", f"拒绝了来自 {remote_ip} 的错误六位配对码"))
+            return
+
+        self.failed_attempts.pop(remote_ip, None)
+        response: dict[str, object] = {
+            "type": "starly_paired",
+            "version": DISCOVERY_PROTOCOL_VERSION,
+            "nonce": nonce,
+            "computer": socket.gethostname(),
+            "host": get_lan_ip(),
+            "port": self.server.config.port,
+            "token": self.server.config.token,
+        }
+        self.successful_pairings[pairing_key] = (now, response)
+        self._send(response, addr)
+        self.server.config.rotate_pairing_code()
+        self.server.config.save()
+        self.server.event_queue.put(("pairing_code_changed", self.server.config.pairing_code))
+        self.server.event_queue.put(("paired_bootstrap", f"手机已通过六位码配对：{remote_ip}"))
+
+    def _send_pairing_error(self, nonce: str, message: str,
+                            addr: tuple[str, int]) -> None:
+        self._send({
+            "type": "starly_pair_error",
+            "version": DISCOVERY_PROTOCOL_VERSION,
+            "nonce": nonce,
+            "message": message,
+        }, addr)
+
+    def _send(self, message: dict[str, object], addr: tuple[str, int]) -> None:
+        if self.transport is None:
+            return
+        payload = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.transport.sendto(payload, addr)
+
+
 class BridgeServer:
     def __init__(self, config: BridgeConfig, event_queue: queue.Queue[tuple[str, str]]) -> None:
         self.config = config
@@ -505,6 +618,7 @@ class BridgeServer:
         self.codex_refresh_task: asyncio.Task[None] | None = None
         self.pending_desktop_open: set[str] = set()
         self.codex_poll_tasks: dict[str, asyncio.Task[None]] = {}
+        self.discovery_transport: asyncio.DatagramTransport | None = None
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -528,18 +642,35 @@ class BridgeServer:
         self.loop = asyncio.get_running_loop()
         self.stop_event = asyncio.Event()
         self.codex = CodexAppServerClient(self._handle_codex_event)
-        async with websockets.serve(
-            self._handle_client,
-            "0.0.0.0",
-            self.config.port,
-            max_size=MAX_WIRE_MESSAGE_SIZE,
-            ping_interval=20,
-            ping_timeout=20,
-        ):
-            self.event_queue.put(("server", f"正在监听端口 {self.config.port}"))
-            await self.stop_event.wait()
-        if self.codex:
-            await self.codex.stop()
+        discovery_ready = False
+        try:
+            transport, _protocol = await self.loop.create_datagram_endpoint(
+                lambda: DiscoveryProtocol(self),
+                local_addr=("0.0.0.0", DEFAULT_DISCOVERY_PORT),
+                allow_broadcast=True,
+            )
+            self.discovery_transport = transport  # type: ignore[assignment]
+            discovery_ready = True
+        except OSError as error:
+            self.event_queue.put(("error", f"自动发现端口 {DEFAULT_DISCOVERY_PORT} 启动失败：{error}"))
+        try:
+            async with websockets.serve(
+                self._handle_client,
+                "0.0.0.0",
+                self.config.port,
+                max_size=MAX_WIRE_MESSAGE_SIZE,
+                ping_interval=20,
+                ping_timeout=20,
+            ):
+                discovery_text = f"，自动发现端口 {DEFAULT_DISCOVERY_PORT}" if discovery_ready else ""
+                self.event_queue.put(("server", f"正在监听端口 {self.config.port}{discovery_text}"))
+                await self.stop_event.wait()
+        finally:
+            if self.discovery_transport is not None:
+                self.discovery_transport.close()
+                self.discovery_transport = None
+            if self.codex:
+                await self.codex.stop()
 
     async def _handle_client(self, connection: websockets.ServerConnection) -> None:
         remote = connection.remote_address
@@ -746,13 +877,23 @@ class BridgeServer:
             thread_title = str(before.get("title", "")).strip()
             ok, result = await asyncio.to_thread(
                 self._send_to_codex_desktop, thread_id, thread_title, text, submit_mode)
+            used_background_channel = False
             if not ok:
-                raise RuntimeError(result)
+                # UI Automation is inherently sensitive to Chromium navigation
+                # and focus timing. The app-server route provides a reliable
+                # fallback so an accepted phone command cannot be silently lost.
+                await self.codex.send_message(thread_id, text)
+                self.pending_desktop_open.add(thread_id)
+                used_background_channel = True
             await self._send_json(connection, {
                 "type": "ack", "id": message_id,
-                "message": "消息已发送给 Codex，电脑端已按" +
-                           (" Ctrl+回车" if submit_mode == "ctrl_enter" else "回车"),
+                "message": "消息已发送给 Codex，" +
+                           ("桌面输入框暂不可用，已自动切换后台可靠通道" if used_background_channel else
+                            "电脑端已确认接收"),
             })
+            if used_background_channel:
+                await self._schedule_codex_refresh()
+                return
             await self._broadcast({
                 "type": "codex_event", "event": "turn/started",
                 "params": {"threadId": thread_id},
@@ -1108,9 +1249,10 @@ class BridgeApp:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.status_var = tk.StringVar(value="正在启动…")
         self.address_var = tk.StringVar()
+        self.pairing_code_var = tk.StringVar()
         self.paired_devices_var = tk.StringVar(value="暂无手机连接")
         self.connected_devices: set[str] = set()
-        self.qr_collapsed = False
+        self.qr_collapsed = True
         self.log_collapsed = False
         self.log_text: tk.Text
         self.qr_photo: ImageTk.PhotoImage | None = None
@@ -1132,22 +1274,28 @@ class BridgeApp:
         status = ttk.Frame(outer, padding=12)
         status.pack(fill=tk.X, pady=(0, 14))
         ttk.Label(status, textvariable=self.status_var, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor=tk.W)
-        qr_frame = ttk.LabelFrame(outer, text="手机扫码配对", padding=14)
+        qr_frame = ttk.LabelFrame(outer, text="局域网自动配对", padding=14)
         qr_frame.pack(fill=tk.X)
         qr_header = ttk.Frame(qr_frame)
         qr_header.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(qr_header, text="扫码后手机即可连接电脑").pack(side=tk.LEFT)
-        self.qr_toggle_button = ttk.Button(qr_header, text="收起二维码", command=self.toggle_qr)
+        ttk.Label(qr_header, text="手机会自动发现本机，请输入下方 6 位码").pack(side=tk.LEFT)
+        self.qr_toggle_button = ttk.Button(qr_header, text="备用方式", command=self.toggle_qr)
         self.qr_toggle_button.pack(side=tk.RIGHT)
+        ttk.Label(
+            qr_frame,
+            textvariable=self.pairing_code_var,
+            font=("Consolas", 34, "bold"),
+            foreground="#175CD3",
+        ).pack(pady=(3, 2))
+        ttk.Label(qr_frame, textvariable=self.address_var, foreground="#475467").pack()
+        ttk.Button(qr_frame, text="换一个六位配对码", command=self.regenerate_pairing_code).pack(pady=(10, 2))
         self.qr_body = ttk.Frame(qr_frame)
-        self.qr_body.pack(fill=tk.X)
         self.qr_label = ttk.Label(self.qr_body)
-        self.qr_label.pack(pady=(0, 8))
-        ttk.Label(self.qr_body, textvariable=self.address_var, foreground="#475467").pack()
+        self.qr_label.pack(pady=(10, 8))
         button_row = ttk.Frame(self.qr_body)
         button_row.pack(fill=tk.X, pady=(12, 0))
         ttk.Button(button_row, text="复制配对信息", command=self.copy_pairing).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
-        ttk.Button(button_row, text="更换配对密钥", command=self.regenerate_token).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(6, 0))
+        ttk.Button(button_row, text="更换长期密钥", command=self.regenerate_token).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(6, 0))
         paired_frame = ttk.LabelFrame(outer, text="已配对手机", padding=12)
         paired_frame.pack(fill=tk.X, pady=(10, 0))
         ttk.Label(paired_frame, textvariable=self.paired_devices_var, foreground="#175CD3",
@@ -1196,7 +1344,11 @@ class BridgeApp:
         image.thumbnail((260, 260), Image.Resampling.LANCZOS)
         self.qr_photo = ImageTk.PhotoImage(image)
         self.qr_label.configure(image=self.qr_photo)
-        self.address_var.set(f"{get_lan_ip()}:{self.config.port}")
+        code = self.config.pairing_code
+        self.pairing_code_var.set(f"{code[:3]} {code[3:]}")
+        self.address_var.set(
+            f"{socket.gethostname()} · {get_lan_ip()}:{self.config.port} · 自动发现 {DEFAULT_DISCOVERY_PORT}"
+        )
 
     def _poll_events(self) -> None:
         while True:
@@ -1204,7 +1356,10 @@ class BridgeApp:
                 event_type, message = self.events.get_nowait()
             except queue.Empty:
                 break
-            if event_type == "client_connected":
+            if event_type == "pairing_code_changed":
+                self._refresh_pairing_view()
+                display_message = "六位配对码已自动更新"
+            elif event_type == "client_connected":
                 self.connected_devices.add(message)
                 self._refresh_paired_devices()
                 display_message = f"手机已配对：{message}"
@@ -1239,10 +1394,10 @@ class BridgeApp:
         self.qr_collapsed = not self.qr_collapsed
         if self.qr_collapsed:
             self.qr_body.pack_forget()
-            self.qr_toggle_button.configure(text="展开二维码")
+            self.qr_toggle_button.configure(text="备用方式")
         else:
             self.qr_body.pack(fill=tk.X)
-            self.qr_toggle_button.configure(text="收起二维码")
+            self.qr_toggle_button.configure(text="收起备用方式")
 
     def toggle_log(self) -> None:
         self.log_collapsed = not self.log_collapsed
@@ -1321,6 +1476,13 @@ class BridgeApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(self._pairing_uri())
         self.status_var.set("配对信息已复制")
+
+    def regenerate_pairing_code(self) -> None:
+        self.config.rotate_pairing_code()
+        self.config.save()
+        self._refresh_pairing_view()
+        self.status_var.set("六位配对码已更新")
+        self._append_log("六位配对码已手动更新")
 
     def regenerate_token(self) -> None:
         if not messagebox.askyesno("更换密钥", "现有手机连接会失效，需要重新扫码。是否继续？"):
