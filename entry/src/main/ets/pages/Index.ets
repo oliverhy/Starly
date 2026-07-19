@@ -448,6 +448,7 @@ struct Index {
       .height('100%')
       .alignItems(VerticalAlign.Top)
       .padding({ top: 134, bottom: 18 })
+      .clip(true)
       .translate({ x: this.mainSectionPageTranslate(section) })
     } else {
       Scroll(scroller) {
@@ -472,6 +473,7 @@ struct Index {
       }
       .width('100%')
       .height('100%')
+      .clip(true)
       .translate({ x: this.mainSectionPageTranslate(section) })
     }
   }
