@@ -6374,7 +6374,7 @@ struct Index {
   }
 
   private visibleCodexActivities(): CodexActivity[] {
-    return this.selectedCodexActivities.slice(-20);
+    return this.selectedCodexActivities.slice(-30);
   }
 
   private latestCodexActivity(): CodexActivity {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import io
 import json
@@ -116,6 +117,41 @@ def normalize_snapshot(rate_response: JsonObject, usage_response: JsonObject,
     }
 
 
+def _thumbnail_image_data_url(raw_bytes: bytes) -> str:
+    if not raw_bytes:
+        return ""
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as opened:
+            opened.thumbnail((720, 720), Image.Resampling.LANCZOS)
+            if opened.mode != "RGB":
+                rendered = Image.new("RGB", opened.size, "white")
+                if "A" in opened.getbands():
+                    rendered.paste(opened, mask=opened.getchannel("A"))
+                else:
+                    rendered.paste(opened)
+            else:
+                rendered = opened.copy()
+            output = io.BytesIO()
+            rendered.save(output, format="JPEG", quality=70, optimize=True)
+            rendered.close()
+        return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    except (OSError, ValueError):
+        return ""
+
+
+def _embedded_image_data_url(source: str) -> str:
+    if not source.startswith("data:image/") or "," not in source:
+        return ""
+    header, encoded = source.split(",", 1)
+    if ";base64" not in header.lower():
+        return source if len(source) <= 2 * 1024 * 1024 else ""
+    try:
+        rendered = _thumbnail_image_data_url(base64.b64decode(encoded, validate=True))
+        return rendered or (source if len(source) <= 2 * 1024 * 1024 else "")
+    except (ValueError, binascii.Error):
+        return ""
+
+
 def _local_image_data_url(raw_path: str) -> str:
     path_text = raw_path.strip()
     if not path_text:
@@ -134,27 +170,65 @@ def _local_image_data_url(raw_path: str) -> str:
     if not path.is_file():
         return ""
     try:
-        with Image.open(path) as source:
-            source.thumbnail((720, 720), Image.Resampling.LANCZOS)
-            if source.mode != "RGB":
-                rgb = Image.new("RGB", source.size, "white")
-                if "A" in source.getbands():
-                    rgb.paste(source, mask=source.getchannel("A"))
-                else:
-                    rgb.paste(source)
-                source = rgb
-            output = io.BytesIO()
-            source.save(output, format="JPEG", quality=70, optimize=True)
-        return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
-    except (OSError, ValueError):
+        return _thumbnail_image_data_url(path.read_bytes())
+    except OSError:
         return ""
 
 
 def _image_source(value: object) -> str:
+    if isinstance(value, dict):
+        for key in ("image_url", "imageUrl", "url", "path", "saved_path", "savedPath"):
+            candidate = value.get(key)
+            if candidate:
+                return _image_source(candidate)
+        return ""
     source = str(value or "").strip()
-    if source.startswith(("https://", "http://", "data:image/")):
+    if source.startswith(("https://", "http://")):
         return source
+    if source.startswith("data:image/"):
+        return _embedded_image_data_url(source)
     return _local_image_data_url(source)
+
+
+def _raw_base64_image_source(value: object) -> str:
+    source = str(value or "").strip()
+    if not source:
+        return ""
+    if source.startswith(("data:image/", "https://", "http://")):
+        return _image_source(source)
+    try:
+        return _thumbnail_image_data_url(base64.b64decode(source, validate=True))
+    except (ValueError, binascii.Error):
+        return ""
+
+
+def _tool_output_images(payload: JsonObject) -> list[str]:
+    output = payload.get("output")
+    blocks = output if isinstance(output, list) else [output]
+    images: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict) or str(block.get("type", "")) not in (
+                "image", "input_image", "localImage", "inputImage"):
+            continue
+        source = _image_source(block)
+        if source and source not in images:
+            images.append(source)
+    return images
+
+
+def _rollout_image_message(raw_line: bytes, timestamp: object, turn_id: object,
+                           title: str, images: list[str]) -> JsonObject | None:
+    unique_images = list(dict.fromkeys(source for source in images if source))
+    if not unique_images:
+        return None
+    return {
+        "id": hashlib.sha1(raw_line).hexdigest()[:24],
+        "role": "assistant",
+        "text": title,
+        "images": unique_images,
+        "timestamp": _timestamp_value(timestamp),
+        "turnId": str(turn_id or timestamp or ""),
+    }
 
 
 _MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\((?:<([^>]+)>|([^\)]+))\)")
@@ -217,7 +291,8 @@ def _item_content(item: JsonObject) -> tuple[str, str, list[str]]:
         text, inline_images = _extract_inline_images("\n".join(parts))
         return "user", text, images + inline_images
     if item_type == "imageGeneration":
-        source = _image_source(item.get("savedPath", item.get("result")))
+        source = _image_source(item.get("savedPath")) or \
+            _raw_base64_image_source(item.get("result"))
         return "assistant", "生成的图片", [source] if source else []
     return "", "", []
 
@@ -518,6 +593,7 @@ def read_rollout_thread_detail(thread_id: str,
     newest_first: list[JsonObject] = []
     latest_task_event = ""
     latest_turn_id = ""
+    pending_view_images: dict[str, tuple[bytes, object, object, list[str]]] = {}
     cursor_found = not before_message_id
     for raw_line in _reverse_jsonl_lines(path):
         is_agent = b'agent_message' in raw_line
@@ -525,7 +601,15 @@ def read_rollout_thread_detail(thread_id: str,
             b'"user"' in raw_line
         is_task_event = b'task_started' in raw_line or b'task_complete' in raw_line or \
             b'turn_aborted' in raw_line
-        if not (is_agent or is_user or is_task_event):
+        is_generated_image = b'image_generation_end' in raw_line
+        is_image_output = (b'custom_tool_call_output' in raw_line or
+                           b'function_call_output' in raw_line) and \
+            (b'input_image' in raw_line or b'"type":"image"' in raw_line or
+             b'"type": "image"' in raw_line)
+        is_tool_call = bool(pending_view_images) and \
+            (b'custom_tool_call' in raw_line or b'function_call' in raw_line)
+        if not (is_agent or is_user or is_task_event or is_generated_image or
+                is_image_output or is_tool_call):
             continue
         try:
             record = json.loads(raw_line)
@@ -563,6 +647,29 @@ def read_rollout_thread_detail(thread_id: str,
                     "timestamp": _timestamp_value(record.get("timestamp")),
                     "turnId": turn_id or str(record.get("timestamp", "")),
                 }
+        elif payload_type == "image_generation_end":
+            source = _image_source(payload.get("saved_path", payload.get("savedPath"))) or \
+                _raw_base64_image_source(payload.get("result"))
+            visible_message = _rollout_image_message(
+                raw_line, record.get("timestamp"), payload.get("turn_id"),
+                "生成的图片", [source])
+        elif payload_type in ("custom_tool_call_output", "function_call_output"):
+            images = _tool_output_images(payload)
+            call_id = str(payload.get("call_id", ""))
+            passthrough = payload.get("internal_chat_message_metadata_passthrough")
+            turn_id = str(passthrough.get("turn_id", "")) \
+                if isinstance(passthrough, dict) else ""
+            if images and call_id:
+                pending_view_images[call_id] = (
+                    raw_line, record.get("timestamp"), turn_id, images)
+        elif payload_type in ("custom_tool_call", "function_call"):
+            call_id = str(payload.get("call_id", ""))
+            pending = pending_view_images.pop(call_id, None)
+            if pending is not None and str(payload.get("name", "")).lower() == "view_image":
+                output_line, output_timestamp, output_turn_id, images = pending
+                visible_message = _rollout_image_message(
+                    output_line, output_timestamp, output_turn_id,
+                    "查看的图片", images)
         if visible_message is not None:
             message_id = str(visible_message.get("id", ""))
             if not cursor_found:
@@ -570,7 +677,8 @@ def read_rollout_thread_detail(thread_id: str,
                     cursor_found = True
             elif len(newest_first) <= page_limit:
                 newest_first.append(visible_message)
-        if cursor_found and len(newest_first) > page_limit and latest_task_event:
+        if cursor_found and len(newest_first) > page_limit and latest_task_event and \
+                not pending_view_images:
             break
 
     if before_message_id and not cursor_found:

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import ctypes
+import io
 import json
 import os
 import queue
@@ -10,6 +11,8 @@ import urllib.parse
 from pathlib import Path
 from ctypes import wintypes
 from unittest import mock
+
+from PIL import Image
 
 from pc.starly_bridge import (BridgeApp, BridgeConfig, BridgeServer, CODEX_COMPOSER_FOCUS_SCRIPT,
                               CODEX_COMPOSER_SETTINGS_SCRIPT,
@@ -593,6 +596,77 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(role, "assistant")
         self.assertEqual(text, "结果如下：预览")
         self.assertEqual(images, ["https://example.com/result.png"])
+
+    def test_rollout_exposes_generated_image_as_paginated_message(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            generated = Path(temp_dir) / "generated.png"
+            Image.new("RGB", (32, 24), "#336699").save(generated)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                {"timestamp": "2026-07-15T01:00:02Z", "type": "event_msg",
+                 "payload": {"type": "image_generation_end", "turn_id": "turn-1",
+                             "status": "completed", "saved_path": str(generated)}},
+                {"timestamp": "2026-07-15T01:00:03Z", "type": "event_msg",
+                 "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                           for item in records) + "\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                detail = read_rollout_thread_detail(thread_id)
+
+        assert detail is not None
+        self.assertEqual(len(detail["messages"]), 1)
+        self.assertEqual(detail["messages"][0]["text"], "生成的图片")
+        self.assertTrue(detail["messages"][0]["images"][0].startswith(
+            "data:image/jpeg;base64,"))
+        self.assertIn("图片生成完成", [item["title"] for item in detail["activities"]])
+
+    def test_rollout_exposes_view_image_tool_output_as_message(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            output = io.BytesIO()
+            Image.new("RGB", (20, 20), "#CC8844").save(output, format="PNG")
+            data_url = "data:image/png;base64," + base64.b64encode(
+                output.getvalue()).decode("ascii")
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                {"timestamp": "2026-07-15T01:00:02Z", "type": "response_item",
+                 "payload": {"type": "function_call", "call_id": "call-image",
+                             "name": "view_image", "arguments": "{}"}},
+                {"timestamp": "2026-07-15T01:00:03Z", "type": "response_item",
+                 "payload": {"type": "function_call_output", "call_id": "call-image",
+                             "output": [{"type": "input_image", "image_url": data_url}],
+                             "internal_chat_message_metadata_passthrough": {
+                                 "turn_id": "turn-1"}}},
+                {"timestamp": "2026-07-15T01:00:04Z", "type": "event_msg",
+                 "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                           for item in records) + "\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                detail = read_rollout_thread_detail(thread_id)
+
+        assert detail is not None
+        self.assertEqual(len(detail["messages"]), 1)
+        self.assertEqual(detail["messages"][0]["text"], "查看的图片")
+        self.assertTrue(detail["messages"][0]["images"][0].startswith(
+            "data:image/jpeg;base64,"))
+        self.assertIn("查看图片", [item["title"] for item in detail["activities"]])
 
     def test_rollout_exposes_public_activity_without_tool_io_or_encrypted_reasoning(self) -> None:
         thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
