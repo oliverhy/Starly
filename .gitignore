@@ -27,3 +27,6 @@
 *.pem
 *.key
 /release
+/gateway/data
+/artifacts
+/output

@@ -1,16 +1,26 @@
 import { common } from '@kit.AbilityKit';
+import { window } from '@kit.ArkUI';
 import { scanBarcode } from '@kit.ScanKit';
 import { hdsEffect } from '@kit.UIDesignKit';
-import { PairingConfig, parsePairingUri } from '../model/PairingConfig';
+import { vibrator } from '@kit.SensorServiceKit';
+import { PairingConfig, PublicPairingRequest, parsePairingUri,
+  parsePublicPairingUri } from '../model/PairingConfig';
 import {
-  CodexMessage, CodexQuota, CodexSnapshot, CodexTask, CodexThreadDetail,
-  isCodexTerminalStatus, normalizeCodexDetailStatus, resolveCodexDisplayStatus
+  CodexActivity, CodexMessage, CodexModelOption, CodexQuota, CodexReasoningOption, CodexSnapshot,
+  CodexTask, CodexThreadDetail,
+  isCodexTerminalStatus, normalizeCodexDetailStatus, parseCodexSnapshot, parseCodexThread,
+  resolveCodexDisplayStatus
 } from '../model/CodexModels';
 import pairingStore from '../service/PairingStore';
 import pairingDiscoveryService, { DiscoveredComputer } from '../service/PairingDiscoveryService';
-import remoteInputClient, { RemoteClientListener } from '../service/RemoteInputClient';
+import remoteInputClient, {
+  CodexApprovalRequest, GatewayPeerDevice, RemoteClientListener
+} from '../service/RemoteInputClient';
 import speechService, { SpeechListener } from '../service/SpeechService';
 import imageTransferService from '../service/ImageTransferService';
+import taskNotificationService from '../service/TaskNotificationService';
+import codexUiStateStore, { CodexUiState } from '../service/CodexUiStateStore';
+import publicPairingService from '../service/PublicPairingService';
 
 enum VoiceGestureAction {
   Keep,
@@ -18,37 +28,64 @@ enum VoiceGestureAction {
   Edit
 }
 
+class PopupVisibilityEvent {
+  isVisible: boolean = false;
+}
+
 class PageRemoteListener implements RemoteClientListener {
   private connectionCallback: (isConnected: boolean, message: string) => void;
-  private acknowledgeCallback: (message: string) => void;
-  private errorCallback: (message: string) => void;
+  private acknowledgeCallback: (messageId: string, operation: string, message: string) => void;
+  private errorCallback: (message: string, messageId?: string, operation?: string) => void;
   private snapshotCallback: (snapshot: CodexSnapshot) => void;
   private threadCallback: (detail: CodexThreadDetail) => void;
   private eventCallback: (event: string, threadId: string) => void;
+  private approvalCallback: (approval: CodexApprovalRequest) => void;
+  private createdCallback: (threadId: string) => void;
+  private gatewaySequenceCallback: (lastReceivedSeq: number) => void;
+  private gatewayCryptoCallback: (sendCounter: number, peerCounter: number,
+    peerCountersJson: string) => void;
+  private gatewayDevicesCallback: (devices: GatewayPeerDevice[], selectedDeviceId: string) => void;
+  private gatewayIdentityCallback: (privateKey: string, publicKey: string,
+    peerKeysJson: string, sessionToken: string, deviceCredential: string) => void;
 
   constructor(connectionCallback: (isConnected: boolean, message: string) => void,
-    acknowledgeCallback: (message: string) => void, errorCallback: (message: string) => void,
+    acknowledgeCallback: (messageId: string, operation: string, message: string) => void,
+    errorCallback: (message: string, messageId?: string, operation?: string) => void,
     snapshotCallback: (snapshot: CodexSnapshot) => void,
     threadCallback: (detail: CodexThreadDetail) => void,
-    eventCallback: (event: string, threadId: string) => void) {
+    eventCallback: (event: string, threadId: string) => void,
+    approvalCallback: (approval: CodexApprovalRequest) => void,
+    createdCallback: (threadId: string) => void,
+    gatewaySequenceCallback: (lastReceivedSeq: number) => void,
+    gatewayCryptoCallback: (sendCounter: number, peerCounter: number,
+      peerCountersJson: string) => void,
+    gatewayDevicesCallback: (devices: GatewayPeerDevice[], selectedDeviceId: string) => void,
+    gatewayIdentityCallback: (privateKey: string, publicKey: string,
+      peerKeysJson: string, sessionToken: string, deviceCredential: string) => void) {
     this.connectionCallback = connectionCallback;
     this.acknowledgeCallback = acknowledgeCallback;
     this.errorCallback = errorCallback;
     this.snapshotCallback = snapshotCallback;
     this.threadCallback = threadCallback;
     this.eventCallback = eventCallback;
+    this.approvalCallback = approvalCallback;
+    this.createdCallback = createdCallback;
+    this.gatewaySequenceCallback = gatewaySequenceCallback;
+    this.gatewayCryptoCallback = gatewayCryptoCallback;
+    this.gatewayDevicesCallback = gatewayDevicesCallback;
+    this.gatewayIdentityCallback = gatewayIdentityCallback;
   }
 
   onConnectionChanged(isConnected: boolean, message: string): void {
     this.connectionCallback(isConnected, message);
   }
 
-  onAcknowledged(message: string): void {
-    this.acknowledgeCallback(message);
+  onAcknowledged(messageId: string, operation: string, message: string): void {
+    this.acknowledgeCallback(messageId, operation, message);
   }
 
-  onError(message: string): void {
-    this.errorCallback(message);
+  onError(message: string, messageId?: string, operation?: string): void {
+    this.errorCallback(message, messageId, operation);
   }
 
   onCodexSnapshot(snapshot: CodexSnapshot): void {
@@ -61,6 +98,33 @@ class PageRemoteListener implements RemoteClientListener {
 
   onCodexEvent(event: string, threadId: string): void {
     this.eventCallback(event, threadId);
+  }
+
+  onCodexApproval(approval: CodexApprovalRequest): void {
+    this.approvalCallback(approval);
+  }
+
+  onCodexCreated(threadId: string): void {
+    this.createdCallback(threadId);
+  }
+
+  onGatewaySequence(lastReceivedSeq: number): void {
+    this.gatewaySequenceCallback(lastReceivedSeq);
+  }
+
+  onGatewayCryptoCounters(sendCounter: number, peerCounter: number,
+    peerCountersJson: string): void {
+    this.gatewayCryptoCallback(sendCounter, peerCounter, peerCountersJson);
+  }
+
+  onGatewayDevices(devices: GatewayPeerDevice[], selectedDeviceId: string): void {
+    this.gatewayDevicesCallback(devices, selectedDeviceId);
+  }
+
+  onGatewayIdentity(privateKey: string, publicKey: string, peerKeysJson: string,
+    sessionToken: string, deviceCredential: string): void {
+    this.gatewayIdentityCallback(privateKey, publicKey, peerKeysJson, sessionToken,
+      deviceCredential);
   }
 }
 
@@ -95,6 +159,26 @@ struct Index {
   @State host: string = '';
   @State portText: string = '8765';
   @State token: string = '';
+  @State connectionMode: string = 'lan';
+  @State activeConnectionTransport: string = '';
+  private gatewayUrl: string = '';
+  private gatewayToken: string = '';
+  private gatewayPairingId: string = '';
+  private phoneDeviceId: string = '';
+  private gatewayLastReceivedSeq: number = 0;
+  private gatewaySendCounter: number = 0;
+  private gatewayPeerCounter: number = 0;
+  private gatewayPeerCountersJson: string = '{}';
+  private gatewayPrivateKey: string = '';
+  private gatewayPublicKey: string = '';
+  private gatewayPeerPublicKeysJson: string = '{}';
+  private gatewaySessionToken: string = '';
+  private gatewayDeviceCredential: string = '';
+  @State gatewayBridgeDevices: GatewayPeerDevice[] = [];
+  @State selectedGatewayBridgeId: string = '';
+  @State gatewayDeviceName: string = '';
+  @State gatewayRevokeConfirm: boolean = false;
+  @State gatewaySwitchConfirmId: string = '';
   @State draft: string = '';
   @State isConnected: boolean = false;
   @State isPairingExpanded: boolean = false;
@@ -107,6 +191,11 @@ struct Index {
   @State pairingCode: string = '';
   @State isDiscoveringComputers: boolean = false;
   @State isPairingWithCode: boolean = false;
+  @State pairingNetworkMode: string = 'lan';
+  @State publicPairingCode: string = '';
+  @State publicPairingStatus: string = '在电脑端生成公网配对码后，手机扫码或手动输入';
+  @State publicPairingVerification: string = '';
+  @State isPublicPairing: boolean = false;
   @State pairingDiscoveryMessage: string = '正在查找同一局域网内的电脑…';
   @State showManualPairing: boolean = false;
   @State submitMode: string = 'ctrl_enter';
@@ -124,14 +213,43 @@ struct Index {
   @State codexError: string = '';
   @State codexQuota: CodexQuota = new CodexQuota();
   @State codexTasks: CodexTask[] = [];
+  @State codexModels: CodexModelOption[] = [];
+  @State codexRelativeTimeNow: number = Date.now();
+  @State codexInitialSyncPending: boolean = true;
+  @State codexSearchText: string = '';
+  @State selectedCodexProject: string = '';
+  @State codexNewTaskMode: boolean = false;
+  @State codexSettingsMenu: string = '';
+  @State selectedCodexModel: string = '';
+  @State selectedCodexEffort: string = 'medium';
+  @State codexPermissionMode: string = 'default';
+  @State selectedCodexServiceTier: string = '';
+  @State codexDeliveryMode: string = 'background';
+  @State desktopSubmitMode: string = 'enter';
+  @State codexFullAccessConfirm: boolean = false;
+  @State codexVoiceListening: boolean = false;
+  @State keyboardInset: number = 0;
+  @State showArchivedCodexTasks: boolean = false;
+  @State codexArchivedTasksLoaded: boolean = false;
+  @State pinnedCodexThreadIds: string[] = [];
+  @State expandedCodexProjects: string[] = [];
+  @State codexTaskMenuId: string = '';
+  @State codexTaskRenameMode: boolean = false;
+  @State codexTaskRenameText: string = '';
+  @State codexTaskMenuX: number = 12;
+  @State codexTaskMenuY: number = 120;
+  @State codexTaskMenuExpanded: boolean = false;
   @State areCodexTasksExpanded: boolean = true;
   @State codexTaskDisplayLimit: number = 10;
   @State selectedCodexTaskId: string = '';
   @State selectedCodexTitle: string = '';
   @State selectedCodexCwd: string = '';
+  @State selectedCodexArchived: boolean = false;
   @State selectedCodexStatus: string = 'notLoaded';
   @State selectedCodexActiveTurnId: string = '';
   @State selectedCodexMessages: CodexMessage[] = [];
+  @State selectedCodexActivities: CodexActivity[] = [];
+  @State codexActivityExpanded: boolean = false;
   @State pendingCodexThreadId: string = '';
   @State isCodexConversationOpen: boolean = false;
   @State codexConversationLimit: number = 5;
@@ -148,15 +266,31 @@ struct Index {
   @State codexImageMimeType: string = '';
   @State codexImagePicking: boolean = false;
   @State codexLoading: boolean = false;
+  @State approvalId: string = '';
+  @State approvalKind: string = '';
+  @State approvalCommand: string = '';
+  @State approvalCwd: string = '';
+  @State approvalReason: string = '';
+  @State approvalPermissions: string = '';
+  @State approvalRiskReason: string = '';
+  @State approvalHighRisk: boolean = false;
+  @State approvalSecondConfirm: boolean = false;
   @State voiceGestureAction: VoiceGestureAction = VoiceGestureAction.Keep;
   private voiceStartX: number = 0;
   private voiceStartY: number = 0;
   private voicePressSequence: number = 0;
   private pendingVoiceSend: boolean = false;
+  private codexVoiceTarget: boolean = false;
   private lastCodexTaskTapId: string = '';
   private lastCodexTaskTapAt: number = 0;
   private codexAutoRefreshTimer: number = -1;
   private codexAutoRefreshInFlight: boolean = false;
+  private codexReconcileTick: number = 0;
+  private pendingDraftSendId: string = '';
+  private pendingCodexSendId: string = '';
+  private pendingCodexSendText: string = '';
+  private pendingCodexSendImage: string = '';
+  private pendingCodexAckTimer: number = -1;
   private codexDetailRetryTimer: number = -1;
   private codexDetailWatchdogTimer: number = -1;
   private codexDetailRetryCount: number = 0;
@@ -173,6 +307,19 @@ struct Index {
   private pairingOverlayShowTimer: number = -1;
   private pairingPanelDragStartX: number = 0;
   private pairingPanelDragStartY: number = 0;
+  private closePairingAfterConnect: boolean = false;
+  private approvalSecondConfirmTimer: number = -1;
+  private codexUiStateSaveTimer: number = -1;
+  private gatewaySwitchConfirmTimer: number = -1;
+  private keyboardChatScrollTimer: number = -1;
+  private codexTaskMenuAnimationTimer: number = -1;
+  private keyboardHeightListener: ((height: number) => void) | null = null;
+  private codexUiComputerKey: string = 'unpaired';
+  private codexComputerSwitchGeneration: number = 0;
+  private restoredCodexTaskId: string = '';
+  private codexCacheRestored: boolean = false;
+  private codexLastSeenMessageIds: Record<string, string> = {};
+  @State codexUnreadCounts: Record<string, number> = {};
   private submitTabsController: TabsController = new TabsController();
   private voiceRestEffect = new hdsEffect.HdsEffectBuilder()
     .pressShadow(hdsEffect.PressShadowType.BLEND_GRADIENT)
@@ -199,26 +346,33 @@ struct Index {
     .buildEffect();
 
   aboutToAppear(): void {
+    this.registerKeyboardHeightListener();
     remoteInputClient.setListener(new PageRemoteListener(
       (isConnected: boolean, message: string): void => {
         this.isConnected = isConnected;
+        this.activeConnectionTransport = remoteInputClient.getActiveTransport();
         this.statusText = message;
         this.statusIsError = false;
         if (isConnected) {
-          this.closePairingPanel();
+          if (this.mainSection === 'codex') {
+            this.codexInitialSyncPending = true;
+            this.startCodexAutoRefresh();
+          }
+          if (this.closePairingAfterConnect) {
+            this.closePairingAfterConnect = false;
+            this.closePairingPanel();
+          }
         } else {
           this.stopCodexAutoRefresh();
           this.clearCodexDetailTimers();
         }
       },
-      (message: string): void => {
+      (messageId: string, operation: string, message: string): void => {
         this.lastAction = message;
-        if (message.startsWith('消息已发送给 Codex')) {
-          this.updateLatestPendingCodexMessage('sent');
-          this.codexCommand = '';
-          this.codexImagePreviewUri = '';
-          this.codexImageDataUrl = '';
-          this.codexImageMimeType = '';
+        if (this.isCodexSendOperation(operation) &&
+          messageId.length > 0 && messageId === this.pendingCodexSendId) {
+          this.updatePendingCodexMessage(messageId, 'sent');
+          this.clearAcknowledgedCodexComposer(messageId);
           const acknowledgedThreadId = this.pendingCodexThreadId.length > 0 ?
             this.pendingCodexThreadId : this.selectedCodexTaskId;
           this.pendingCodexThreadId = acknowledgedThreadId;
@@ -226,20 +380,29 @@ struct Index {
           if (acknowledgedThreadId === this.selectedCodexTaskId) {
             this.selectedCodexStatus = 'active';
           }
-        } else {
+        } else if (operation === 'input' && messageId === this.pendingDraftSendId) {
           this.draft = '';
+          this.pendingDraftSendId = '';
         }
         this.statusText = '电脑已执行';
         this.statusIsError = false;
       },
-      (message: string): void => {
+      (message: string, messageId?: string, operation?: string): void => {
         const shouldRetryCodexDetail = this.codexDetailLoading &&
           this.selectedCodexTaskId.length > 0 && this.mainSection === 'codex';
         this.statusText = message;
         this.statusIsError = true;
-        if (message.includes('Codex')) {
+        if (messageId !== undefined && messageId.length > 0 &&
+          messageId === this.pendingCodexSendId && this.isCodexSendOperation(operation ?? '')) {
+          this.pendingCodexThreadId = '';
+          this.updatePendingCodexMessage(messageId, 'failed');
+          this.clearPendingCodexAcknowledgement();
+        } else if (message.includes('Codex')) {
           this.pendingCodexThreadId = '';
           this.updateLatestPendingCodexMessage('failed');
+        }
+        if (messageId !== undefined && messageId === this.pendingDraftSendId) {
+          this.pendingDraftSendId = '';
         }
         this.codexHistoryLoadingOlder = false;
         this.codexDetailLoading = false;
@@ -249,14 +412,36 @@ struct Index {
         }
       },
       (snapshot: CodexSnapshot): void => {
+        const wasCacheRestored = this.codexCacheRestored;
+        this.codexCacheRestored = false;
+        this.codexInitialSyncPending = false;
         this.codexAvailable = snapshot.available;
         this.codexError = snapshot.error;
+        if (snapshot.models.length > 0) {
+          this.codexModels = snapshot.models;
+          if (this.selectedCodexModel.length === 0 || !snapshot.models.some(
+            (model: CodexModelOption): boolean => model.model === this.selectedCodexModel)) {
+            const preferred = snapshot.models.find(
+              (model: CodexModelOption): boolean => model.isDefault) ?? snapshot.models[0];
+            this.selectedCodexModel = preferred.model;
+            this.selectedCodexEffort = preferred.defaultReasoningEffort || 'medium';
+            this.scheduleCodexUiStateSave();
+          }
+        }
         if (!this.sameCodexQuota(this.codexQuota, snapshot.quota)) {
           this.codexQuota = snapshot.quota;
         }
         const mergedTasks = this.mergeCodexTaskStatuses(snapshot.threads);
+        this.codexArchivedTasksLoaded = snapshot.threads.some(
+          (task: CodexTask): boolean => task.archived);
         if (!this.sameCodexTasks(this.codexTasks, mergedTasks)) {
           this.codexTasks = mergedTasks;
+        }
+        if (this.selectedCodexProject.length > 0 &&
+          this.selectedCodexProject !== '__starly_chats__' &&
+          !this.codexProjects().includes(this.selectedCodexProject)) {
+          this.selectedCodexProject = '';
+          this.scheduleCodexUiStateSave();
         }
         for (let index = 0; index < mergedTasks.length; index += 1) {
           const task = mergedTasks[index];
@@ -266,16 +451,30 @@ struct Index {
               task.updatedAt > this.selectedCodexUpdatedAt;
             this.selectedCodexUpdatedAt = task.updatedAt;
             this.selectedCodexStatus = this.resolvedCodexStatus(task.id, task.status);
-            if (contentChanged && !this.isCodexConversationOpen) {
+            if (contentChanged && this.isCodexConversationOpen) {
               this.requestSelectedCodexThread();
             }
             break;
           }
         }
         this.codexLoading = false;
-        if (this.selectedCodexTaskId.length === 0 && snapshot.threads.length > 0) {
-          this.selectCodexTask(snapshot.threads[0].id);
+        if (this.selectedCodexTaskId.length > 0 && !snapshot.threads.some(
+          (task: CodexTask): boolean => task.id === this.selectedCodexTaskId)) {
+          this.selectedCodexTaskId = '';
+          this.selectedCodexMessages = [];
+          this.selectedCodexActivities = [];
+          this.selectedCodexActiveTurnId = '';
         }
+        if (this.selectedCodexTaskId.length === 0 && snapshot.threads.length > 0) {
+          const restoredExists = snapshot.threads.some(
+            (task: CodexTask): boolean => task.id === this.restoredCodexTaskId);
+          const nextThreadId = restoredExists ? this.restoredCodexTaskId : snapshot.threads[0].id;
+          this.restoredCodexTaskId = '';
+          this.selectCodexTask(nextThreadId);
+        } else if (wasCacheRestored && this.selectedCodexTaskId.length > 0) {
+          this.requestSelectedCodexThread(true);
+        }
+        this.scheduleCodexUiStateSave();
       },
       (detail: CodexThreadDetail): void => {
         this.applyCodexThreadDetail(detail);
@@ -298,6 +497,9 @@ struct Index {
           shouldRefreshSnapshot = true;
           shouldRefreshThread = true;
         } else if (event === 'turn/completed' && threadId.length > 0) {
+          taskNotificationService.publish(
+            'Codex 任务已完成', this.codexTaskNotificationLabel(threadId),
+            `complete-${threadId}-${Date.now()}`);
           if (threadId === this.pendingCodexThreadId) {
             this.pendingCodexThreadId = '';
           }
@@ -309,7 +511,11 @@ struct Index {
           // reads the selected thread again after the desktop has persisted
           // the final assistant message.
           shouldRefreshSnapshot = true;
+          shouldRefreshThread = threadId === this.selectedCodexTaskId;
         } else if (event === 'turn/failed' && threadId.length > 0) {
+          taskNotificationService.publish(
+            'Codex 任务失败', this.codexTaskNotificationLabel(threadId),
+            `failed-${threadId}-${Date.now()}`);
           this.rememberCodexTaskStatus(threadId, 'systemError');
           if (threadId === this.selectedCodexTaskId) {
             this.selectedCodexStatus = 'systemError';
@@ -317,6 +523,9 @@ struct Index {
           shouldRefreshSnapshot = true;
         } else if (event === 'codex/refreshReady') {
           shouldRefreshThread = true;
+        } else if (event === 'thread/archived' || event === 'thread/unarchived' ||
+          event === 'thread/renamed') {
+          shouldRefreshSnapshot = true;
         } else if (event === 'thread/status/changed' ||
           event === 'account/rateLimits/updated') {
           shouldRefreshSnapshot = true;
@@ -327,10 +536,86 @@ struct Index {
         if (shouldRefreshThread && this.selectedCodexTaskId.length > 0) {
           this.requestSelectedCodexThread();
         }
+      },
+      (approval: CodexApprovalRequest): void => {
+        this.approvalId = approval.id;
+        this.approvalKind = approval.method;
+        this.approvalCommand = approval.command;
+        this.approvalCwd = approval.cwd;
+        this.approvalReason = approval.reason;
+        this.approvalPermissions = approval.permissions;
+        this.approvalRiskReason = approval.riskReason;
+        this.approvalHighRisk = approval.highRisk;
+        this.clearApprovalSecondConfirmTimer();
+        this.approvalSecondConfirm = false;
+        this.statusText = 'Codex 正在等待手机审批';
+        this.statusIsError = approval.highRisk;
+        taskNotificationService.publish(
+          'Codex 等待审批',
+          approval.highRisk ? '高风险操作，请打开 Starly 查看并处理' : '请打开 Starly 查看并处理',
+          `approval-${approval.id}`);
+      },
+      (threadId: string): void => {
+        if (threadId.length === 0) {
+          return;
+        }
+        const pendingText = this.codexCommand.trim();
+        const pendingImage = this.codexImagePreviewUri;
+        this.codexCommand = '';
+        this.codexNewTaskMode = false;
+        this.clearCodexImage();
+        this.pendingCodexThreadId = threadId;
+        this.statusText = '新 Codex 任务已创建';
+        this.statusIsError = false;
+        remoteInputClient.requestCodexSnapshot();
+        setTimeout(() => this.selectCodexTask(threadId, pendingText, pendingImage), 500);
+      },
+      (lastReceivedSeq: number): void => {
+        this.gatewayLastReceivedSeq = Math.max(this.gatewayLastReceivedSeq, lastReceivedSeq);
+        const config = this.readConfigFromForm();
+        pairingStore.save(this.getContext(), config).catch((): void => {});
+      },
+      (sendCounter: number, peerCounter: number, peerCountersJson: string): void => {
+        this.gatewaySendCounter = Math.max(this.gatewaySendCounter, sendCounter);
+        this.gatewayPeerCounter = Math.max(this.gatewayPeerCounter, peerCounter);
+        this.gatewayPeerCountersJson = peerCountersJson;
+        const config = this.readConfigFromForm();
+        pairingStore.save(this.getContext(), config).catch((): void => {});
+      },
+      (devices: GatewayPeerDevice[], selectedDeviceId: string): void => {
+        this.gatewayBridgeDevices = devices;
+        this.selectedGatewayBridgeId = selectedDeviceId;
+        const selected = devices.find(
+          (device: GatewayPeerDevice): boolean => device.deviceId === selectedDeviceId);
+        this.gatewayDeviceName = selected?.displayName ?? '';
+        this.gatewayRevokeConfirm = false;
+        this.gatewaySwitchConfirmId = '';
+        const nextComputerKey = this.gatewayCodexUiComputerKey(selectedDeviceId);
+        if (nextComputerKey !== this.codexUiComputerKey) {
+          this.activateCodexComputer(nextComputerKey);
+        }
+        const config = this.readConfigFromForm();
+        pairingStore.save(this.getContext(), config).catch((): void => {});
+      },
+      (privateKey: string, publicKey: string, peerKeysJson: string,
+        sessionToken: string, deviceCredential: string): void => {
+        this.gatewayPrivateKey = privateKey;
+        this.gatewayPublicKey = publicKey;
+        this.gatewayPeerPublicKeysJson = peerKeysJson;
+        this.gatewaySessionToken = sessionToken;
+        this.gatewayDeviceCredential = deviceCredential;
+        const config = this.readConfigFromForm();
+        pairingStore.save(this.getContext(), config).catch((): void => {});
       }
     ));
     speechService.setListener(new PageSpeechListener(
       (isListening: boolean, message: string): void => {
+        if (this.codexVoiceTarget) {
+          this.codexVoiceListening = isListening;
+          if (!isListening && message === '识别完成') {
+            this.codexVoiceTarget = false;
+          }
+        }
         this.statusText = message;
         this.statusIsError = false;
         if (!isListening && message === '识别完成' && this.pendingVoiceSend) {
@@ -339,7 +624,11 @@ struct Index {
         }
       },
       (text: string, isFinal: boolean): void => {
-        this.draft = text;
+        if (this.codexVoiceTarget) {
+          this.codexCommand = text;
+        } else {
+          this.draft = text;
+        }
         if (isFinal && this.pendingVoiceSend) {
           this.pendingVoiceSend = false;
           this.sendDraft();
@@ -350,10 +639,11 @@ struct Index {
         this.statusIsError = true;
       }
     ));
-    this.loadPairing();
+    this.initializePage();
   }
 
   aboutToDisappear(): void {
+    this.unregisterKeyboardHeightListener();
     this.stopCodexAutoRefresh();
     if (this.pairingOverlayShowTimer >= 0) {
       clearTimeout(this.pairingOverlayShowTimer);
@@ -363,8 +653,113 @@ struct Index {
       clearTimeout(this.codexChatScrollTimer);
       this.codexChatScrollTimer = -1;
     }
+    if (this.keyboardChatScrollTimer >= 0) {
+      clearTimeout(this.keyboardChatScrollTimer);
+      this.keyboardChatScrollTimer = -1;
+    }
+    if (this.codexTaskMenuAnimationTimer >= 0) {
+      clearTimeout(this.codexTaskMenuAnimationTimer);
+      this.codexTaskMenuAnimationTimer = -1;
+    }
+    if (this.pendingCodexAckTimer >= 0) {
+      clearTimeout(this.pendingCodexAckTimer);
+      this.pendingCodexAckTimer = -1;
+    }
+    this.clearApprovalSecondConfirmTimer();
+    this.clearGatewaySwitchConfirmTimer();
+    this.flushCodexUiState();
     remoteInputClient.setListener(null);
     speechService.setListener(null);
+  }
+
+  onBackPress(): boolean {
+    // Close the deepest visible layer first. Returning false is reserved for
+    // the real home level, where HarmonyOS may minimize/close the ability.
+    if (this.codexTaskRenameMode && this.codexTaskMenuId.length > 0) {
+      this.codexTaskRenameMode = false;
+      this.codexTaskRenameText = '';
+      this.codexTaskMenuExpanded = true;
+      return true;
+    }
+    if (this.codexTaskMenuId.length > 0) {
+      this.closeCodexTaskMenu();
+      return true;
+    }
+    if (this.approvalId.length > 0) {
+      if (this.approvalSecondConfirm) {
+        this.clearApprovalSecondConfirmTimer();
+        this.approvalSecondConfirm = false;
+      } else {
+        this.statusText = '请先允许或拒绝当前审批';
+        this.statusIsError = true;
+      }
+      return true;
+    }
+    if (this.isPairingOverlayMounted) {
+      if (this.showManualPairing) {
+        this.showManualPairing = false;
+      } else {
+        this.closePairingPanel();
+      }
+      return true;
+    }
+    if (this.codexSettingsMenu.length > 0 || this.codexFullAccessConfirm) {
+      this.codexSettingsMenu = '';
+      this.codexFullAccessConfirm = false;
+      return true;
+    }
+    if (this.isCodexConversationOpen) {
+      this.closeRemoteCodexConversation();
+      return true;
+    }
+    if (this.selectedCodexProject.length > 0) {
+      this.selectedCodexProject = '';
+      return true;
+    }
+    return false;
+  }
+
+  private registerKeyboardHeightListener(): void {
+    if (this.keyboardHeightListener !== null) {
+      return;
+    }
+    this.keyboardHeightListener = (height: number): void => {
+      this.keyboardInset = Math.max(0, px2vp(height));
+      if (height <= 0 || !this.isCodexConversationOpen) {
+        return;
+      }
+      if (this.keyboardChatScrollTimer >= 0) {
+        clearTimeout(this.keyboardChatScrollTimer);
+      }
+      // Wait until the keyboard/inset animation has finished, then anchor the
+      // latest message directly above the composer.
+      this.keyboardChatScrollTimer = setTimeout(() => {
+        this.keyboardChatScrollTimer = -1;
+        if (this.keyboardInset > 0 && this.isCodexConversationOpen) {
+          this.scrollCodexChatToBottom(false);
+        }
+      }, 180);
+    };
+    const listener = this.keyboardHeightListener;
+    window.getLastWindow(this.getContext()).then((mainWindow: window.Window): void => {
+      mainWindow.on('keyboardHeightChange', listener);
+    }).catch((): void => {});
+  }
+
+  private unregisterKeyboardHeightListener(): void {
+    const listener = this.keyboardHeightListener;
+    if (listener === null) {
+      return;
+    }
+    this.keyboardHeightListener = null;
+    this.keyboardInset = 0;
+    if (this.keyboardChatScrollTimer >= 0) {
+      clearTimeout(this.keyboardChatScrollTimer);
+      this.keyboardChatScrollTimer = -1;
+    }
+    window.getLastWindow(this.getContext()).then((mainWindow: window.Window): void => {
+      mainWindow.off('keyboardHeightChange', listener);
+    }).catch((): void => {});
   }
 
   build() {
@@ -418,6 +813,12 @@ struct Index {
       if (this.isPairingOverlayMounted) {
         this.buildPairingOverlay();
       }
+      if (this.approvalId.length > 0) {
+        this.buildApprovalOverlay();
+      }
+      if (this.codexTaskMenuId.length > 0) {
+        this.buildCodexTaskMenuOverlay();
+      }
     }
     .width('100%')
     .height('100%')
@@ -440,14 +841,26 @@ struct Index {
 
   @Builder
   buildMainSectionPage(section: string, scroller: Scroller) {
-    if (section === 'codex' && this.useTwoPaneCodexLayout() && this.selectedCodexTaskId.length > 0) {
+    // Phones keep the full-width Remote flow. Wide screens reuse that same
+    // Remote module in a compact left pane and show the selected chat beside it.
+    if (section === 'codex' && this.useTwoPaneCodexLayout()) {
       Row() {
-        this.buildFixedWideCodexDashboard();
+        this.buildDesktopCodexWorkspace();
       }
       .width('100%')
       .height('100%')
       .alignItems(VerticalAlign.Top)
       .padding({ top: 134, bottom: 18 })
+      .clip(true)
+      .translate({ x: this.mainSectionPageTranslate(section) })
+    } else if (section === 'codex') {
+      Column() {
+        this.buildCodexRemoteHome(false)
+      }
+      .width('100%')
+      .height('100%')
+      .alignItems(HorizontalAlign.Center)
+      .padding({ top: 126, bottom: 12 })
       .clip(true)
       .translate({ x: this.mainSectionPageTranslate(section) })
     } else {
@@ -570,17 +983,17 @@ struct Index {
   @Builder
   buildTitleConnectionStatus() {
     Row({ space: 6 }) {
-      Text(this.isConnected ? '✓' : '•')
+      Text(this.titleConnectionIcon())
         .fontSize(13)
         .fontWeight(FontWeight.Bold)
-        .fontColor(this.isConnected ? '#175CD3' : $r('app.color.text_secondary'))
-      Text(this.isConnected ? '已配对' : '未配对')
+        .fontColor(this.titleConnectionColor())
+      Text(this.titleConnectionLabel())
         .fontSize(12)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.text_primary'))
         .maxLines(1)
     }
-    .width(92)
+    .width(108)
     .height(36)
     .padding({ left: 11, right: 11 })
     .clip(true)
@@ -597,6 +1010,42 @@ struct Index {
     .onClick(() => {
       this.togglePairingPanel();
     })
+  }
+
+  private hasPairingConfiguration(): boolean {
+    return this.readConfigFromForm().isComplete();
+  }
+
+  private titleConnectionLabel(): string {
+    if (!this.hasPairingConfiguration()) {
+      return '未配对';
+    }
+    if (this.activeConnectionTransport === 'gateway') {
+      if (!this.isConnected) {
+        return '中继未连接';
+      }
+      return this.selectedGatewayDeviceOnline() ? '电脑在线' : '电脑离线';
+    }
+    if (this.isConnected) {
+      return '电脑在线';
+    }
+    return this.connectionMode === 'lan' ? '电脑离线' : '中继未连接';
+  }
+
+  private titleConnectionIcon(): string {
+    const label = this.titleConnectionLabel();
+    if (label === '电脑在线') return '✓';
+    if (label === '电脑离线') return '●';
+    if (label === '中继未连接') return '!';
+    return '•';
+  }
+
+  private titleConnectionColor(): string {
+    const label = this.titleConnectionLabel();
+    if (label === '电脑在线') return '#067647';
+    if (label === '电脑离线') return '#B54708';
+    if (label === '中继未连接') return '#B42318';
+    return '#667085';
   }
 
   @Builder
@@ -673,7 +1122,168 @@ struct Index {
       )
       Scroll() {
         Column({ space: 10 }) {
+          Column({ space: 8 }) {
+            Row() {
+              Column({ space: 2 }) {
+                Text('Codex 发送方式')
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                Text('选择手机指令如何进入电脑端 Codex')
+                  .fontSize(10)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .alignItems(HorizontalAlign.Start)
+              Blank()
+            }
+            .width('100%')
+            Row({ space: 8 }) {
+              Button('默认模式')
+                .layoutWeight(1)
+                .height(38)
+                .fontSize(12)
+                .fontColor(this.codexDeliveryMode === 'background' ? Color.White : '#FF344054')
+                .backgroundColor(this.codexDeliveryMode === 'background' ? '#FF175CD3' :
+                  $r('app.color.input_background'))
+                .borderRadius(12)
+                .onClick(() => this.selectCodexDeliveryMode('background'))
+              Button('桌面输入框')
+                .layoutWeight(1)
+                .height(38)
+                .fontSize(12)
+                .fontColor(this.codexDeliveryMode === 'desktop' ? Color.White : '#FF344054')
+                .backgroundColor(this.codexDeliveryMode === 'desktop' ? '#FF175CD3' :
+                  $r('app.color.input_background'))
+                .borderRadius(12)
+                .onClick(() => this.selectCodexDeliveryMode('desktop'))
+            }
+            .width('100%')
+            Text(this.codexDeliveryMode === 'desktop' ?
+              '打开对应桌面任务，定位模型、推理强度和权限后，通过输入框发送文字或图片。新建任务仍使用默认模式。' :
+              '通过 Starly 的后台可靠通道发送，电脑端可能需要刷新后才能显示。')
+              .width('100%')
+              .fontSize(10)
+              .fontColor(this.codexDeliveryMode === 'desktop' ? '#FF175CD3' :
+                $r('app.color.text_secondary'))
+              .lineHeight(15)
+            if (this.codexDeliveryMode === 'desktop') {
+              Column({ space: 6 }) {
+                Text('发送按钮快捷键')
+                  .width('100%')
+                  .fontSize(11)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                Row({ space: 8 }) {
+                  Button('回车发送')
+                    .layoutWeight(1)
+                    .height(34)
+                    .fontSize(11)
+                    .fontColor(this.desktopSubmitMode === 'enter' ? Color.White : '#FF344054')
+                    .backgroundColor(this.desktopSubmitMode === 'enter' ? '#FF175CD3' :
+                      $r('app.color.input_background'))
+                    .borderRadius(11)
+                    .onClick(() => this.selectDesktopSubmitMode('enter'))
+                  Button('Ctrl + 回车发送')
+                    .layoutWeight(1)
+                    .height(34)
+                    .fontSize(11)
+                    .fontColor(this.desktopSubmitMode === 'ctrl_enter' ? Color.White : '#FF344054')
+                    .backgroundColor(this.desktopSubmitMode === 'ctrl_enter' ? '#FF175CD3' :
+                      $r('app.color.input_background'))
+                    .borderRadius(11)
+                    .onClick(() => this.selectDesktopSubmitMode('ctrl_enter'))
+                }
+                .width('100%')
+              }
+              .width('100%')
+              .padding({ top: 2 })
+            }
+          }
+          .width('100%')
+          .padding(12)
+          .backgroundColor('#12FFFFFF')
+          .border({ width: 1, color: $r('app.color.glass_border') })
+          .borderRadius(14)
+
+          Column({ space: 7 }) {
+            Row() {
+              Text('连接通道')
+                .fontSize(14)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.text_primary'))
+              Blank()
+              Text(this.activeConnectionTransport === 'lan' ? '当前：局域网直连' :
+                (this.activeConnectionTransport === 'gateway' ? '当前：公网中继' : '当前：未连接'))
+                .fontSize(10)
+                .fontColor(this.isConnected ? '#FF067647' : $r('app.color.text_secondary'))
+            }
+            .width('100%')
+            Row({ space: 6 }) {
+              Button('自动')
+                .layoutWeight(1)
+                .height(34)
+                .fontSize(11)
+                .fontColor(this.connectionMode === 'auto' ? Color.White : '#FF344054')
+                .backgroundColor(this.connectionMode === 'auto' ? '#FF175CD3' :
+                  $r('app.color.input_background'))
+                .borderRadius(11)
+                .onClick(() => this.selectConnectionMode('auto'))
+              Button('仅局域网')
+                .layoutWeight(1)
+                .height(34)
+                .fontSize(11)
+                .fontColor(this.connectionMode === 'lan' ? Color.White : '#FF344054')
+                .backgroundColor(this.connectionMode === 'lan' ? '#FF175CD3' :
+                  $r('app.color.input_background'))
+                .borderRadius(11)
+                .onClick(() => this.selectConnectionMode('lan'))
+              Button('仅公网')
+                .layoutWeight(1)
+                .height(34)
+                .fontSize(11)
+                .fontColor(this.connectionMode === 'gateway' ? Color.White : '#FF344054')
+                .backgroundColor(this.connectionMode === 'gateway' ? '#FF175CD3' :
+                  $r('app.color.input_background'))
+                .borderRadius(11)
+                .onClick(() => this.selectConnectionMode('gateway'))
+            }
+            .width('100%')
+            Text('自动模式优先使用局域网；局域网不可用时切换公网，恢复后自动切回。')
+              .width('100%')
+              .fontSize(10)
+              .lineHeight(15)
+              .fontColor($r('app.color.text_secondary'))
+          }
+          .width('100%')
+          .padding(12)
+          .backgroundColor('#12FFFFFF')
+          .border({ width: 1, color: $r('app.color.glass_border') })
+          .borderRadius(14)
+
           Row({ space: 8 }) {
+            Button('局域网配对')
+              .layoutWeight(1)
+              .height(38)
+              .fontSize(12)
+              .fontColor(this.pairingNetworkMode === 'lan' ? Color.White : '#FF344054')
+              .backgroundColor(this.pairingNetworkMode === 'lan' ? '#FF175CD3' :
+                $r('app.color.input_background'))
+              .borderRadius(12)
+              .onClick(() => this.selectPairingNetworkMode('lan'))
+            Button('公网配对')
+              .layoutWeight(1)
+              .height(38)
+              .fontSize(12)
+              .fontColor(this.pairingNetworkMode === 'public' ? Color.White : '#FF344054')
+              .backgroundColor(this.pairingNetworkMode === 'public' ? '#FF175CD3' :
+                $r('app.color.input_background'))
+              .borderRadius(12)
+              .onClick(() => this.selectPairingNetworkMode('public'))
+          }
+          .width('100%')
+
+          if (this.pairingNetworkMode === 'lan') {
+            Row({ space: 8 }) {
             Text(this.pairingDiscoveryMessage)
               .layoutWeight(1)
               .fontSize(12)
@@ -779,7 +1389,7 @@ struct Index {
             this.showManualPairing = !this.showManualPairing;
           })
 
-          if (this.showManualPairing) {
+            if (this.showManualPairing) {
             if (canIUse('SystemCapability.Multimedia.Scan.ScanBarcode')) {
               Button('扫描原有配对二维码')
                 .width('100%')
@@ -832,6 +1442,58 @@ struct Index {
                 .borderRadius(12)
                 .onClick(() => this.clearPairing())
             }
+            }
+          } else {
+            Text(this.publicPairingStatus)
+              .width('100%')
+              .fontSize(12)
+              .fontColor(this.isPublicPairing ? '#175CD3' : $r('app.color.text_secondary'))
+              .padding(12)
+              .backgroundColor($r('app.color.input_background'))
+              .borderRadius(12)
+            if (this.publicPairingVerification.length > 0) {
+              Text(`安全校验码：${this.publicPairingVerification}`)
+                .width('100%')
+                .fontSize(20)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#175CD3')
+                .textAlign(TextAlign.Center)
+                .padding(10)
+            }
+            if (canIUse('SystemCapability.Multimedia.Scan.ScanBarcode')) {
+              Button('扫描电脑端公网配对二维码')
+                .width('100%')
+                .height(46)
+                .fontColor(Color.White)
+                .backgroundColor('#175CD3')
+                .borderRadius(12)
+                .enabled(!this.isPublicPairing)
+                .onClick(() => this.scanPublicPairingCode())
+            }
+            TextInput({ text: this.publicPairingCode,
+              placeholder: '输入电脑端显示的 8 位公网配对码' })
+              .height(48)
+              .maxLength(9)
+              .fontSize(18)
+              .letterSpacing(2)
+              .backgroundColor($r('app.color.input_background'))
+              .border({ width: 1, color: $r('app.color.glass_border') })
+              .borderRadius(12)
+              .onChange((value: string) => this.publicPairingCode = value.toUpperCase())
+            Button(this.isPublicPairing ? '正在等待电脑允许…' : '使用短码配对')
+              .width('100%')
+              .height(46)
+              .fontColor(Color.White)
+              .backgroundColor('#175CD3')
+              .borderRadius(12)
+              .enabled(!this.isPublicPairing &&
+                this.publicPairingCode.replace('-', '').length === 8)
+              .onClick(() => this.pairPublicGateway(null))
+            Text('公网短码只能使用一次，2 分钟过期；配对必须在电脑端明确允许。')
+              .width('100%')
+              .fontSize(10)
+              .lineHeight(15)
+              .fontColor($r('app.color.text_secondary'))
           }
         }
         .width('100%')
@@ -917,6 +1579,450 @@ struct Index {
   }
 
   @Builder
+  buildCodexRemoteHome(compact: boolean) {
+    Column() {
+      this.buildCodexRemoteHeader(true)
+
+      Scroll() {
+        Column({ space: 4 }) {
+          if (this.selectedCodexProject.length === 0) {
+            Row({ space: 7 }) {
+              Text(this.isConnected ? '●' : '○')
+                .fontSize(10)
+                .fontColor(this.isConnected ? '#12B76A' : '#98A2B3')
+              Text(this.selectedGatewayDevice()?.displayName || '当前电脑')
+                .fontSize(12)
+                .fontColor($r('app.color.text_primary'))
+            }
+            .width('100%')
+            .padding({ left: 4, top: 4, bottom: 12 })
+
+            Text('项目')
+              .width('100%')
+              .fontSize(14)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_secondary'))
+              .padding({ left: 4, top: 4, bottom: 5 })
+            Row({ space: 10 }) {
+              Text('对话')
+                .fontSize(11)
+                .fontColor('#344054')
+              Text('聊天')
+                .layoutWeight(1)
+                .fontSize(14)
+                .fontColor($r('app.color.text_primary'))
+              Text('›')
+                .fontSize(18)
+                .fontColor($r('app.color.text_secondary'))
+            }
+            .width('100%')
+            .padding({ left: 4, right: 4, top: 10, bottom: 10 })
+            .onClick(() => this.selectedCodexProject = '__starly_chats__')
+            ForEach(this.codexHomeProjects(), (project: string) => {
+              Row({ space: 10 }) {
+                Text('项目')
+                  .fontSize(11)
+                  .fontColor('#344054')
+                Text(this.codexProjectName(project))
+                  .layoutWeight(1)
+                  .fontSize(14)
+                  .fontColor($r('app.color.text_primary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .width('100%')
+              .padding({ left: 4, right: 4, top: 10, bottom: 10 })
+              .onClick(() => this.selectedCodexProject = project)
+            }, (project: string): string => project)
+          }
+
+          Text(this.selectedCodexProject === '__starly_chats__' ? '聊天' :
+            (this.selectedCodexProject.length > 0 ? '项目任务' : '最近'))
+            .width('100%')
+            .fontSize(14)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.text_secondary'))
+            .padding({ left: 4, top: 14, bottom: 5 })
+          if (this.codexRemoteHomeTasks().length === 0) {
+            Text(this.codexLoading ? '正在同步任务…' : '没有匹配的任务')
+              .width('100%')
+              .textAlign(TextAlign.Center)
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+              .padding({ top: 32, bottom: 32 })
+          }
+          ForEach(this.codexRemoteHomeTasks(), (task: CodexTask) => {
+            Row({ space: 10 }) {
+              Column({ space: 3 }) {
+                Text(task.title || 'Codex 任务')
+                  .width('100%')
+                  .fontSize(14)
+                  .fontColor($r('app.color.text_primary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                if (this.selectedCodexProject.length > 0 && task.preview.length > 0) {
+                  Text(task.preview)
+                    .width('100%')
+                    .fontSize(10)
+                    .fontColor($r('app.color.text_secondary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+              if (this.isCodexTaskPinned(task.id)) {
+                Text('置顶')
+                  .fontSize(9)
+                  .fontColor('#175CD3')
+              }
+              if (this.effectiveCodexStatus(task) === 'active') {
+                Text('正在执行')
+                  .fontSize(10)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#067647')
+              } else if (this.codexTaskUnreadCount(task.id) > 0) {
+                Text(`${this.codexTaskUnreadCount(task.id)} 未读`)
+                  .fontSize(9)
+                  .fontColor('#175CD3')
+              } else {
+                Text(this.codexInitialSyncPending ? '同步中' :
+                  this.formatCodexRelativeTime(task.updatedAt))
+                  .fontSize(10)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+            }
+            .width('100%')
+            .padding({ left: 4, right: 4, top: 11, bottom: 11 })
+            .border({ width: { bottom: 1 }, color: '#10000000' })
+            .onClick(() => this.openRemoteCodexTask(task.id))
+            .gesture(
+              LongPressGesture({ repeat: false })
+                .onAction((event: GestureEvent) => this.openCodexTaskMenu(task.id, event))
+            )
+          }, (task: CodexTask): string => this.codexTaskRenderKey(task, 'remote'))
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.Start)
+        .padding({ left: 16, right: 16, bottom: 20 })
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .align(Alignment.TopStart)
+      .scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring)
+
+      this.buildCodexRemoteFooter()
+    }
+    .width(compact ? this.codexSidebarWidth() : this.codexRemoteHomeWidth())
+    .height('100%')
+    .justifyContent(FlexAlign.Start)
+    .linearGradient({
+      angle: 145,
+      colors: [['#78FDFEFF', 0.0], ['#58EAF5FF', 0.42], ['#68F4E9FF', 1.0]]
+    })
+    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+      colorMode: ThemeColorMode.SYSTEM,
+      adaptiveColor: AdaptiveColor.DEFAULT,
+      scale: 0.9
+    })
+    .border({ width: 1, color: '#B8FFFFFF' })
+    .borderRadius(26)
+    .shadow({ radius: 32, color: '#303B82F6', offsetY: 10 })
+    .clip(true)
+  }
+
+  @Builder
+  buildCodexRemoteHeader(showProjectNavigation: boolean) {
+    Row({ space: 10 }) {
+      if (showProjectNavigation && this.selectedCodexProject.length > 0) {
+        Button('‹')
+          .width(40)
+          .height(40)
+          .padding(0)
+          .fontSize(28)
+          .fontColor($r('app.color.text_primary'))
+          .backgroundColor(Color.Transparent)
+          .onClick(() => this.selectedCodexProject = '')
+      }
+      Column({ space: 2 }) {
+        Text(showProjectNavigation && this.selectedCodexProject.length > 0 ?
+          this.codexProjectName(this.selectedCodexProject) : 'Remote')
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.text_primary'))
+          .maxLines(1)
+        Text(this.selectedGatewayDeviceStatusText())
+          .fontSize(10)
+          .fontColor(this.isConnected ? '#067647' : $r('app.color.text_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+      Column({ space: 1 }) {
+        Text(this.codexAvailable ?
+          `订阅剩余 ${Math.round(this.codexQuota.remainingPercent)}%` : '订阅额度 --')
+          .fontSize(9)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.codexAvailable ? '#175CD3' : $r('app.color.text_secondary'))
+        Text(this.codexAvailable ? `重置 ${this.codexQuota.resetCredits} 次` : '重置 --')
+          .fontSize(8)
+          .fontColor($r('app.color.text_secondary'))
+      }
+      .padding({ left: 9, right: 9, top: 5, bottom: 5 })
+      .alignItems(HorizontalAlign.Start)
+      .backgroundColor('#7AFFFFFF')
+      .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+        colorMode: ThemeColorMode.SYSTEM,
+        adaptiveColor: AdaptiveColor.DEFAULT,
+        scale: 0.88
+      })
+      .border({ width: 1, color: '#8AFFFFFF' })
+      .borderRadius(12)
+      Button('⋮')
+        .width(40)
+        .height(40)
+        .padding(0)
+        .fontSize(24)
+        .fontColor($r('app.color.text_primary'))
+        .backgroundColor('#88FFFFFF')
+        .borderRadius(20)
+        .onClick(() => this.togglePairingPanel())
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 4, bottom: 8 })
+  }
+
+  @Builder
+  buildCodexRemoteFooter() {
+    Row({ space: 8 }) {
+      Row({ space: 7 }) {
+        Text('⌕')
+          .fontSize(20)
+          .fontColor($r('app.color.text_secondary'))
+        TextInput({ text: this.codexSearchText, placeholder: '搜索聊天' })
+          .layoutWeight(1)
+          .height(42)
+          .fontSize(13)
+          .backgroundColor(Color.Transparent)
+          .onChange((value: string) => this.codexSearchText = value)
+      }
+      .layoutWeight(1)
+      .height(48)
+      .padding({ left: 12, right: 8 })
+      .backgroundColor('#FFFFFFFF')
+      .border({ width: 1, color: '#18000000' })
+      .borderRadius(24)
+      Button('✎  聊天')
+        .height(48)
+        .padding({ left: 17, right: 17 })
+        .fontSize(13)
+        .fontColor('#FFFFFFFF')
+        .backgroundColor('#FF111111')
+        .borderRadius(24)
+        .enabled(this.codexProjects().length > 0 && this.isConnected)
+        .onClick(() => this.openNewCodexTask())
+    }
+    .width('100%')
+    .padding({ left: 12, right: 12, top: 8, bottom: 4 })
+    .backgroundColor('#5EFFFFFF')
+  }
+
+  @Builder
+  buildDesktopCodexWorkspace() {
+    Row({ space: 18 }) {
+      this.buildCodexRemoteHome(true);
+      Column() {
+        if (this.selectedCodexTaskId.length > 0) {
+          this.buildCodexDetailCard();
+        } else {
+          this.buildDesktopCodexEmptyDetail();
+        }
+      }
+      .layoutWeight(1)
+      .height('100%')
+    }
+    .width('100%')
+    .height('100%')
+    .alignItems(VerticalAlign.Top)
+  }
+
+  @Builder
+  buildDesktopCodexSidebar() {
+    Column() {
+      this.buildCodexRemoteHeader(false)
+      Scroll() {
+        Column({ space: 4 }) {
+          Row({ space: 7 }) {
+            Text(this.isConnected ? '●' : '○')
+              .fontSize(10)
+              .fontColor(this.isConnected ? '#12B76A' : '#98A2B3')
+            Text(this.selectedGatewayDevice()?.displayName || '当前电脑')
+              .fontSize(12)
+              .fontColor($r('app.color.text_primary'))
+          }
+          .width('100%')
+          .padding({ left: 4, top: 4, bottom: 12 })
+
+          Row() {
+            Text('项目')
+              .fontSize(14)
+              .fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_secondary'))
+            Blank()
+            Text(`${this.codexTasks.length} 个任务`)
+              .fontSize(10)
+              .fontColor($r('app.color.text_secondary'))
+          }
+          .width('100%')
+          .padding({ left: 4, right: 4, top: 4, bottom: 5 })
+
+          ForEach(this.codexDesktopProjects(), (project: string) => {
+            Column({ space: 2 }) {
+              Row({ space: 10 }) {
+                Text('▱')
+                  .fontSize(16)
+                  .fontColor('#344054')
+                Text(this.codexProjectName(project))
+                  .layoutWeight(1)
+                  .fontSize(14)
+                  .fontColor($r('app.color.text_primary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                Text(`${this.codexTasksForDesktopProject(project).length}`)
+                  .fontSize(10)
+                  .fontColor($r('app.color.text_secondary'))
+                Text(this.isCodexProjectExpanded(project) ? '⌄' : '›')
+                  .fontSize(16)
+                  .fontColor($r('app.color.text_secondary'))
+              }
+              .width('100%')
+              .padding({ left: 4, right: 4, top: 10, bottom: 10 })
+              .backgroundColor(this.isCodexProjectExpanded(project) ?
+                '#18FFFFFF' : Color.Transparent)
+              .borderRadius(12)
+              .onClick(() => this.toggleCodexProject(project))
+              if (this.isCodexProjectExpanded(project)) {
+                ForEach(this.codexTasksForDesktopProject(project), (task: CodexTask) => {
+                  Row({ space: 10 }) {
+                    Column({ space: 3 }) {
+                      Text(task.title || 'Codex 任务')
+                        .width('100%')
+                        .fontSize(14)
+                        .fontColor($r('app.color.text_primary'))
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      if (task.preview.length > 0) {
+                        Text(task.preview)
+                          .width('100%')
+                          .fontSize(10)
+                          .fontColor($r('app.color.text_secondary'))
+                          .maxLines(1)
+                          .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      }
+                    }
+                    .layoutWeight(1)
+                    .alignItems(HorizontalAlign.Start)
+                    if (this.isCodexTaskPinned(task.id)) {
+                      Text('置顶')
+                        .fontSize(9)
+                        .fontColor('#175CD3')
+                    }
+                    if (this.effectiveCodexStatus(task) === 'active') {
+                      Text('正在执行')
+                        .fontSize(10)
+                        .fontWeight(FontWeight.Medium)
+                        .fontColor('#067647')
+                    } else if (this.codexTaskUnreadCount(task.id) > 0) {
+                      Text(`${this.codexTaskUnreadCount(task.id)} 未读`)
+                        .fontSize(9)
+                        .fontColor('#175CD3')
+                    } else {
+                      Text(this.codexInitialSyncPending ? '同步中' :
+                        this.formatCodexRelativeTime(task.updatedAt))
+                        .fontSize(10)
+                        .fontColor($r('app.color.text_secondary'))
+                    }
+                  }
+                  .width('100%')
+                  .padding({ left: 28, right: 4, top: 11, bottom: 11 })
+                  .backgroundColor(this.selectedCodexTaskId === task.id ?
+                    '#32FFFFFF' : Color.Transparent)
+                  .border({ width: { bottom: 1 }, color: '#10000000' })
+                  .borderRadius(12)
+                  .onClick(() => this.openDesktopCodexTask(task.id, project))
+                  .gesture(
+                    LongPressGesture({ repeat: false })
+                      .onAction((event: GestureEvent) => this.openCodexTaskMenu(task.id, event))
+                  )
+                }, (task: CodexTask): string => this.codexTaskRenderKey(task, 'desktop'))
+              }
+            }
+            .width('100%')
+          }, (project: string): string => `desktop-project-${project}`)
+          if (this.codexDesktopProjects().length === 0) {
+            Text(this.codexLoading ? '正在同步任务…' : '暂无项目任务')
+              .width('100%')
+              .textAlign(TextAlign.Center)
+              .fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+              .padding({ top: 30, bottom: 30 })
+          }
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.Start)
+        .padding({ left: 16, right: 16, bottom: 20 })
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .align(Alignment.TopStart)
+      .scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring)
+
+      this.buildCodexRemoteFooter()
+    }
+    .width(this.codexSidebarWidth())
+    .height('100%')
+    .justifyContent(FlexAlign.Start)
+    .linearGradient({
+      angle: 145,
+      colors: [['#78FDFEFF', 0.0], ['#58EAF5FF', 0.42], ['#68F4E9FF', 1.0]]
+    })
+    .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+      colorMode: ThemeColorMode.SYSTEM,
+      adaptiveColor: AdaptiveColor.DEFAULT,
+      scale: 0.9
+    })
+    .border({ width: 1, color: '#B8FFFFFF' })
+    .borderRadius(26)
+    .shadow({ radius: 32, color: '#303B82F6', offsetY: 10 })
+    .clip(true)
+  }
+
+  @Builder
+  buildDesktopCodexEmptyDetail() {
+    Column({ space: 12 }) {
+      Text('选择一个任务')
+        .fontSize(24)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('app.color.text_primary'))
+      Text('从左侧项目中展开并选择任务，右侧将显示完整聊天记录和任务操作。')
+        .fontSize(13)
+        .fontColor($r('app.color.text_secondary'))
+        .textAlign(TextAlign.Center)
+    }
+    .width('100%')
+    .height(this.codexDetailCardHeight())
+    .justifyContent(FlexAlign.Center)
+    .padding(24)
+    .backgroundColor(this.codexGlassSurfaceColor())
+    .border({ width: 1, color: this.codexGlassBorderColor() })
+    .borderRadius(28)
+    .shadow({ radius: 28, color: this.codexGlassShadowColor(), offsetY: 10 })
+  }
+
+  @Builder
   buildCodexDashboard() {
     if (this.useTwoPaneCodexLayout() && this.selectedCodexTaskId.length > 0) {
       Row({ space: 18 }) {
@@ -942,6 +2048,211 @@ struct Index {
       }
       .width('100%')
     }
+  }
+
+  @Builder
+  buildApprovalOverlay() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor('#66000000')
+      Column({ space: 14 }) {
+        Text(this.approvalHighRisk ? '高风险操作审批' : 'Codex 请求审批')
+          .fontSize(22)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(this.approvalHighRisk ? '#FFD7D2' : '#FFFFFFFF')
+        Text(this.approvalDisplayKind())
+          .fontSize(14)
+          .fontColor('#B8FFFFFF')
+        if (this.approvalCommand.length > 0) {
+          Text(this.approvalCommand)
+            .fontSize(14)
+            .fontFamily('monospace')
+            .fontColor('#FFFFFFFF')
+            .width('100%')
+            .maxLines(6)
+        }
+        if (this.approvalCwd.length > 0) {
+          Text(`目录：${this.approvalCwd}`)
+            .fontSize(13)
+            .fontColor('#C8FFFFFF')
+            .width('100%')
+        }
+        if (this.approvalReason.length > 0) {
+          Text(this.approvalReason)
+            .fontSize(13)
+            .fontColor('#C8FFFFFF')
+            .width('100%')
+        }
+        if (this.approvalPermissions.length > 0) {
+          Text(`权限：${this.approvalPermissions}`)
+            .fontSize(13)
+            .fontColor('#FFFFD7A8')
+            .width('100%')
+            .maxLines(4)
+        }
+        if (this.approvalRiskReason.length > 0) {
+          Text(`风险提示：${this.approvalRiskReason}`)
+            .fontSize(13)
+            .fontColor(this.approvalHighRisk ? '#FFFFC2BC' : '#C8FFFFFF')
+            .width('100%')
+            .maxLines(4)
+        }
+        Row({ space: 12 }) {
+          Button('拒绝')
+            .layoutWeight(1)
+            .onClick(() => this.submitApprovalDecision('decline'))
+          Button(this.approvalHighRisk && !this.approvalSecondConfirm ? '继续确认' : '允许一次')
+            .layoutWeight(1)
+            .backgroundColor(this.approvalHighRisk ? '#FFC93D3D' : '#FF3578E5')
+            .onClick(() => {
+              if (this.approvalHighRisk && !this.approvalSecondConfirm) {
+                this.armApprovalSecondConfirm();
+                return;
+              }
+              this.submitApprovalDecision('accept');
+            })
+        }
+        .width('100%')
+        if (this.approvalHighRisk && this.approvalSecondConfirm) {
+          Text('请再次点击“允许一次”确认高风险操作')
+            .fontSize(12)
+            .fontColor('#FFFFC2BC')
+        }
+      }
+      .width(Math.min(520, this.layoutViewportWidth - 32))
+      .padding(22)
+      .borderRadius(24)
+      .backgroundColor('#F01E2430')
+    }
+    .width('100%')
+    .height('100%')
+    .zIndex(100)
+  }
+
+  @Builder
+  buildCodexTaskMenuOverlay() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor(this.codexTaskRenameMode ? '#32000000' : '#08000000')
+        .onClick(() => this.closeCodexTaskMenu())
+      if (this.codexTaskRenameMode) {
+        Column({ space: 16 }) {
+          Text('重命名任务')
+            .width('100%')
+            .fontSize(19)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.text_primary'))
+          TextInput({ text: this.codexTaskRenameText, placeholder: '输入新的任务名称' })
+            .width('100%')
+            .height(48)
+            .fontSize(15)
+            .maxLength(80)
+            .backgroundColor($r('app.color.input_background'))
+            .borderRadius(14)
+            .onChange((value: string) => this.codexTaskRenameText = value)
+          Row({ space: 10 }) {
+            Button('取消')
+              .layoutWeight(1)
+              .height(44)
+              .fontColor($r('app.color.text_secondary'))
+              .backgroundColor($r('app.color.input_background'))
+              .onClick(() => this.closeCodexTaskMenu())
+            Button('保存')
+              .layoutWeight(1)
+              .height(44)
+              .fontColor('#FFFFFFFF')
+              .backgroundColor('#175CD3')
+              .enabled(this.codexTaskRenameText.trim().length > 0)
+              .onClick(() => this.renameCodexTaskFromMenu())
+          }
+          .width('100%')
+        }
+        .width(Math.min(440, this.layoutViewportWidth - 32))
+        .padding(20)
+        .backgroundColor($r('app.color.page_background'))
+        .borderRadius(24)
+        .position({
+          x: Math.max(16, (this.layoutViewportWidth - Math.min(440,
+            this.layoutViewportWidth - 32)) / 2),
+          y: Math.max(80, this.layoutViewportHeight / 2 - 110)
+        })
+      } else {
+        Column({ space: 2 }) {
+          Row() {
+            Text(this.isCodexTaskPinned(this.codexTaskMenuId) ? '取消置顶' : '置顶')
+              .fontSize(14)
+              .fontColor($r('app.color.text_primary'))
+          }
+            .width('100%')
+            .height(40)
+            .padding({ left: 12, right: 12 })
+            .backgroundColor(Color.Transparent)
+            .onClick(() => this.toggleCodexTaskPinned(this.codexTaskMenuId))
+          Row() {
+            Text('标记为未读')
+              .fontSize(14)
+              .fontColor($r('app.color.text_primary'))
+          }
+            .width('100%')
+            .height(40)
+            .padding({ left: 12, right: 12 })
+            .backgroundColor(Color.Transparent)
+            .onClick(() => this.markCodexTaskUnread(this.codexTaskMenuId))
+          Row() {
+            Text('重命名')
+              .fontSize(14)
+              .fontColor($r('app.color.text_primary'))
+          }
+            .width('100%')
+            .height(40)
+            .padding({ left: 12, right: 12 })
+            .backgroundColor(Color.Transparent)
+            .onClick(() => this.openCodexTaskRename())
+          Row() {
+            Text('归档')
+              .fontSize(14)
+              .fontColor(this.isCodexTaskMenuRunning() ? '#98A2B3' : '#C4320A')
+          }
+            .width('100%')
+            .height(40)
+            .padding({ left: 12, right: 12 })
+            .backgroundColor(Color.Transparent)
+            .onClick(() => {
+              if (!this.isCodexTaskMenuRunning()) {
+                this.archiveCodexTaskFromMenu();
+              }
+            })
+        }
+        .width(176)
+        .padding(8)
+        .position({ x: this.codexTaskMenuX, y: this.codexTaskMenuY })
+        .backgroundColor('#C8FFFFFF')
+        .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+          colorMode: ThemeColorMode.SYSTEM,
+          adaptiveColor: AdaptiveColor.DEFAULT,
+          scale: 0.92
+        })
+        .border({ width: 1, color: '#A8FFFFFF' })
+        .borderRadius(16)
+        .shadow({ radius: 24, color: '#38000000', offsetY: 8 })
+        .scale({
+          x: this.codexTaskMenuExpanded ? 1 : 0.84,
+          y: this.codexTaskMenuExpanded ? 1 : 0.84,
+          centerX: 0,
+          centerY: 0
+        })
+        .opacity(this.codexTaskMenuExpanded ? 1 : 0)
+        .translate({ y: this.codexTaskMenuExpanded ? 0 : -6 })
+        .animation({ duration: 170, curve: Curve.FastOutSlowIn })
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .zIndex(120)
   }
 
   @Builder
@@ -1058,6 +2369,83 @@ struct Index {
         }
       }
       .width('100%')
+      if (this.areCodexTasksExpanded) {
+        Row({ space: 8 }) {
+          TextInput({ text: this.codexSearchText, placeholder: '搜索任务、目录或内容' })
+            .layoutWeight(1)
+            .height(38)
+            .fontSize(13)
+            .backgroundColor($r('app.color.input_background'))
+            .borderRadius(12)
+            .onChange((value: string) => {
+              this.codexSearchText = value;
+              this.codexTaskDisplayLimit = 10;
+            })
+          Button(this.showArchivedCodexTasks ? '含已归档' : '仅当前')
+            .height(38)
+            .fontSize(11)
+            .padding({ left: 10, right: 10 })
+            .backgroundColor(this.showArchivedCodexTasks ? '#1A175CD3' : Color.Transparent)
+            .fontColor('#175CD3')
+            .border({ width: 1, color: '#4D175CD3' })
+            .borderRadius(12)
+            .onClick(() => this.toggleArchivedCodexTasks())
+        }
+        .width('100%')
+      }
+      if (this.connectionMode !== 'lan') {
+        Scroll() {
+          Row({ space: 8 }) {
+            ForEach(this.visibleGatewayDevices(), (device: GatewayPeerDevice) => {
+              Button(`${device.online ? '●' : '○'} ${device.displayName || device.deviceId}`)
+                .height(34)
+                .fontSize(11)
+                .fontColor(device.deviceId === this.selectedGatewayBridgeId ? '#FFFFFFFF' : '#175CD3')
+                .backgroundColor(device.deviceId === this.selectedGatewayBridgeId ?
+                  '#FF175CD3' : '#14175CD3')
+                .borderRadius(12)
+                .onClick(() => {
+                  this.handleGatewayDeviceTap(device);
+                })
+            }, (device: GatewayPeerDevice): string => device.deviceId)
+          }
+        }
+        .width('100%')
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+        Text(this.selectedGatewayDeviceStatusText())
+          .width('100%')
+          .fontSize(11)
+          .fontColor(this.selectedGatewayDeviceOnline() ? '#067647' : '#B54708')
+          .maxLines(2)
+        if (this.gatewaySwitchConfirmId.length > 0) {
+          Text(this.gatewaySwitchConfirmationText())
+            .width('100%')
+            .fontSize(11)
+            .fontColor('#B54708')
+            .padding({ left: 9, right: 9, top: 7, bottom: 7 })
+            .backgroundColor('#FFFFFAEB')
+            .borderRadius(10)
+        }
+        Row({ space: 8 }) {
+          TextInput({ text: this.gatewayDeviceName, placeholder: '给这台电脑命名' })
+            .layoutWeight(1)
+            .height(34)
+            .fontSize(12)
+            .onChange((value: string) => this.gatewayDeviceName = value)
+          Button('保存名称')
+            .height(34)
+            .fontSize(11)
+            .onClick(() => this.renameSelectedGatewayDevice())
+          Button(this.gatewayRevokeConfirm ? '再次点按撤销' : '撤销设备')
+            .height(34)
+            .fontSize(11)
+            .fontColor('#B42318')
+            .backgroundColor('#FFF1F0')
+            .onClick(() => this.revokeSelectedGatewayDevice())
+        }
+        .width('100%')
+      }
       if (!this.areCodexTasksExpanded) {
         if (this.selectedCodexTaskId.length > 0) {
           Row({ space: 11 }) {
@@ -1131,7 +2519,7 @@ struct Index {
           .padding({ top: 10, bottom: 8 })
           .onClick(() => this.toggleCodexTasks())
         }
-      } else if (this.codexTasks.length === 0) {
+      } else if (this.displayedCodexTasks().length === 0) {
         Text(this.codexAvailable ? '暂时没有可显示的 Codex 任务' : '连接电脑后读取 Codex 任务')
           .width('100%')
           .textAlign(TextAlign.Center)
@@ -1140,7 +2528,7 @@ struct Index {
           .padding({ top: 24, bottom: 24 })
       } else {
         List({ space: 4 }) {
-          ForEach(this.codexTasks.slice(0, this.codexTaskDisplayLimit), (task: CodexTask) => {
+          ForEach(this.displayedCodexTasks().slice(0, this.codexTaskDisplayLimit), (task: CodexTask) => {
             ListItem() {
               Row({ space: 11 }) {
             if (this.selectedCodexTaskId === task.id) {
@@ -1181,9 +2569,19 @@ struct Index {
                 .fontColor($r('app.color.text_secondary'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
+              if (task.archived) {
+                Text('已归档')
+                  .fontSize(10)
+                  .fontColor('#B54708')
+              }
             }
             .layoutWeight(1)
             .alignItems(HorizontalAlign.Start)
+            if (this.isCodexTaskPinned(task.id)) {
+              Text('置顶')
+                .fontSize(9)
+                .fontColor('#175CD3')
+            }
             if (this.selectedCodexTaskId === task.id) {
               Column({ space: 3 }) {
                 Text('当前')
@@ -1197,13 +2595,32 @@ struct Index {
                 Text(this.codexStatusLabel(this.effectiveCodexStatus(task)))
                   .fontSize(10)
                   .fontColor(this.codexStatusColor(this.effectiveCodexStatus(task)))
+                if (this.codexTaskUnreadCount(task.id) > 0) {
+                  Text(`${this.codexTaskUnreadCount(task.id)} 未读`)
+                    .fontSize(10)
+                    .fontColor('#FFFFFF')
+                    .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+                    .backgroundColor('#175CD3')
+                    .borderRadius(9)
+                }
               }
               .alignItems(HorizontalAlign.End)
             } else {
-              Text(this.codexStatusLabel(this.effectiveCodexStatus(task)))
-                .fontSize(11)
-                .fontColor(this.codexStatusColor(this.effectiveCodexStatus(task)))
-                .maxLines(1)
+              Column({ space: 4 }) {
+                Text(this.codexStatusLabel(this.effectiveCodexStatus(task)))
+                  .fontSize(11)
+                  .fontColor(this.codexStatusColor(this.effectiveCodexStatus(task)))
+                  .maxLines(1)
+                if (this.codexTaskUnreadCount(task.id) > 0) {
+                  Text(`${this.codexTaskUnreadCount(task.id)} 未读`)
+                    .fontSize(10)
+                    .fontColor('#FFFFFF')
+                    .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+                    .backgroundColor('#175CD3')
+                    .borderRadius(9)
+                }
+              }
+              .alignItems(HorizontalAlign.End)
             }
               }
               .width(this.selectedCodexTaskId === task.id ? '94%' : '100%')
@@ -1231,9 +2648,13 @@ struct Index {
               .zIndex(this.selectedCodexTaskId === task.id ? 2 : 0)
               .animation({ duration: 260, curve: Curve.EaseOut })
               .onClick(() => this.handleCodexTaskTap(task.id))
+              .gesture(
+                LongPressGesture({ repeat: false })
+                  .onAction((event: GestureEvent) => this.openCodexTaskMenu(task.id, event))
+              )
             }
-          }, (task: CodexTask): string => task.id)
-          if (this.codexTaskDisplayLimit < this.codexTasks.length) {
+          }, (task: CodexTask): string => this.codexTaskRenderKey(task, 'list'))
+          if (this.codexTaskDisplayLimit < this.displayedCodexTasks().length) {
             ListItem() {
               Text('继续向下滑动，加载更多')
                 .width('100%')
@@ -1289,9 +2710,18 @@ struct Index {
           Text('正在执行')
             .fontSize(12)
             .fontColor('#067647')
+        } else {
+          Text(this.selectedCodexArchived ? '恢复' : '归档')
+            .fontSize(12)
+            .fontColor(this.selectedCodexArchived ? '#175CD3' : '#B54708')
+            .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+            .onClick(() => this.toggleSelectedCodexArchived())
         }
       }
       .width('100%')
+      if (this.selectedCodexActivities.length > 0) {
+        this.buildCodexActivityTimeline()
+      }
       Row() {
         Text(`聊天记录 · 已加载 ${this.selectedCodexMessages.length} 条`)
           .fontSize(12)
@@ -1363,7 +2793,9 @@ struct Index {
       })
       .onReachEnd(() => {
         this.codexChatPinnedToBottom = true;
-        this.codexUnreadMessages = 0;
+        if (this.codexHistoryReady && this.isCodexConversationOpen) {
+          this.markSelectedCodexRead();
+        }
       })
       if (this.codexUnreadMessages > 0) {
         Button(`↓ ${this.codexUnreadMessages} 条新消息`)
@@ -1374,102 +2806,10 @@ struct Index {
           .borderRadius(17)
           .onClick(() => this.scrollCodexChatToBottom(true))
       }
-      Column({ space: 8 }) {
-        if (this.codexImagePreviewUri.length > 0) {
-          Row({ space: 10 }) {
-            Image(this.codexImagePreviewUri)
-              .width(92)
-              .height(72)
-              .objectFit(ImageFit.Contain)
-              .borderRadius(10)
-              .backgroundColor('#12000000')
-            Text(this.codexImagePicking ? '正在处理图片…' : '图片已就绪，可继续输入文字')
-              .layoutWeight(1)
-              .fontSize(12)
-              .fontColor($r('app.color.text_secondary'))
-            Button('移除')
-              .height(34)
-              .fontSize(12)
-              .fontColor('#B42318')
-              .backgroundColor('#14FEF3F2')
-              .borderRadius(12)
-              .enabled(!this.codexImagePicking)
-              .onClick(() => {
-                this.codexImagePreviewUri = '';
-                this.codexImageDataUrl = '';
-                this.codexImageMimeType = '';
-              })
-          }
-          .width('100%')
-        }
-        TextArea({ text: this.codexCommand, placeholder: '继续给这个 Codex 任务发送要求…' })
-          .height(72)
-          .fontSize(15)
-          .backgroundColor(Color.Transparent)
-          .padding(4)
-          .onChange((value: string) => {
-            this.codexCommand = value;
-          })
-      }
-      .width('100%')
-      .padding(12)
-      .backgroundColor($r('app.color.input_background'))
-      .border({ width: 1, color: $r('app.color.glass_border') })
-      .borderRadius(18)
-      Row({ space: 8 }) {
-        Button('+')
-          .width(48)
-          .height(48)
-          .padding(0)
-          .fontSize(25)
-          .fontWeight(FontWeight.Normal)
-          .fontColor('#175CD3')
-          .backgroundColor($r('app.color.glass_surface_strong'))
-          .border({ width: 1, color: $r('app.color.glass_border') })
-          .borderRadius(24)
-          .enabled(this.isConnected && !this.codexImagePicking)
-          .onClick(() => this.chooseCodexImage())
-        Button('发送后按回车')
-          .layoutWeight(1)
-          .height(48)
-          .padding({ left: 4, right: 4 })
-          .fontSize(this.useTwoPaneCodexLayout() ? 12 : 10)
-          .fontColor(this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0 ?
-            '#175CD3' : '#344054')
-          .backgroundColor($r('app.color.glass_surface_strong'))
-          .border({ width: 1, color: $r('app.color.glass_border') })
-          .borderRadius(14)
-          .enabled((this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0) &&
-            this.isConnected && !this.codexImagePicking)
-          .onClick(() => this.sendCodexCommand('enter'))
-        Button('发送后按Ctrl+回车')
-          .layoutWeight(1)
-          .height(48)
-          .padding({ left: 4, right: 4 })
-          .fontSize(this.useTwoPaneCodexLayout() ? 12 : 10)
-          .fontColor(this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0 ?
-            '#175CD3' : '#344054')
-          .backgroundColor($r('app.color.glass_surface_strong'))
-          .border({ width: 1, color: $r('app.color.glass_border') })
-          .borderRadius(14)
-          .enabled((this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0) &&
-            this.isConnected && !this.codexImagePicking)
-          .onClick(() => this.sendCodexCommand('ctrl_enter'))
-        if (this.selectedCodexActiveTurnId.length > 0) {
-          Button() {
-            Text('■')
-              .fontSize(17)
-              .fontColor('#D92D20')
-          }
-          .width(48)
-          .height(48)
-          .padding(0)
-          .backgroundColor('#24F04438')
-          .border({ width: 1, color: '#55F04438' })
-          .borderRadius(24)
-          .onClick(() => this.stopCodexTask())
-        }
-      }
+      // Wide-screen and phone conversations intentionally share one Remote
+      // composer so their model/permission controls and send behavior stay
+      // visually and functionally identical.
+      this.buildCodexRemoteComposer()
     }
     .width('100%')
     .height(this.codexDetailCardHeight())
@@ -1487,6 +2827,88 @@ struct Index {
     .onTouch((event: TouchEvent) => {
       this.handleCodexDetailTouch(event);
     })
+  }
+
+  @Builder
+  buildCodexActivityTimeline() {
+    Column({ space: 8 }) {
+      Row({ space: 8 }) {
+        Text('执行过程')
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#FF344054')
+        Text(`${this.selectedCodexActivities.length} 条`)
+          .fontSize(10)
+          .fontColor('#FF667085')
+        Blank()
+        Text(this.codexActivityExpanded ? '收起⌃' : '展开⌄')
+          .fontSize(10)
+          .fontColor('#FF175CD3')
+      }
+      .width('100%')
+      .onClick(() => this.codexActivityExpanded = !this.codexActivityExpanded)
+      if (this.codexActivityExpanded) {
+        ForEach(this.visibleCodexActivities(), (activity: CodexActivity) => {
+          Row({ space: 9 }) {
+            Text(this.codexActivityIcon(activity))
+              .width(22)
+              .fontSize(13)
+              .textAlign(TextAlign.Center)
+              .fontColor(this.codexActivityColor(activity))
+            Column({ space: 2 }) {
+              Row() {
+                Text(activity.title)
+                  .fontSize(11)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#FF344054')
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                Blank()
+                Text(this.formatMessageTimestamp(activity.timestamp))
+                  .fontSize(8)
+                  .fontColor('#FF98A2B3')
+              }
+              .width('100%')
+              if (activity.text.trim().length > 0) {
+                Text(this.codexDisplayText(activity.text))
+                  .width('100%')
+                  .fontSize(10)
+                  .lineHeight(16)
+                  .fontColor('#FF667085')
+                  .maxLines(4)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+          }
+          .width('100%')
+        }, (activity: CodexActivity): string => `activity-${activity.id}`)
+        Text('仅显示公开执行摘要；密钥、工具参数和加密内部推理不会同步。')
+          .width('100%')
+          .fontSize(9)
+          .lineHeight(14)
+          .fontColor('#FF98A2B3')
+      } else {
+        Row({ space: 8 }) {
+          Text(this.codexActivityIcon(this.latestCodexActivity()))
+            .fontSize(12)
+            .fontColor(this.codexActivityColor(this.latestCodexActivity()))
+          Text(this.latestCodexActivity().title)
+            .layoutWeight(1)
+            .fontSize(11)
+            .fontColor('#FF667085')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .width('100%')
+      }
+    }
+    .width('100%')
+    .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+    .backgroundColor('#0F175CD3')
+    .border({ width: 1, color: '#24175CD3' })
+    .borderRadius(14)
   }
 
   @Builder
@@ -1557,6 +2979,525 @@ struct Index {
 
   @Builder
   buildCodexConversationCover() {
+    Column() {
+      Row({ space: 10 }) {
+        Button('‹')
+          .width(40)
+          .height(40)
+          .padding(0)
+          .fontSize(28)
+          .fontColor('#FF111111')
+          .backgroundColor('#FFFFFFFF')
+          .borderRadius(20)
+          .onClick(() => this.closeRemoteCodexConversation())
+        Column({ space: 2 }) {
+          Text(this.codexNewTaskMode ? '新任务' : (this.selectedCodexTitle || 'Codex 任务'))
+            .fontSize(14)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#FF111111')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(`项目 · ${this.codexProjectName(this.selectedCodexCwd)}  电脑 · ${this.gatewayDeviceName || '当前电脑'}`)
+            .fontSize(9)
+            .fontColor('#FF667085')
+            .maxLines(1)
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+        Button(this.codexLoading || this.codexDetailLoading ? '◌' : '↻')
+          .width(40)
+          .height(40)
+          .padding(0)
+          .fontSize(21)
+          .fontColor('#FF344054')
+          .backgroundColor('#FFFFFFFF')
+          .borderRadius(20)
+          .enabled(!this.codexNewTaskMode)
+          .onClick(() => this.requestSelectedCodexThread(true))
+        Button('⋮')
+          .width(40)
+          .height(40)
+          .padding(0)
+          .fontSize(23)
+          .fontColor('#FF111111')
+          .backgroundColor('#FFFFFFFF')
+          .borderRadius(20)
+          .onClick(() => this.codexSettingsMenu =
+            this.codexSettingsMenu === 'actions' ? '' : 'actions')
+          .bindPopup(this.codexSettingsMenu === 'actions', {
+            builder: this.buildCodexRemoteSettingsMenu,
+            placement: Placement.BottomRight,
+            popupColor: '#B8FFFFFF',
+            backgroundBlurStyle: BlurStyle.COMPONENT_ULTRA_THIN,
+            enableArrow: false,
+            autoCancel: true,
+            mask: false,
+            targetSpace: 6,
+            onStateChange: (event: PopupVisibilityEvent): void => {
+              if (!event.isVisible) this.codexSettingsMenu = '';
+            }
+          })
+      }
+      .width('100%')
+      .height(64)
+      .padding({ left: 10, right: 10, top: 8, bottom: 6 })
+      .backgroundColor('#FAFFFFFF')
+
+      if (this.codexNewTaskMode) {
+        Scroll() {
+          Row({ space: 7 }) {
+            ForEach(this.codexProjects(), (project: string) => {
+              Button(this.codexProjectName(project))
+                .height(32)
+                .fontSize(10)
+                .fontColor(project === this.selectedCodexCwd ? '#FFFFFFFF' : '#FF344054')
+                .backgroundColor(project === this.selectedCodexCwd ? '#FF111111' : '#FFF2F4F7')
+                .borderRadius(16)
+                .onClick(() => this.selectedCodexCwd = project)
+            }, (project: string): string => `new-${project}`)
+          }
+          .padding({ left: 12, right: 12 })
+        }
+        .width('100%')
+        .height(38)
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+      }
+
+      List({ space: 12, scroller: this.codexChatScroller }) {
+        if (!this.codexNewTaskMode && this.codexDetailLoading &&
+          this.selectedCodexMessages.length === 0) {
+          ForEach([1, 2, 3], (item: number) => {
+            ListItem() {
+              Column({ space: 10 }) {
+                Text('')
+                  .width(item === 1 ? '48%' : '70%')
+                  .height(34)
+                  .backgroundColor('#FFEDEDED')
+                  .borderRadius(8)
+                Text('')
+                  .width(item === 2 ? '92%' : '78%')
+                  .height(item === 2 ? 88 : 58)
+                  .backgroundColor('#FFE7E7E7')
+                  .borderRadius(8)
+              }
+              .width('100%')
+              .alignItems(item === 1 ? HorizontalAlign.End : HorizontalAlign.Start)
+            }
+          }, (item: number): string => `skeleton-${item}`)
+        } else if (this.codexNewTaskMode) {
+          ListItem() {
+            Column({ space: 8 }) {
+              Text('开始一个新的 Codex 任务')
+                .fontSize(18)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#FF111111')
+              Text('选择项目，在下方输入你的要求。模型、智能强度和权限可在输入框上方调整。')
+                .fontSize(12)
+                .lineHeight(19)
+                .fontColor('#FF667085')
+                .textAlign(TextAlign.Center)
+            }
+            .width('100%')
+            .padding({ top: 72 })
+          }
+        }
+        if (!this.codexNewTaskMode && this.selectedCodexActivities.length > 0) {
+          ListItem() {
+            this.buildCodexActivityTimeline()
+          }
+        }
+        if (this.codexHistoryHasMore && !this.codexNewTaskMode) {
+          ListItem() {
+            Button(this.codexHistoryLoadingOlder ? '正在载入…' : `前 ${Math.min(15, this.selectedCodexMessages.length)} 条消息 ›`)
+              .height(34)
+              .fontSize(11)
+              .fontColor('#FF667085')
+              .backgroundColor(Color.Transparent)
+              .enabled(!this.codexHistoryLoadingOlder)
+              .onClick(() => this.loadOlderCodexMessages())
+          }
+        }
+        ForEach(this.selectedCodexMessages, (message: CodexMessage) => {
+          ListItem() {
+            this.buildCodexRemoteMessage(message)
+          }
+        }, (message: CodexMessage): string => `remote-${message.id}`)
+        if (!this.codexNewTaskMode && this.isSelectedCodexRunning()) {
+          ListItem() {
+            Row({ space: 6 }) {
+              Text('◌')
+                .fontSize(16)
+                .fontColor('#FF667085')
+              Text('Codex 正在处理…')
+                .fontSize(11)
+                .fontColor('#FF667085')
+            }
+            .width('100%')
+            .padding({ top: 6, bottom: 6 })
+          }
+        }
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+      .scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring)
+      .onReachStart(() => this.loadOlderCodexMessages())
+      .onReachEnd(() => {
+        this.codexChatPinnedToBottom = true;
+        this.markSelectedCodexRead();
+      })
+
+      this.buildCodexRemoteComposer()
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ top: 38, bottom: this.keyboardInset })
+    .backgroundColor('#FFF8F8F7')
+  }
+
+  @Builder
+  buildCodexRemoteMessage(message: CodexMessage) {
+    Row() {
+      if (message.role === 'user') {
+        Blank()
+      }
+      Column({ space: 6 }) {
+        if (message.text.trim().length > 0) {
+          Text(this.codexDisplayText(message.text))
+            .width('100%')
+            .fontSize(13)
+            .lineHeight(21)
+            .fontColor('#FF202124')
+            .copyOption(CopyOptions.LocalDevice)
+        }
+        if (message.images.length > 0) {
+          ForEach(message.images, (source: string, index: number) => {
+            Image(source)
+              .width('100%')
+              .height(180)
+              .objectFit(ImageFit.Contain)
+              .backgroundColor('#0F000000')
+              .borderRadius(12)
+          }, (_source: string, index: number): string => `${message.id}-${index}`)
+        }
+        if (message.deliveryState.length > 0) {
+          Text(message.deliveryState === 'failed' ? '发送失败' :
+            (message.deliveryState === 'sent' ? '已发送' : '发送中…'))
+            .fontSize(9)
+            .fontColor(message.deliveryState === 'failed' ? '#FFD92D20' : '#FF98A2B3')
+        }
+      }
+      .width(message.role === 'user' ? '72%' : '100%')
+      .alignItems(HorizontalAlign.Start)
+      .padding(message.role === 'user' ? 12 : 2)
+      .backgroundColor(message.role === 'user' ? '#FFEDEDED' : Color.Transparent)
+      .borderRadius(message.role === 'user' ? 16 : 0)
+      if (message.role !== 'user') {
+        Blank()
+      }
+    }
+    .width('100%')
+  }
+
+  @Builder
+  buildCodexRemoteComposer() {
+    Column({ space: 6 }) {
+      if (this.codexImagePreviewUri.length > 0) {
+        Row({ space: 8 }) {
+          Image(this.codexImagePreviewUri)
+            .width(58)
+            .height(48)
+            .objectFit(ImageFit.Cover)
+            .borderRadius(9)
+          Text(this.codexImagePicking ? '正在处理图片…' : '图片已添加')
+            .layoutWeight(1)
+            .fontSize(11)
+            .fontColor('#FF667085')
+          Button('移除')
+            .height(30)
+            .fontSize(10)
+            .fontColor('#FFD92D20')
+            .backgroundColor(Color.Transparent)
+            .onClick(() => this.clearCodexImage())
+        }
+        .width('100%')
+      }
+      Row({ space: 6 }) {
+        Button(`${this.selectedCodexModelLabel()}  ›`)
+          .height(28)
+          .fontSize(9)
+          .fontColor('#FF344054')
+          .backgroundColor('#FFF2F4F7')
+          .borderRadius(14)
+          .onClick(() => this.codexSettingsMenu =
+            this.codexSettingsMenu === 'main' ? '' : 'main')
+          .bindPopup(this.isCodexModelSettingsMenu(), {
+            builder: this.buildCodexRemoteSettingsMenu,
+            placement: Placement.TopLeft,
+            popupColor: '#B8FFFFFF',
+            backgroundBlurStyle: BlurStyle.COMPONENT_ULTRA_THIN,
+            enableArrow: false,
+            autoCancel: true,
+            mask: false,
+            targetSpace: 6,
+            onStateChange: (event: PopupVisibilityEvent): void => {
+              if (!event.isVisible) this.codexSettingsMenu = '';
+            }
+          })
+        Button(this.codexPermissionLabel())
+          .height(28)
+          .fontSize(9)
+          .fontColor(this.codexPermissionMode === 'fullAccess' ? '#FFB42318' : '#FF344054')
+          .backgroundColor('#FFF2F4F7')
+          .borderRadius(14)
+          .onClick(() => this.codexSettingsMenu =
+            this.codexSettingsMenu === 'permissions' ? '' : 'permissions')
+          .bindPopup(this.codexSettingsMenu === 'permissions', {
+            builder: this.buildCodexRemoteSettingsMenu,
+            placement: Placement.TopLeft,
+            popupColor: '#B8FFFFFF',
+            backgroundBlurStyle: BlurStyle.COMPONENT_ULTRA_THIN,
+            enableArrow: false,
+            autoCancel: true,
+            mask: false,
+            targetSpace: 6,
+            onStateChange: (event: PopupVisibilityEvent): void => {
+              if (!event.isVisible) this.codexSettingsMenu = '';
+            }
+          })
+        Blank()
+      }
+      .width('100%')
+      Row({ space: 6 }) {
+        Button('+')
+          .width(38)
+          .height(38)
+          .padding(0)
+          .fontSize(23)
+          .fontColor('#FF111111')
+          .backgroundColor('#FFF2F4F7')
+          .borderRadius(19)
+          .enabled(this.isConnected && !this.codexImagePicking)
+          .onClick(() => this.chooseCodexImage())
+        TextArea({ text: this.codexCommand, placeholder: this.codexNewTaskMode ?
+          '向 Codex 提问' : '继续向 Codex 提问' })
+          .layoutWeight(1)
+          .height(48)
+          .fontSize(13)
+          .backgroundColor(Color.Transparent)
+          .padding({ left: 4, right: 4, top: 2, bottom: 2 })
+          .onChange((value: string) => this.codexCommand = value)
+        if (this.codexVoiceListening) {
+          Button('■')
+            .width(38)
+            .height(38)
+            .padding(0)
+            .fontSize(15)
+            .fontColor('#FFD92D20')
+            .backgroundColor('#FFFFE4E0')
+            .borderRadius(19)
+            .onClick(() => this.toggleCodexVoiceInput())
+        } else {
+          Button() {
+            Image($r('app.media.microphone_icon'))
+              .width(21)
+              .height(21)
+              .objectFit(ImageFit.Contain)
+          }
+          .width(32)
+          .height(32)
+          .padding(0)
+          .backgroundColor('#FF344054')
+          .borderRadius(16)
+          .onClick(() => this.toggleCodexVoiceInput())
+        }
+        if (this.selectedCodexActiveTurnId.length > 0 && !this.codexNewTaskMode) {
+          Button() {
+            Image($r('app.media.stop_button_icon'))
+              // The source has slightly more transparent padding than the
+              // send icon, so compensate inside the same 38vp hit target.
+              .width(42)
+              .height(42)
+              .objectFit(ImageFit.Contain)
+          }
+            .width(38)
+            .height(38)
+            .padding(0)
+            .backgroundColor(Color.Transparent)
+            .borderRadius(19)
+            .onClick(() => this.stopCodexTask())
+        } else {
+          Button() {
+            Image($r('app.media.send_arrow_icon'))
+              .width(38)
+              .height(38)
+              .objectFit(ImageFit.Contain)
+          }
+            .width(38)
+            .height(38)
+            .padding(0)
+            .opacity(this.canSendRemoteCodexComposer() ? 1 : 0.42)
+            .backgroundColor(Color.Transparent)
+            .borderRadius(19)
+            .enabled(this.canSendRemoteCodexComposer())
+            .onClick(() => this.sendRemoteCodexComposer())
+        }
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .padding({ left: 10, right: 10, top: 7, bottom: 8 })
+    .backgroundColor('#FFFFFFFF')
+    .border({ width: 1, color: '#18000000' })
+    .borderRadius(20)
+    .margin({ left: 8, right: 8, bottom: 4 })
+  }
+
+  @Builder
+  buildCodexRemoteSettingsMenu() {
+    Column({ space: 3 }) {
+      if (this.codexSettingsMenu === 'actions') {
+        Button(this.selectedCodexArchived ? '恢复任务' : '归档任务')
+          .width('100%')
+          .height(40)
+          .fontSize(12)
+          .fontColor('#FF344054')
+          .backgroundColor(Color.Transparent)
+          .enabled(!this.codexNewTaskMode && !this.isSelectedCodexRunning())
+          .onClick(() => {
+            this.codexSettingsMenu = '';
+            this.toggleSelectedCodexArchived();
+          })
+      } else if (this.codexSettingsMenu === 'models') {
+        Row() {
+          Text('选择模型')
+            .fontSize(11)
+            .fontWeight(FontWeight.Bold)
+          Blank()
+          Button('‹')
+            .width(28)
+            .height(28)
+            .fontSize(18)
+            .padding(0)
+            .backgroundColor(Color.Transparent)
+            .onClick(() => this.codexSettingsMenu = 'main')
+        }
+        .width('100%')
+        Scroll() {
+          Column({ space: 3 }) {
+            ForEach(this.codexModels, (model: CodexModelOption) => {
+              Button(`${model.displayName}${model.model === this.selectedCodexModel ? '  ✓' : ''}`)
+                .width('100%')
+                .height(34)
+                .fontSize(11)
+                .fontColor('#FF111111')
+                .backgroundColor(Color.Transparent)
+                .onClick(() => this.selectCodexModel(model))
+            }, (model: CodexModelOption): string => model.model)
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .height(Math.min(this.codexModels.length * 37, 216))
+        .scrollBar(BarState.Auto)
+        .edgeEffect(EdgeEffect.Spring)
+      } else if (this.codexSettingsMenu === 'effort') {
+        ForEach(this.codexReasoningEfforts(), (effort: string) => {
+          Button(`${this.codexEffortLabelFor(effort)}${effort === this.selectedCodexEffort ? '  ✓' : ''}`)
+            .width('100%')
+            .height(34)
+            .fontSize(11)
+            .fontColor('#FF111111')
+            .backgroundColor(Color.Transparent)
+            .onClick(() => this.selectCodexEffort(effort))
+        }, (effort: string): string => effort)
+      } else if (this.codexSettingsMenu === 'permissions') {
+        ForEach(['default', 'autoApprove', 'readOnly', 'fullAccess'], (mode: string) => {
+          Button(`${this.codexPermissionLabelFor(mode)}${mode === this.codexPermissionMode ? '  ✓' : ''}`)
+            .width('100%')
+            .height(mode === 'fullAccess' && this.codexFullAccessConfirm ? 42 : 34)
+            .fontSize(11)
+            .fontColor(mode === 'fullAccess' ? '#FFB42318' : '#FF111111')
+            .backgroundColor(Color.Transparent)
+            .onClick(() => this.selectCodexPermission(mode))
+        }, (mode: string): string => mode)
+      } else if (this.codexSettingsMenu === 'speed') {
+        ForEach(this.codexServiceTierOptions(), (tier: string) => {
+          Button(`${this.codexServiceTierLabel(tier)}${tier === this.selectedCodexServiceTier ? '  ✓' : ''}`)
+            .width('100%')
+            .height(34)
+            .fontSize(11)
+            .fontColor('#FF111111')
+            .backgroundColor(Color.Transparent)
+            .onClick(() => this.selectCodexServiceTier(tier))
+        }, (tier: string): string => tier || 'standard')
+      } else {
+        Row({ space: 6 }) {
+          Text('模型')
+            .fontSize(11)
+            .fontColor('#FF344054')
+          Blank()
+          Text(this.selectedCodexModelLabel())
+            .fontSize(10)
+            .fontColor('#FF98A2B3')
+            .maxLines(1)
+          Text('›')
+            .fontSize(18)
+            .fontColor('#FF98A2B3')
+        }
+          .width('100%')
+          .height(36)
+          .padding({ left: 9, right: 7 })
+          .onClick(() => this.codexSettingsMenu = 'models')
+        Row({ space: 6 }) {
+          Text('推理强度')
+            .fontSize(11)
+            .fontColor('#FF344054')
+          Blank()
+          Text(this.codexEffortLabel())
+            .fontSize(10)
+            .fontColor('#FF98A2B3')
+          Text('›')
+            .fontSize(18)
+            .fontColor('#FF98A2B3')
+        }
+          .width('100%')
+          .height(36)
+          .padding({ left: 9, right: 7 })
+          .backgroundColor('#0A000000')
+          .borderRadius(7)
+          .onClick(() => this.codexSettingsMenu = 'effort')
+        Row({ space: 6 }) {
+          Text('速度')
+            .fontSize(11)
+            .fontColor('#FF344054')
+          Blank()
+          Text(this.codexServiceTierLabel(this.selectedCodexServiceTier))
+            .fontSize(10)
+            .fontColor('#FF98A2B3')
+          Text('›')
+            .fontSize(18)
+            .fontColor('#FF98A2B3')
+        }
+          .width('100%')
+          .height(36)
+          .padding({ left: 9, right: 7 })
+          .onClick(() => this.codexSettingsMenu = 'speed')
+      }
+    }
+    .width(this.codexSettingsMenu === 'models' ? 176 :
+      (this.codexSettingsMenu === 'permissions' ? 140 :
+        (this.codexSettingsMenu === 'actions' ? 140 : 152)))
+    .constraintSize({ maxHeight: 260 })
+    .padding(6)
+    .backgroundColor(Color.Transparent)
+  }
+
+  @Builder
+  buildLegacyCodexConversationCover() {
     Stack({ alignContent: Alignment.TopStart }) {
       this.buildAmbientBackground();
       Row() {
@@ -1965,14 +3906,21 @@ struct Index {
     if (this.layoutViewportWidth < 600) {
       return Math.max(280, this.layoutViewportWidth - 36);
     }
-    if (this.layoutViewportWidth < 1100) {
-      return Math.min(960, Math.max(520, this.layoutViewportWidth - 48));
+    if (this.layoutViewportWidth < 900) {
+      return Math.min(880, Math.max(520, this.layoutViewportWidth - 32));
     }
-    return Math.min(1280, Math.max(760, this.layoutViewportWidth - 72));
+    if (this.layoutViewportWidth < 1280) {
+      return Math.min(1120, Math.max(760, this.layoutViewportWidth - 48));
+    }
+    // On 2-in-1/desktop windows keep a readable maximum while using the
+    // additional horizontal space for the task sidebar and chat pane.
+    return Math.min(1480, Math.max(960, this.layoutViewportWidth - 96));
   }
 
   private voiceContentWidth(): number {
-    return Math.min(this.mainSectionViewportWidth, this.layoutViewportWidth >= 1100 ? 820 : 760);
+    const maxWidth = this.layoutViewportWidth >= 1280 ? 1040 :
+      (this.layoutViewportWidth >= 900 ? 880 : 760);
+    return Math.min(this.mainSectionViewportWidth, maxWidth);
   }
 
   private mainTabsWidth(): number {
@@ -1980,16 +3928,38 @@ struct Index {
   }
 
   private pairingPanelWidth(): number {
-    return Math.min(520, Math.max(280, this.layoutViewportWidth - 36));
+    const maxWidth = this.layoutViewportWidth >= 1100 ? 640 : 520;
+    const outerPadding = this.layoutViewportWidth < 600 ? 36 : 48;
+    return Math.min(maxWidth, Math.max(280, this.layoutViewportWidth - outerPadding));
   }
 
   private conversationPanelWidth(): number {
     const outerPadding = this.layoutViewportWidth < 600 ? 36 : 72;
-    return Math.min(960, Math.max(280, this.layoutViewportWidth - outerPadding));
+    const maxWidth = this.layoutViewportWidth >= 1280 ? 1200 : 960;
+    return Math.min(maxWidth, Math.max(280, this.layoutViewportWidth - outerPadding));
+  }
+
+  private codexRemoteHomeWidth(): number {
+    // The Remote card lives inside the centered main shell. Using the full
+    // window width here makes the card wider than its clipped parent on
+    // phones, cutting off both rounded sides and the edge content.
+    const shellWidth = this.mainShellWidth();
+    const measuredWidth = this.mainSectionViewportWidth > 0 ?
+      this.mainSectionViewportWidth : shellWidth;
+    const availableWidth = Math.min(shellWidth, measuredWidth);
+    if (availableWidth < 900) {
+      return Math.max(280, availableWidth);
+    }
+    const maxWidth = availableWidth >= 1280 ? 1240 : 960;
+    return Math.min(maxWidth, Math.max(520, availableWidth - 48));
   }
 
   private useTwoPaneCodexLayout(): boolean {
-    return this.mainSectionViewportWidth >= 900;
+    // Use the measured content width when available, but allow the layout to
+    // settle from the window width during the first render. This avoids a
+    // desktop briefly rendering the phone layout after a resize.
+    const measuredWidth = Math.max(this.mainSectionViewportWidth, this.layoutViewportWidth);
+    return measuredWidth >= 900;
   }
 
   private codexSidebarWidth(): number {
@@ -2027,9 +3997,17 @@ struct Index {
   }
 
   private codexTaskListViewportHeight(): number {
-    const loadedCount = Math.min(this.codexTaskDisplayLimit, this.codexTasks.length);
+    const loadedCount = Math.min(this.codexTaskDisplayLimit, this.displayedCodexTasks().length);
     const visibleRows = Math.min(loadedCount, this.useTwoPaneCodexLayout() ? 7 : 5);
-    return Math.max(68, visibleRows * 64);
+    const preferredHeight = visibleRows * 64;
+    if (!this.useTwoPaneCodexLayout()) {
+      return Math.max(68, preferredHeight);
+    }
+    // Quota card, task-card chrome and vertical gaps consume roughly 300vp
+    // above the list in the wide sidebar. Cap the list so short tablet/PC
+    // windows keep the sidebar and detail pane inside the viewport.
+    const availableHeight = Math.max(180, this.layoutViewportHeight - 300);
+    return Math.max(180, Math.min(preferredHeight, availableHeight));
   }
 
   private codexDetailCardHeight(): number {
@@ -2051,10 +4029,66 @@ struct Index {
     return this.getUIContext().getHostContext() as common.UIAbilityContext;
   }
 
-  private async loadPairing(): Promise<void> {
+  private approvalDisplayKind(): string {
+    if (this.approvalKind.includes('commandExecution')) {
+      return '命令执行';
+    }
+    if (this.approvalKind.includes('fileChange')) {
+      return '文件修改';
+    }
+    if (this.approvalKind.includes('permissions')) {
+      return '权限提升';
+    }
+    return '待确认操作';
+  }
+
+  private codexTaskNotificationLabel(threadId: string): string {
+    for (let index = 0; index < this.codexTasks.length; index += 1) {
+      if (this.codexTasks[index].id === threadId) {
+        return this.codexTasks[index].title || this.shortPath(this.codexTasks[index].cwd);
+      }
+    }
+    return '请打开 Starly 查看详情';
+  }
+
+  private async submitApprovalDecision(decision: string): Promise<void> {
+    const approvalId = this.approvalId;
+    if (approvalId.length === 0) {
+      return;
+    }
+    const sent = await remoteInputClient.decideCodexApproval(approvalId, decision);
+    if (sent) {
+      this.clearApprovalSecondConfirmTimer();
+      this.approvalId = '';
+      this.approvalSecondConfirm = false;
+      this.statusText = decision === 'accept' ? '已允许 Codex 操作' : '已拒绝 Codex 操作';
+      this.statusIsError = false;
+    }
+  }
+
+  private armApprovalSecondConfirm(): void {
+    this.clearApprovalSecondConfirmTimer();
+    this.approvalSecondConfirm = true;
+    this.approvalSecondConfirmTimer = setTimeout(() => {
+      this.approvalSecondConfirmTimer = -1;
+      this.approvalSecondConfirm = false;
+    }, 8000);
+  }
+
+  private clearApprovalSecondConfirmTimer(): void {
+    if (this.approvalSecondConfirmTimer >= 0) {
+      clearTimeout(this.approvalSecondConfirmTimer);
+      this.approvalSecondConfirmTimer = -1;
+    }
+  }
+
+  private async initializePage(): Promise<void> {
     try {
       const config = await pairingStore.load(this.getContext());
       this.applyConfig(config);
+      this.codexUiComputerKey = this.codexUiKey(config);
+      const state = await codexUiStateStore.load(this.getContext(), this.codexUiComputerKey);
+      this.applyCodexUiState(state);
       if (config.isComplete()) {
         this.statusText = '正在连接电脑…';
         await remoteInputClient.connect(config);
@@ -2063,6 +4097,127 @@ struct Index {
       this.statusText = `读取配对信息失败：${JSON.stringify(error)}`;
       this.statusIsError = true;
     }
+  }
+
+  private applyCodexUiState(state: CodexUiState): void {
+    this.restoredCodexTaskId = state.selectedThreadId;
+    this.mainSection = state.mainSection;
+    this.codexLastSeenMessageIds = state.lastSeenMessageIds;
+    this.codexUnreadCounts = state.unreadCounts;
+    this.pinnedCodexThreadIds = state.pinnedThreadIds;
+    this.selectedCodexModel = state.selectedModel;
+    this.selectedCodexEffort = state.selectedEffort || 'medium';
+    this.codexPermissionMode = state.permissionMode || 'default';
+    this.selectedCodexServiceTier = state.selectedServiceTier;
+    this.codexDeliveryMode = state.deliveryMode === 'desktop' ? 'desktop' : 'background';
+    this.desktopSubmitMode = state.desktopSubmitMode === 'ctrl_enter' ? 'ctrl_enter' : 'enter';
+    this.restoreCodexDataCache(state);
+  }
+
+  private currentCodexUiState(): CodexUiState {
+    const state = new CodexUiState();
+    state.selectedThreadId = this.selectedCodexTaskId || this.restoredCodexTaskId;
+    state.mainSection = this.mainSection;
+    state.lastSeenMessageIds = this.codexLastSeenMessageIds;
+    state.unreadCounts = this.codexUnreadCounts;
+    state.pinnedThreadIds = this.pinnedCodexThreadIds;
+    state.selectedModel = this.selectedCodexModel;
+    state.selectedEffort = this.selectedCodexEffort;
+    state.permissionMode = this.codexPermissionMode;
+    state.selectedServiceTier = this.selectedCodexServiceTier;
+    state.deliveryMode = this.codexDeliveryMode;
+    state.desktopSubmitMode = this.desktopSubmitMode;
+    state.cacheSavedAt = Date.now();
+    if (this.codexTasks.length > 0 || this.codexModels.length > 0) {
+      state.cachedSnapshotJson = JSON.stringify({
+        available: this.codexAvailable,
+        error: '',
+        quota: this.codexQuota,
+        threads: this.codexTasks,
+        models: this.codexModels
+      });
+    }
+    if (this.selectedCodexTaskId.length > 0) {
+      state.cachedThreadJson = JSON.stringify({
+        id: this.selectedCodexTaskId,
+        title: this.selectedCodexTitle,
+        preview: this.codexTaskPreview(this.selectedCodexTaskId),
+        status: this.selectedCodexStatus,
+        cwd: this.selectedCodexCwd,
+        updatedAt: this.selectedCodexUpdatedAt,
+        archived: this.selectedCodexArchived,
+        messages: this.selectedCodexMessages.slice(-15),
+        activities: this.selectedCodexActivities.slice(-30),
+        activeTurnId: this.selectedCodexActiveTurnId,
+        hasMoreBefore: this.codexHistoryHasMore,
+        updateMode: 'latest',
+        model: this.selectedCodexModel,
+        effort: this.selectedCodexEffort,
+        permissionMode: this.codexPermissionMode,
+        serviceTier: this.selectedCodexServiceTier
+      });
+    }
+    return state;
+  }
+
+  private restoreCodexDataCache(state: CodexUiState): void {
+    if (state.cacheSavedAt <= 0 || Date.now() - state.cacheSavedAt > 30 * 24 * 60 * 60 * 1000) {
+      return;
+    }
+    try {
+      if (state.cachedSnapshotJson.length > 0) {
+        const snapshotSource = JSON.parse(state.cachedSnapshotJson) as Record<string, Object>;
+        const snapshot = parseCodexSnapshot(snapshotSource);
+        if (snapshot.threads.length > 0 || snapshot.models.length > 0) {
+          this.codexTasks = snapshot.threads;
+          this.codexModels = snapshot.models;
+          this.codexQuota = snapshot.quota;
+          this.codexAvailable = snapshot.available;
+          this.codexError = '';
+          this.codexArchivedTasksLoaded = snapshot.threads.some(
+            (task: CodexTask): boolean => task.archived);
+          this.codexCacheRestored = true;
+        }
+      }
+      const cachedSelection = this.codexTasks.some(
+        (task: CodexTask): boolean => task.id === this.restoredCodexTaskId) ?
+        this.restoredCodexTaskId : (this.codexTasks[0]?.id ?? '');
+      if (cachedSelection.length > 0) {
+        this.selectedCodexTaskId = cachedSelection;
+        this.prepareSelectedCodexTask(cachedSelection);
+      }
+      if (state.cachedThreadJson.length > 0 && this.selectedCodexTaskId.length > 0) {
+        const detailSource = JSON.parse(state.cachedThreadJson) as Object;
+        const detail = parseCodexThread(detailSource);
+        if (detail.id === this.selectedCodexTaskId) {
+          detail.updateMode = 'latest';
+          this.applyCodexThreadDetail(detail);
+        }
+      }
+      this.codexInitialSyncPending = this.codexCacheRestored;
+    } catch (_error) {
+      this.codexCacheRestored = false;
+    }
+  }
+
+  private scheduleCodexUiStateSave(): void {
+    if (this.codexUiStateSaveTimer >= 0) {
+      clearTimeout(this.codexUiStateSaveTimer);
+    }
+    this.codexUiStateSaveTimer = setTimeout(() => {
+      this.codexUiStateSaveTimer = -1;
+      codexUiStateStore.save(this.getContext(), this.codexUiComputerKey,
+        this.currentCodexUiState()).catch((): void => {});
+    }, 150);
+  }
+
+  private flushCodexUiState(): void {
+    if (this.codexUiStateSaveTimer >= 0) {
+      clearTimeout(this.codexUiStateSaveTimer);
+      this.codexUiStateSaveTimer = -1;
+    }
+    codexUiStateStore.save(this.getContext(), this.codexUiComputerKey,
+      this.currentCodexUiState()).catch((): void => {});
   }
 
   private async discoverPairingComputers(): Promise<void> {
@@ -2121,17 +4276,16 @@ struct Index {
     this.isPairingWithCode = true;
     this.pairingDiscoveryMessage = `正在与 ${computer.name} 配对…`;
     try {
-      const config = await pairingDiscoveryService.pair(computer, this.pairingCode);
+      const lanConfig = await pairingDiscoveryService.pair(computer, this.pairingCode);
+      const config = this.mergeLanPairing(lanConfig);
       this.applyConfig(config);
       await pairingStore.save(this.getContext(), config);
       this.pairingCode = '';
       this.statusText = '配对成功，正在连接电脑…';
       this.statusIsError = false;
+      this.closePairingAfterConnect = true;
       const connected = await remoteInputClient.connect(config);
-      if (connected) {
-        this.pairingDiscoveryMessage = `已与 ${computer.name} 配对`;
-        this.closePairingPanel();
-      } else {
+      if (!connected) {
         this.pairingDiscoveryMessage = '配对信息已保存，但连接电脑失败';
       }
     } catch (error) {
@@ -2151,12 +4305,14 @@ struct Index {
     }
     try {
       const result = await scanBarcode.startScanForResult(this.getContext());
-      const config = parsePairingUri(result.originalValue);
-      if (config === null) {
+      const scannedConfig = parsePairingUri(result.originalValue);
+      if (scannedConfig === null) {
         this.statusText = '这不是有效的 Starly 配对二维码';
         this.statusIsError = true;
         return;
       }
+      const config = scannedConfig.mode === 'gateway' ?
+        this.mergeGatewayPairing(scannedConfig) : this.mergeLanPairing(scannedConfig);
       this.applyConfig(config);
       await this.saveAndConnect();
     } catch (_error) {
@@ -2167,6 +4323,7 @@ struct Index {
 
   private async saveAndConnect(): Promise<void> {
     const config = this.readConfigFromForm();
+    config.mode = config.hasGateway() ? 'auto' : 'lan';
     if (!config.isComplete()) {
       this.statusText = '请填写有效的电脑地址、端口和配对密钥';
       this.statusIsError = true;
@@ -2181,6 +4338,7 @@ struct Index {
     }
     this.statusText = '正在连接电脑…';
     this.statusIsError = false;
+    this.closePairingAfterConnect = true;
     await remoteInputClient.connect(config);
   }
 
@@ -2196,6 +4354,16 @@ struct Index {
     this.host = '';
     this.portText = '8765';
     this.token = '';
+    this.gatewayPairingId = '';
+    this.gatewayToken = '';
+    this.phoneDeviceId = '';
+    this.gatewayDeviceCredential = '';
+    this.gatewaySessionToken = '';
+    this.gatewayPrivateKey = '';
+    this.gatewayPublicKey = '';
+    this.gatewayPeerPublicKeysJson = '{}';
+    this.gatewayBridgeDevices = [];
+    this.selectedGatewayBridgeId = '';
     this.isConnected = false;
     this.statusText = '配对信息已清除';
     this.statusIsError = false;
@@ -2411,6 +4579,7 @@ struct Index {
   }
 
   private onMainSectionChanged(targetSection: string): void {
+    this.scheduleCodexUiStateSave();
     if (targetSection === 'codex') {
       this.refreshCodex();
       this.startCodexAutoRefresh();
@@ -2446,6 +4615,7 @@ struct Index {
   }
 
   private closePairingPanel(): void {
+    this.closePairingAfterConnect = false;
     if (!this.isPairingOverlayMounted) {
       return;
     }
@@ -2466,6 +4636,95 @@ struct Index {
     }, () => {
       this.isPairingExpanded = false;
     });
+  }
+
+  private selectPairingNetworkMode(mode: string): void {
+    this.pairingNetworkMode = mode === 'public' ? 'public' : 'lan';
+    this.publicPairingVerification = '';
+    if (this.pairingNetworkMode === 'lan' && this.discoveredComputers.length === 0) {
+      this.discoverPairingComputers();
+    }
+  }
+
+  private async selectConnectionMode(mode: string): Promise<void> {
+    const nextMode = mode === 'gateway' ? 'gateway' : (mode === 'lan' ? 'lan' : 'auto');
+    const config = this.readConfigFromForm();
+    if (nextMode === 'lan' && !config.hasLan()) {
+      this.statusText = '尚未完成局域网配对';
+      this.statusIsError = true;
+      return;
+    }
+    if (nextMode === 'gateway' && !config.hasGateway()) {
+      this.statusText = '尚未完成公网配对';
+      this.statusIsError = true;
+      return;
+    }
+    if (!config.hasLan() && !config.hasGateway()) {
+      this.statusText = '请先完成至少一种配对';
+      this.statusIsError = true;
+      return;
+    }
+    config.mode = nextMode;
+    this.connectionMode = nextMode;
+    await pairingStore.save(this.getContext(), config);
+    this.statusText = nextMode === 'auto' ? '已启用局域网优先、公网兜底' :
+      (nextMode === 'lan' ? '已切换为仅局域网' : '已切换为仅公网');
+    this.statusIsError = false;
+    await remoteInputClient.connect(config);
+  }
+
+  private async scanPublicPairingCode(): Promise<void> {
+    if (!canIUse('SystemCapability.Multimedia.Scan.ScanBarcode')) {
+      this.publicPairingStatus = '当前设备不支持扫码，请输入 8 位公网配对码';
+      return;
+    }
+    try {
+      const result = await scanBarcode.startScanForResult(this.getContext());
+      const request = parsePublicPairingUri(result.originalValue);
+      if (request === null) {
+        this.publicPairingStatus = '这不是有效的 Starly 公网配对二维码';
+        this.statusIsError = true;
+        return;
+      }
+      await this.pairPublicGateway(request);
+    } catch (_error) {
+      if (!this.isPublicPairing) {
+        this.publicPairingStatus = '扫码已取消或不可用';
+      }
+    }
+  }
+
+  private async pairPublicGateway(request: PublicPairingRequest | null): Promise<void> {
+    if (this.isPublicPairing) {
+      return;
+    }
+    this.isPublicPairing = true;
+    this.publicPairingVerification = '';
+    this.publicPairingStatus = '正在连接公网配对服务…';
+    try {
+      const gatewayConfig = await publicPairingService.pair(
+        request, this.publicPairingCode, this.gatewayUrl,
+        (message: string, verificationCode: string): void => {
+          this.publicPairingStatus = message;
+          this.publicPairingVerification = verificationCode;
+        });
+      const config = this.mergeGatewayPairing(gatewayConfig);
+      this.applyConfig(config);
+      await pairingStore.save(this.getContext(), config);
+      this.publicPairingCode = '';
+      this.publicPairingVerification = '';
+      this.publicPairingStatus = '公网配对成功，正在连接电脑…';
+      this.statusText = '公网配对成功';
+      this.statusIsError = false;
+      this.closePairingAfterConnect = true;
+      await remoteInputClient.connect(config);
+    } catch (error) {
+      this.publicPairingStatus = `${error}`.replace('Error: ', '');
+      this.statusText = this.publicPairingStatus;
+      this.statusIsError = true;
+    } finally {
+      this.isPublicPairing = false;
+    }
   }
 
   private handleCodexDetailTouch(event: TouchEvent): void {
@@ -2507,10 +4766,20 @@ struct Index {
     if (this.codexAutoRefreshTimer >= 0) {
       return;
     }
+    this.codexRelativeTimeNow = Date.now();
+    this.codexReconcileTick = 0;
     this.codexAutoRefreshTimer = setInterval(() => {
+      // Date.now() alone is not reactive in ArkUI. Advance State so relative
+      // task times are recomputed while the Codex task list is visible.
+      this.codexRelativeTimeNow = Date.now();
       if (!this.isConnected || this.mainSection !== 'codex') {
         return;
       }
+      this.codexReconcileTick += 1;
+      if (this.codexReconcileTick < 6) {
+        return;
+      }
+      this.codexReconcileTick = 0;
       this.refreshCodexAutomatically();
     }, 5000);
   }
@@ -2524,7 +4793,7 @@ struct Index {
   }
 
   private shouldPollSelectedCodexDetail(): boolean {
-    if (this.isCodexConversationOpen || this.selectedCodexTaskId.length === 0) {
+    if (this.selectedCodexTaskId.length === 0) {
       return false;
     }
     return this.selectedCodexStatus === 'active' ||
@@ -2533,8 +4802,7 @@ struct Index {
   }
 
   private async refreshCodexAutomatically(): Promise<void> {
-    if (this.codexAutoRefreshInFlight || !this.isConnected || this.mainSection !== 'codex' ||
-      this.isCodexConversationOpen) {
+    if (this.codexAutoRefreshInFlight || !this.isConnected || this.mainSection !== 'codex') {
       return;
     }
     this.codexAutoRefreshInFlight = true;
@@ -2543,7 +4811,7 @@ struct Index {
       // list first, then read the selected task after a short gap so the
       // detail response is not rejected as a burst request.
       await remoteInputClient.requestCodexSnapshot();
-      if (this.shouldPollSelectedCodexDetail()) {
+      if (!this.codexDetailLoading && this.shouldPollSelectedCodexDetail()) {
         await new Promise<void>((resolve: () => void) => {
           setTimeout(resolve, 180);
         });
@@ -2561,7 +4829,7 @@ struct Index {
     if (!this.isConnected || this.mainSection !== 'codex' || threadId.length === 0) {
       return;
     }
-    if (!force && (this.codexDetailLoading || this.isCodexConversationOpen)) {
+    if (!force && this.codexDetailLoading) {
       return;
     }
     this.codexDetailLoading = this.selectedCodexMessages.length === 0;
@@ -2623,10 +4891,14 @@ struct Index {
   }
 
   private async sendDraft(): Promise<void> {
-    const sent = await remoteInputClient.sendText(this.draft, this.submitMode);
+    const requestId = remoteInputClient.createRequestId();
+    this.pendingDraftSendId = requestId;
+    const sent = await remoteInputClient.sendText(this.draft, this.submitMode, requestId);
     if (sent) {
       this.statusText = '已发送，等待电脑确认…';
       this.statusIsError = false;
+    } else if (this.pendingDraftSendId === requestId) {
+      this.pendingDraftSendId = '';
     }
   }
 
@@ -2640,25 +4912,35 @@ struct Index {
     await remoteInputClient.requestCodexSnapshot();
   }
 
-  private async selectCodexTask(threadId: string): Promise<void> {
+  private async selectCodexTask(threadId: string, pendingText: string = '',
+    pendingImage: string = ''): Promise<void> {
     this.clearCodexDetailTimers();
     this.codexDetailRetryCount = 0;
     const previousThreadId = this.selectedCodexTaskId;
     if (previousThreadId.length > 0 && this.selectedCodexStatus !== 'notLoaded') {
       this.rememberCodexTaskStatus(previousThreadId, this.selectedCodexStatus);
     }
+    if (previousThreadId.length > 0) {
+      this.codexUnreadCounts[previousThreadId] = this.codexUnreadMessages;
+    }
     this.selectedCodexTaskId = threadId;
     this.prepareSelectedCodexTask(threadId);
     this.selectedCodexMessages = [];
+    this.selectedCodexActivities = [];
+    this.codexActivityExpanded = false;
     this.selectedCodexActiveTurnId = '';
     this.codexHistoryHasMore = false;
     this.codexHistoryLoadingOlder = false;
     this.codexHistoryReady = false;
     this.codexChatPinnedToBottom = true;
-    this.codexUnreadMessages = 0;
+    this.codexUnreadMessages = this.codexUnreadCounts[threadId] ?? 0;
+    if (pendingText.length > 0 || pendingImage.length > 0) {
+      this.appendPendingCodexMessage(pendingText, pendingImage);
+    }
     this.codexDetailVersion += 1;
     this.codexDetailLoading = false;
     this.codexLoading = false;
+    this.scheduleCodexUiStateSave();
     await this.requestSelectedCodexThread(true);
   }
 
@@ -2668,15 +4950,46 @@ struct Index {
     }
     const pendingText = this.codexCommand.trim();
     const pendingImage = this.codexImagePreviewUri;
+    const requestId = remoteInputClient.createRequestId();
+    this.pendingCodexSendId = requestId;
+    this.pendingCodexSendText = pendingText;
+    this.pendingCodexSendImage = pendingImage;
     const sent = this.codexImageDataUrl.length > 0 ?
       await remoteInputClient.sendImageToCodex(
         this.selectedCodexTaskId, this.codexCommand, this.codexImageDataUrl,
-        this.codexImageMimeType || 'image/jpeg', submitMode) :
-      await remoteInputClient.sendToCodex(this.selectedCodexTaskId, this.codexCommand, submitMode);
+        this.codexImageMimeType || 'image/jpeg', submitMode, this.selectedCodexModel,
+        this.selectedCodexEffort, this.codexPermissionMode, this.selectedCodexServiceTier,
+        this.codexDeliveryMode, requestId) :
+      await remoteInputClient.sendToCodex(
+        this.selectedCodexTaskId, this.codexCommand, submitMode, this.selectedCodexModel,
+        this.selectedCodexEffort, this.codexPermissionMode, this.selectedCodexServiceTier,
+        this.codexDeliveryMode, requestId);
     if (sent) {
-      this.appendPendingCodexMessage(pendingText, pendingImage);
+      this.appendPendingCodexMessage(pendingText, pendingImage, requestId);
       this.pendingCodexThreadId = this.selectedCodexTaskId;
-      this.statusText = '正在恢复任务并发送…';
+      if (this.pendingCodexSendId === requestId) {
+        this.scheduleCodexAcknowledgementCheck(requestId, this.selectedCodexTaskId);
+        this.statusText = '正在恢复任务并发送…';
+      } else {
+        this.updatePendingCodexMessage(requestId, 'sent');
+        this.statusText = '电脑端已收到并执行';
+      }
+      this.statusIsError = false;
+    } else if (this.pendingCodexSendId === requestId) {
+      this.clearPendingCodexAcknowledgement();
+    }
+  }
+
+  private async createCodexTask(): Promise<void> {
+    if (this.selectedCodexCwd.length === 0 || this.codexCommand.trim().length === 0) {
+      return;
+    }
+    const sent = await remoteInputClient.createCodexTask(
+      this.selectedCodexCwd, this.codexCommand, this.selectedCodexModel,
+      this.selectedCodexEffort, this.codexPermissionMode, this.selectedCodexServiceTier,
+      this.codexImageDataUrl, this.codexImageMimeType || 'image/jpeg', 'background');
+    if (sent) {
+      this.statusText = '正在所选工作区创建 Codex 任务…';
       this.statusIsError = false;
     }
   }
@@ -2726,15 +5039,43 @@ struct Index {
       if (task.id === threadId) {
         this.selectedCodexTitle = task.title;
         this.selectedCodexCwd = task.cwd;
+        this.selectedCodexArchived = task.archived;
         this.selectedCodexStatus = this.resolvedCodexStatus(task.id, task.status);
         this.selectedCodexUpdatedAt = task.updatedAt;
+        if (this.useTwoPaneCodexLayout() && task.cwd.length > 0 &&
+          !this.expandedCodexProjects.includes(task.cwd)) {
+          this.expandedCodexProjects = [...this.expandedCodexProjects, task.cwd];
+        }
         return;
       }
     }
     this.selectedCodexTitle = '任务详情';
     this.selectedCodexCwd = '';
+    this.selectedCodexArchived = false;
     this.selectedCodexStatus = 'notLoaded';
     this.selectedCodexUpdatedAt = 0;
+  }
+
+  private codexTaskPreview(threadId: string): string {
+    const task = this.codexTasks.find(
+      (item: CodexTask): boolean => item.id === threadId);
+    return task?.preview ?? '';
+  }
+
+  private async toggleArchivedCodexTasks(): Promise<void> {
+    const next = !this.showArchivedCodexTasks;
+    this.showArchivedCodexTasks = next;
+    this.codexTaskDisplayLimit = 10;
+    if (!next || this.codexArchivedTasksLoaded || !this.isConnected) {
+      return;
+    }
+    this.codexLoading = true;
+    const requested = await remoteInputClient.requestCodexSnapshot(true);
+    if (requested) {
+      this.codexArchivedTasksLoaded = true;
+    } else {
+      this.codexLoading = false;
+    }
   }
 
   private toggleCodexTasks(): void {
@@ -2744,10 +5085,621 @@ struct Index {
   }
 
   private loadMoreCodexTasks(): void {
-    if (!this.areCodexTasksExpanded || this.codexTaskDisplayLimit >= this.codexTasks.length) {
+    const displayedCount = this.displayedCodexTasks().length;
+    if (!this.areCodexTasksExpanded || this.codexTaskDisplayLimit >= displayedCount) {
       return;
     }
-    this.codexTaskDisplayLimit = Math.min(this.codexTaskDisplayLimit + 10, this.codexTasks.length);
+    this.codexTaskDisplayLimit = Math.min(this.codexTaskDisplayLimit + 10, displayedCount);
+  }
+
+  private displayedCodexTasks(): CodexTask[] {
+    const query = this.codexSearchText.trim().toLowerCase();
+    return this.sortCodexTasksWithPinned(this.codexTasks.filter((task: CodexTask): boolean => {
+      if (task.archived && !this.showArchivedCodexTasks) {
+        return false;
+      }
+      if (query.length === 0) {
+        return true;
+      }
+      return `${task.title}\n${task.preview}\n${task.cwd}`.toLowerCase().includes(query);
+    }));
+  }
+
+  private codexProjects(): string[] {
+    const projects: string[] = [];
+    this.codexTasks.forEach((task: CodexTask): void => {
+      const cwd = task.cwd.trim();
+      if (cwd.length > 0 && !this.isCodexGeneratedChatWorkspace(cwd) && !projects.includes(cwd)) {
+        projects.push(cwd);
+      }
+    });
+    return projects;
+  }
+
+  private isCodexGeneratedChatWorkspace(cwd: string): boolean {
+    const normalized = cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    return /\/documents\/codex\/\d{4}-\d{2}-\d{2}\/[^/]+$/.test(normalized);
+  }
+
+  private isCodexSendOperation(operation: string): boolean {
+    return operation === 'codex_send' || operation === 'codex_image_send';
+  }
+
+  private clearAcknowledgedCodexComposer(requestId: string): void {
+    if (requestId.length === 0 || requestId !== this.pendingCodexSendId) {
+      return;
+    }
+    if (this.codexCommand.trim() === this.pendingCodexSendText) {
+      this.codexCommand = '';
+    }
+    if (this.pendingCodexSendImage.length > 0 &&
+      this.codexImagePreviewUri === this.pendingCodexSendImage) {
+      this.clearCodexImage();
+    }
+    this.clearPendingCodexAcknowledgement();
+  }
+
+  private clearPendingCodexAcknowledgement(): void {
+    if (this.pendingCodexAckTimer >= 0) {
+      clearTimeout(this.pendingCodexAckTimer);
+      this.pendingCodexAckTimer = -1;
+    }
+    this.pendingCodexSendId = '';
+    this.pendingCodexSendText = '';
+    this.pendingCodexSendImage = '';
+  }
+
+  private scheduleCodexAcknowledgementCheck(requestId: string, threadId: string): void {
+    if (this.pendingCodexAckTimer >= 0) {
+      clearTimeout(this.pendingCodexAckTimer);
+    }
+    this.pendingCodexAckTimer = setTimeout((): void => {
+      this.pendingCodexAckTimer = -1;
+      if (requestId !== this.pendingCodexSendId || threadId.length === 0) {
+        return;
+      }
+      remoteInputClient.requestCodexThread(threadId);
+      remoteInputClient.requestCodexSnapshot();
+      this.statusText = '正在核对电脑端发送结果…';
+      this.statusIsError = false;
+    }, 8000);
+  }
+
+  private codexHomeProjects(): string[] {
+    const projects = [...this.codexProjects()];
+    projects.sort((left: string, right: string): number =>
+      this.codexProjectTaskCount(right) - this.codexProjectTaskCount(left));
+    return projects.slice(0, 5);
+  }
+
+  private codexProjectTaskCount(cwd: string): number {
+    return this.codexTasks.filter((task: CodexTask): boolean => task.cwd === cwd).length;
+  }
+
+  private codexProjectName(cwd: string): string {
+    if (cwd.length === 0 || cwd === '__starly_chats__') {
+      return '聊天';
+    }
+    const normalized = cwd.replace(/\\/g, '/');
+    const parts = normalized.split('/').filter((part: string): boolean => part.length > 0);
+    return parts.length > 0 ? parts[parts.length - 1] : cwd;
+  }
+
+  private codexRemoteHomeTasks(): CodexTask[] {
+    const query = this.codexSearchText.trim().toLowerCase();
+    return this.sortCodexTasksWithPinned(this.codexTasks.filter((task: CodexTask): boolean => {
+      if (task.archived && !this.showArchivedCodexTasks) {
+        return false;
+      }
+      if (this.selectedCodexProject === '__starly_chats__') {
+        if (!this.isCodexGeneratedChatWorkspace(task.cwd)) {
+          return false;
+        }
+      } else if (this.selectedCodexProject.length > 0 && task.cwd !== this.selectedCodexProject) {
+        return false;
+      }
+      return query.length === 0 ||
+        `${task.title}\n${task.preview}\n${task.cwd}`.toLowerCase().includes(query);
+    }));
+  }
+
+  private codexDesktopProjects(): string[] {
+    const query = this.codexSearchText.trim().toLowerCase();
+    const projects = this.codexProjects().filter((project: string): boolean => {
+      if (query.length === 0) {
+        return true;
+      }
+      return this.codexTasks.some((task: CodexTask): boolean =>
+        task.cwd === project &&
+        `${task.title}\n${task.preview}\n${project}`.toLowerCase().includes(query));
+    });
+    projects.sort((left: string, right: string): number => {
+      const countDifference = this.codexProjectTaskCount(right) - this.codexProjectTaskCount(left);
+      return countDifference !== 0 ? countDifference :
+        this.codexProjectName(left).localeCompare(this.codexProjectName(right));
+    });
+    return projects;
+  }
+
+  private codexTasksForDesktopProject(project: string): CodexTask[] {
+    const query = this.codexSearchText.trim().toLowerCase();
+    const tasks = this.codexTasks.filter((task: CodexTask): boolean => {
+      if (task.cwd !== project || (task.archived && !this.showArchivedCodexTasks)) {
+        return false;
+      }
+      return query.length === 0 ||
+        `${task.title}\n${task.preview}\n${task.cwd}`.toLowerCase().includes(query);
+    });
+    return this.sortCodexTasksWithPinned(tasks);
+  }
+
+  private isCodexProjectExpanded(project: string): boolean {
+    return this.expandedCodexProjects.includes(project);
+  }
+
+  private toggleCodexProject(project: string): void {
+    const expanded = [...this.expandedCodexProjects];
+    const index = expanded.indexOf(project);
+    if (index >= 0) {
+      expanded.splice(index, 1);
+    } else {
+      expanded.push(project);
+    }
+    this.expandedCodexProjects = expanded;
+  }
+
+  private async openDesktopCodexTask(threadId: string, project: string): Promise<void> {
+    if (!this.isCodexProjectExpanded(project)) {
+      this.toggleCodexProject(project);
+    }
+    this.codexNewTaskMode = false;
+    this.codexSettingsMenu = '';
+    await this.selectCodexTask(threadId);
+  }
+
+  private sortCodexTasksWithPinned(tasks: CodexTask[]): CodexTask[] {
+    const result = [...tasks];
+    result.sort((left: CodexTask, right: CodexTask): number => {
+      const leftIndex = this.pinnedCodexThreadIds.indexOf(left.id);
+      const rightIndex = this.pinnedCodexThreadIds.indexOf(right.id);
+      if (leftIndex >= 0 && rightIndex >= 0) {
+        return leftIndex - rightIndex;
+      }
+      if (leftIndex >= 0) {
+        return -1;
+      }
+      if (rightIndex >= 0) {
+        return 1;
+      }
+      return right.updatedAt - left.updatedAt;
+    });
+    return result;
+  }
+
+  private codexTaskRenderKey(task: CodexTask, prefix: string): string {
+    const pinned = this.isCodexTaskPinned(task.id) ? 1 : 0;
+    const selected = this.selectedCodexTaskId === task.id ? 1 : 0;
+    const syncing = this.codexInitialSyncPending ? 1 : 0;
+    return `${prefix}:${task.id}:${task.updatedAt}:${this.effectiveCodexStatus(task)}:` +
+      `${task.title}:${task.preview}:${task.cwd}:${task.archived ? 1 : 0}:` +
+      `${pinned}:${this.codexTaskUnreadCount(task.id)}:${selected}:${syncing}`;
+  }
+
+  private formatCodexRelativeTime(timestamp: number): string {
+    if (timestamp <= 0) {
+      return '';
+    }
+    const seconds = timestamp > 100000000000 ? Math.floor(timestamp / 1000) : timestamp;
+    const elapsed = Math.max(0, Math.floor(this.codexRelativeTimeNow / 1000) - seconds);
+    if (elapsed < 60) {
+      return '刚刚';
+    }
+    if (elapsed < 3600) {
+      return `${Math.floor(elapsed / 60)}分钟`;
+    }
+    if (elapsed < 86400) {
+      return `${Math.floor(elapsed / 3600)}小时`;
+    }
+    return `${Math.floor(elapsed / 86400)}天`;
+  }
+
+  private codexDisplayText(value: string): string {
+    return value
+      .replace(/^#{1,6}\s+/gm, '')
+      .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1')
+      .replace(/::codex-inline-vis\{[^\}]+\}/g, '可视化内容请在电脑端查看')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\*\*([^*]+)\*\*/g, '$1');
+  }
+
+  private openRemoteCodexTask(threadId: string): void {
+    this.codexNewTaskMode = false;
+    this.codexSettingsMenu = '';
+    if (this.useTwoPaneCodexLayout()) {
+      this.isCodexConversationOpen = false;
+      this.selectCodexTask(threadId);
+      setTimeout(() => {
+        if (!this.isCodexConversationOpen && this.selectedCodexTaskId === threadId) {
+          this.scrollCodexChatToBottom(false);
+        }
+      }, 320);
+      return;
+    }
+    this.isCodexConversationOpen = true;
+    this.selectCodexTask(threadId);
+    // The content cover has its own entrance animation. Re-anchor once it is
+    // fully laid out even when the thread response arrived immediately.
+    setTimeout(() => {
+      if (this.isCodexConversationOpen && this.selectedCodexTaskId === threadId) {
+        this.scrollCodexChatToBottom(false);
+      }
+    }, 520);
+  }
+
+  private openNewCodexTask(): void {
+    const selectedProject = this.selectedCodexProject === '__starly_chats__' ? '' :
+      this.selectedCodexProject;
+    const project = selectedProject || this.codexProjects()[0] || '';
+    if (project.length === 0) {
+      this.statusText = '请先在电脑 Codex 中打开一个项目';
+      this.statusIsError = true;
+      return;
+    }
+    this.codexNewTaskMode = true;
+    this.selectedCodexTaskId = '';
+    this.selectedCodexTitle = '新任务';
+    this.selectedCodexCwd = project;
+    this.selectedCodexMessages = [];
+    this.codexCommand = '';
+    this.codexSettingsMenu = '';
+    this.isCodexConversationOpen = true;
+  }
+
+  private closeRemoteCodexConversation(): void {
+    this.codexSettingsMenu = '';
+    this.codexFullAccessConfirm = false;
+    this.codexVoiceTarget = false;
+    this.codexVoiceListening = false;
+    speechService.stop().catch((): void => {});
+    this.isCodexConversationOpen = false;
+    if (this.codexNewTaskMode) {
+      this.codexNewTaskMode = false;
+      this.selectedCodexTaskId = '';
+      this.selectedCodexMessages = [];
+    } else {
+      this.markSelectedCodexRead();
+    }
+  }
+
+  private clearCodexImage(): void {
+    this.codexImagePreviewUri = '';
+    this.codexImageDataUrl = '';
+    this.codexImageMimeType = '';
+  }
+
+  private canSendRemoteCodexComposer(): boolean {
+    const hasContent = this.codexCommand.trim().length > 0 || this.codexImageDataUrl.length > 0;
+    if (!hasContent || !this.isConnected || this.codexImagePicking) {
+      return false;
+    }
+    return this.codexNewTaskMode ? this.selectedCodexCwd.length > 0 &&
+      this.codexCommand.trim().length > 0 : this.selectedCodexTaskId.length > 0;
+  }
+
+  private async sendRemoteCodexComposer(): Promise<void> {
+    this.codexSettingsMenu = '';
+    if (this.codexNewTaskMode) {
+      await this.createCodexTask();
+    } else {
+      const submitMode = this.codexDeliveryMode === 'desktop' ? this.desktopSubmitMode : 'enter';
+      await this.sendCodexCommand(submitMode);
+    }
+  }
+
+  private async toggleCodexVoiceInput(): Promise<void> {
+    if (this.codexVoiceListening) {
+      await speechService.stop();
+      return;
+    }
+    this.codexVoiceTarget = true;
+    const started = await speechService.start();
+    if (!started) {
+      this.codexVoiceTarget = false;
+      this.codexVoiceListening = false;
+    }
+  }
+
+  private selectedCodexModelOption(): CodexModelOption | undefined {
+    return this.codexModels.find(
+      (model: CodexModelOption): boolean => model.model === this.selectedCodexModel);
+  }
+
+  private isCodexModelSettingsMenu(): boolean {
+    return this.codexSettingsMenu === 'main' || this.codexSettingsMenu === 'models' ||
+      this.codexSettingsMenu === 'effort' || this.codexSettingsMenu === 'speed';
+  }
+
+  private selectedCodexModelLabel(): string {
+    const model = this.selectedCodexModelOption();
+    return model?.displayName || this.selectedCodexModel || '默认模型';
+  }
+
+  private codexReasoningEfforts(): string[] {
+    const model = this.selectedCodexModelOption();
+    const efforts = model?.supportedReasoningEfforts.map(
+      (option: CodexReasoningOption): string => option.effort) ?? [];
+    if (efforts.length > 0) {
+      return efforts;
+    }
+    const fallback = this.selectedCodexEffort || model?.defaultReasoningEffort || 'medium';
+    return [fallback];
+  }
+
+  private codexEffortLabel(): string {
+    return this.codexEffortLabelFor(this.selectedCodexEffort);
+  }
+
+  private codexEffortLabelFor(effort: string): string {
+    if (effort === 'low') return '低';
+    if (effort === 'medium') return '中';
+    if (effort === 'high') return '高';
+    if (effort === 'xhigh') return '超高';
+    if (effort === 'max') return '最高';
+    if (effort === 'ultra') return 'Ultra（自动委派）';
+    return effort;
+  }
+
+  private selectCodexModel(model: CodexModelOption): void {
+    this.selectedCodexModel = model.model;
+    if (!model.supportedReasoningEfforts.some(
+      (option: CodexReasoningOption): boolean => option.effort === this.selectedCodexEffort)) {
+      this.selectedCodexEffort = model.defaultReasoningEffort || 'medium';
+    }
+    this.selectedCodexServiceTier = '';
+    this.codexSettingsMenu = '';
+    this.scheduleCodexUiStateSave();
+  }
+
+  private selectCodexEffort(effort: string): void {
+    this.selectedCodexEffort = effort;
+    this.codexSettingsMenu = '';
+    this.scheduleCodexUiStateSave();
+  }
+
+  private codexPermissionLabel(): string {
+    return this.codexPermissionLabelFor(this.codexPermissionMode);
+  }
+
+  private codexPermissionLabelFor(mode: string): string {
+    if (mode === 'autoApprove') return '自动审批';
+    if (mode === 'readOnly') return '只读';
+    if (mode === 'fullAccess') return this.codexFullAccessConfirm ? '再次点按：完全访问' : '完全访问权限';
+    return '默认权限';
+  }
+
+  private selectCodexPermission(mode: string): void {
+    if (mode === 'fullAccess' && !this.codexFullAccessConfirm) {
+      this.codexFullAccessConfirm = true;
+      this.statusText = '完全访问将取消沙箱和审批；请再次点按确认';
+      this.statusIsError = true;
+      return;
+    }
+    this.codexPermissionMode = mode;
+    this.codexFullAccessConfirm = false;
+    this.codexSettingsMenu = '';
+    this.statusText = mode === 'fullAccess' ? '已启用完全访问权限' : '运行权限已更新';
+    this.statusIsError = mode === 'fullAccess';
+    this.scheduleCodexUiStateSave();
+  }
+
+  private codexServiceTierOptions(): string[] {
+    const available = this.selectedCodexModelOption()?.serviceTiers ?? [];
+    const result: string[] = [''];
+    for (let index = 0; index < available.length; index += 1) {
+      const tier = available[index];
+      if (tier.length > 0 && tier !== 'default' && !result.includes(tier)) {
+        result.push(tier);
+      }
+    }
+    return result;
+  }
+
+  private codexServiceTierLabel(tier: string): string {
+    if (tier.length === 0 || tier === 'default') return '标准';
+    if (tier === 'priority' || tier === 'fast') return '快速（1.5×）';
+    return tier;
+  }
+
+  private selectCodexServiceTier(tier: string): void {
+    this.selectedCodexServiceTier = tier;
+    this.codexSettingsMenu = '';
+    this.scheduleCodexUiStateSave();
+  }
+
+  private selectCodexDeliveryMode(mode: string): void {
+    this.codexDeliveryMode = mode === 'desktop' ? 'desktop' : 'background';
+    this.statusText = this.codexDeliveryMode === 'desktop' ?
+      '已切换为桌面输入框发送' : '已切换为默认发送模式';
+    this.statusIsError = false;
+    this.scheduleCodexUiStateSave();
+  }
+
+  private selectDesktopSubmitMode(mode: string): void {
+    this.desktopSubmitMode = mode === 'ctrl_enter' ? 'ctrl_enter' : 'enter';
+    this.statusText = this.desktopSubmitMode === 'ctrl_enter' ?
+      '桌面发送按钮将使用 Ctrl + 回车' : '桌面发送按钮将使用回车';
+    this.statusIsError = false;
+    this.scheduleCodexUiStateSave();
+  }
+
+  private async toggleSelectedCodexArchived(): Promise<void> {
+    if (this.selectedCodexTaskId.length === 0 || this.isSelectedCodexRunning()) {
+      return;
+    }
+    const next = !this.selectedCodexArchived;
+    const sent = await remoteInputClient.setCodexArchived(this.selectedCodexTaskId, next);
+    if (sent) {
+      this.selectedCodexArchived = next;
+      this.statusText = next ? '正在归档任务…' : '正在恢复任务…';
+      this.statusIsError = false;
+      setTimeout(() => remoteInputClient.requestCodexSnapshot(), 350);
+    }
+  }
+
+  private codexTaskForMenu(): CodexTask | undefined {
+    return this.codexTasks.find(
+      (task: CodexTask): boolean => task.id === this.codexTaskMenuId);
+  }
+
+  private codexTaskMenuTitle(): string {
+    return this.codexTaskForMenu()?.title || 'Codex 任务';
+  }
+
+  private openCodexTaskMenu(threadId: string, event: GestureEvent): void {
+    const menuWidth = 176;
+    const menuHeight = 184;
+    const finger = event.fingerList.length > 0 ? event.fingerList[0] : undefined;
+    const touchX = finger?.globalX ?? this.layoutViewportWidth / 2;
+    const touchY = finger?.globalY ?? this.layoutViewportHeight / 2;
+    this.codexTaskMenuX = touchX + menuWidth + 16 <= this.layoutViewportWidth ?
+      touchX + 8 : Math.max(8, touchX - menuWidth - 8);
+    this.codexTaskMenuY = touchY + menuHeight + 16 <= this.layoutViewportHeight ?
+      touchY + 8 : Math.max(8, touchY - menuHeight - 8);
+    if (this.codexTaskMenuAnimationTimer >= 0) {
+      clearTimeout(this.codexTaskMenuAnimationTimer);
+      this.codexTaskMenuAnimationTimer = -1;
+    }
+    this.codexTaskMenuExpanded = false;
+    this.codexTaskMenuId = threadId;
+    this.codexTaskRenameMode = false;
+    this.codexTaskRenameText = '';
+    this.triggerCodexTaskMenuHaptic();
+    this.codexTaskMenuAnimationTimer = setTimeout(() => {
+      this.codexTaskMenuAnimationTimer = -1;
+      this.codexTaskMenuExpanded = true;
+    }, 12);
+  }
+
+  private closeCodexTaskMenu(): void {
+    if (this.codexTaskMenuId.length === 0) {
+      return;
+    }
+    if (this.codexTaskMenuAnimationTimer >= 0) {
+      clearTimeout(this.codexTaskMenuAnimationTimer);
+    }
+    this.codexTaskMenuExpanded = false;
+    this.codexTaskMenuAnimationTimer = setTimeout(() => {
+      this.codexTaskMenuAnimationTimer = -1;
+      this.codexTaskMenuId = '';
+      this.codexTaskRenameMode = false;
+      this.codexTaskRenameText = '';
+    }, 150);
+  }
+
+  private triggerCodexTaskMenuHaptic(): void {
+    const effect: vibrator.VibratePreset = {
+      type: 'preset',
+      effectId: vibrator.HapticFeedback.EFFECT_SOFT,
+      count: 1
+    };
+    const attribute: vibrator.VibrateAttribute = { usage: 'touch' };
+    try {
+      vibrator.startVibration(effect, attribute).catch((): void => {});
+    } catch (_error) {
+      // Some tablets and emulators do not include a vibrator.
+    }
+  }
+
+  private isCodexTaskPinned(threadId: string): boolean {
+    return this.pinnedCodexThreadIds.includes(threadId);
+  }
+
+  private toggleCodexTaskPinned(threadId: string): void {
+    const next = [...this.pinnedCodexThreadIds];
+    const index = next.indexOf(threadId);
+    if (index >= 0) {
+      next.splice(index, 1);
+      this.statusText = '已取消置顶';
+    } else {
+      next.unshift(threadId);
+      this.statusText = '任务已置顶';
+    }
+    this.pinnedCodexThreadIds = next;
+    this.statusIsError = false;
+    this.scheduleCodexUiStateSave();
+    this.closeCodexTaskMenu();
+  }
+
+  private markCodexTaskUnread(threadId: string): void {
+    const next: Record<string, number> = {};
+    Object.keys(this.codexUnreadCounts).forEach((key: string): void => {
+      next[key] = this.codexUnreadCounts[key];
+    });
+    next[threadId] = Math.max(1, next[threadId] ?? 0);
+    this.codexUnreadCounts = next;
+    this.codexLastSeenMessageIds[threadId] = '';
+    if (threadId === this.selectedCodexTaskId) {
+      this.codexUnreadMessages = next[threadId];
+    }
+    this.statusText = '已标记为未读';
+    this.statusIsError = false;
+    this.scheduleCodexUiStateSave();
+    this.closeCodexTaskMenu();
+  }
+
+  private openCodexTaskRename(): void {
+    this.codexTaskRenameText = this.codexTaskMenuTitle();
+    this.codexTaskRenameMode = true;
+  }
+
+  private async renameCodexTaskFromMenu(): Promise<void> {
+    const threadId = this.codexTaskMenuId;
+    const name = this.codexTaskRenameText.trim();
+    if (threadId.length === 0 || name.length === 0) {
+      return;
+    }
+    const sent = await remoteInputClient.renameCodexTask(threadId, name);
+    if (!sent) {
+      return;
+    }
+    const tasks = [...this.codexTasks];
+    const taskIndex = tasks.findIndex((task: CodexTask): boolean => task.id === threadId);
+    if (taskIndex >= 0) {
+      const task = this.cloneCodexTask(tasks[taskIndex]);
+      task.title = name;
+      tasks[taskIndex] = task;
+      this.codexTasks = tasks;
+    }
+    if (threadId === this.selectedCodexTaskId) {
+      this.selectedCodexTitle = name;
+    }
+    this.statusText = '正在重命名任务…';
+    this.statusIsError = false;
+    this.closeCodexTaskMenu();
+    setTimeout(() => remoteInputClient.requestCodexSnapshot(), 350);
+  }
+
+  private isCodexTaskMenuRunning(): boolean {
+    const task = this.codexTaskForMenu();
+    return task !== undefined && this.effectiveCodexStatus(task) === 'active';
+  }
+
+  private async archiveCodexTaskFromMenu(): Promise<void> {
+    const threadId = this.codexTaskMenuId;
+    if (threadId.length === 0 || this.isCodexTaskMenuRunning()) {
+      return;
+    }
+    const sent = await remoteInputClient.setCodexArchived(threadId, true);
+    if (!sent) {
+      return;
+    }
+    if (threadId === this.selectedCodexTaskId) {
+      this.selectedCodexArchived = true;
+    }
+    this.statusText = '正在归档任务…';
+    this.statusIsError = false;
+    this.closeCodexTaskMenu();
+    setTimeout(() => remoteInputClient.requestCodexSnapshot(), 350);
   }
 
   private handleCodexTaskTap(threadId: string): void {
@@ -2769,15 +5721,34 @@ struct Index {
 
   private applyCodexThreadDetail(detail: CodexThreadDetail): void {
     detail.status = normalizeCodexDetailStatus(detail.status, detail.activeTurnId);
+    this.applyCodexTaskDelta(detail);
     this.rememberCodexTaskStatus(detail.id, detail.status);
     if (detail.id !== this.selectedCodexTaskId) {
       return;
     }
     this.selectedCodexTitle = detail.title;
     this.selectedCodexCwd = detail.cwd;
+    this.selectedCodexArchived = detail.archived;
     this.selectedCodexStatus = detail.status;
     this.selectedCodexActiveTurnId = detail.activeTurnId;
     this.selectedCodexUpdatedAt = detail.updatedAt;
+    if (detail.model.length > 0) {
+      this.selectedCodexModel = detail.model;
+    }
+    if (detail.effort.length > 0) {
+      this.selectedCodexEffort = detail.effort;
+    }
+    if (detail.permissionMode.length > 0) {
+      this.codexPermissionMode = detail.permissionMode;
+      this.codexFullAccessConfirm = false;
+    }
+    this.selectedCodexServiceTier = detail.serviceTier;
+    if (detail.updateMode === 'delta') {
+      this.mergeLatestCodexActivities(detail.activities);
+    } else if (detail.updateMode !== 'older') {
+      this.selectedCodexActivities = [...detail.activities];
+    }
+    this.scheduleCodexUiStateSave();
     if (detail.updateMode === 'older') {
       this.prependOlderCodexMessages(detail.messages, detail.hasMoreBefore);
     } else {
@@ -2786,6 +5757,20 @@ struct Index {
         this.codexDetailRetryCount = 0;
       }
       if (detail.updateMode === 'latest' && !this.codexHistoryReady) {
+        if (this.pendingCodexSendId.length > 0) {
+          for (let index = 0; index < detail.messages.length; index += 1) {
+            const incoming = detail.messages[index];
+            if (incoming.role === 'user' &&
+              this.matchPendingCodexMessage(this.selectedCodexMessages, incoming) >= 0) {
+              const requestId = this.pendingCodexSendId;
+              this.clearAcknowledgedCodexComposer(requestId);
+              this.statusText = '电脑端已收到并执行';
+              this.statusIsError = false;
+              break;
+            }
+          }
+        }
+        this.reconcileRestoredCodexUnread(detail.messages);
         this.selectedCodexMessages = [...detail.messages];
         this.codexHistoryHasMore = detail.hasMoreBefore;
         this.codexDetailVersion += 1;
@@ -2803,6 +5788,49 @@ struct Index {
     this.codexLoading = false;
   }
 
+  private applyCodexTaskDelta(detail: CodexThreadDetail): void {
+    if (detail.id.length === 0) {
+      return;
+    }
+    const tasks = [...this.codexTasks];
+    let index = tasks.findIndex((task: CodexTask): boolean => task.id === detail.id);
+    const task = index >= 0 ? this.cloneCodexTask(tasks[index]) : new CodexTask();
+    task.id = detail.id;
+    if (detail.title.length > 0) {
+      task.title = detail.title;
+    }
+    if (detail.preview.length > 0) {
+      task.preview = detail.preview;
+    }
+    if (detail.cwd.length > 0) {
+      task.cwd = detail.cwd;
+    }
+    task.status = detail.status;
+    task.archived = detail.archived;
+    if (detail.updatedAt > 0) {
+      task.updatedAt = detail.updatedAt;
+    }
+    if (index >= 0) {
+      tasks[index] = task;
+    } else {
+      tasks.push(task);
+      index = tasks.length - 1;
+    }
+    this.codexTasks = tasks;
+  }
+
+  private cloneCodexTask(source: CodexTask): CodexTask {
+    const task = new CodexTask();
+    task.id = source.id;
+    task.title = source.title;
+    task.preview = source.preview;
+    task.status = source.status;
+    task.cwd = source.cwd;
+    task.updatedAt = source.updatedAt;
+    task.archived = source.archived;
+    return task;
+  }
+
   private mergeLatestCodexMessages(incoming: CodexMessage[]): void {
     if (incoming.length === 0) {
       return;
@@ -2817,13 +5845,24 @@ struct Index {
         existingIndex = this.matchPendingCodexMessage(merged, next);
       }
       if (existingIndex >= 0) {
+        const matchedLocalId = merged[existingIndex].id;
+        if (matchedLocalId.startsWith('local-')) {
+          const requestId = matchedLocalId.substring('local-'.length);
+          if (requestId === this.pendingCodexSendId) {
+            this.clearAcknowledgedCodexComposer(requestId);
+            this.statusText = '电脑端已收到并执行';
+            this.statusIsError = false;
+          }
+        }
         if (!this.sameCodexMessage(merged[existingIndex], next)) {
           merged[existingIndex] = next;
           changed = true;
         }
       } else {
         merged.push(next);
-        appended += 1;
+        if (next.role !== 'user') {
+          appended += 1;
+        }
         changed = true;
       }
     }
@@ -2834,10 +5873,45 @@ struct Index {
     this.selectedCodexMessages = merged;
     this.codexDetailVersion += 1;
     if (keepPinned) {
-      this.scrollCodexChatToBottom(true);
+      if (this.mainSection === 'codex' && this.isCodexConversationOpen) {
+        this.scrollCodexChatToBottom(true);
+      } else if (appended > 0) {
+        this.setSelectedCodexUnread(this.codexUnreadMessages + appended);
+      }
     } else if (appended > 0) {
-      this.codexUnreadMessages += appended;
+      this.setSelectedCodexUnread(this.codexUnreadMessages + appended);
     }
+  }
+
+  private mergeLatestCodexActivities(incoming: CodexActivity[]): void {
+    if (incoming.length === 0) {
+      return;
+    }
+    const merged = [...this.selectedCodexActivities];
+    let changed = false;
+    for (let incomingIndex = 0; incomingIndex < incoming.length; incomingIndex += 1) {
+      const next = incoming[incomingIndex];
+      const existingIndex = merged.findIndex(
+        (activity: CodexActivity): boolean => activity.id === next.id);
+      if (existingIndex >= 0) {
+        if (!this.sameCodexActivity(merged[existingIndex], next)) {
+          merged[existingIndex] = next;
+          changed = true;
+        }
+      } else {
+        merged.push(next);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.selectedCodexActivities = merged.slice(-30);
+    }
+  }
+
+  private sameCodexActivity(left: CodexActivity, right: CodexActivity): boolean {
+    return left.id === right.id && left.kind === right.kind && left.title === right.title &&
+      left.text === right.text && left.status === right.status &&
+      left.timestamp === right.timestamp && left.turnId === right.turnId;
   }
 
   private prependOlderCodexMessages(older: CodexMessage[], hasMoreBefore: boolean): void {
@@ -2882,9 +5956,10 @@ struct Index {
     }
   }
 
-  private appendPendingCodexMessage(text: string, previewImage: string): void {
+  private appendPendingCodexMessage(text: string, previewImage: string,
+    requestId: string = ''): void {
     const pending = new CodexMessage();
-    pending.id = `local-${Date.now()}`;
+    pending.id = requestId.length > 0 ? `local-${requestId}` : `local-${Date.now()}`;
     pending.role = 'user';
     pending.text = text.length > 0 ? text : '图片';
     pending.images = previewImage.length > 0 ? [previewImage] : [];
@@ -2900,6 +5975,22 @@ struct Index {
     const messages = [...this.selectedCodexMessages];
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       if (messages[index].id.startsWith('local-')) {
+        messages[index].deliveryState = deliveryState;
+        this.selectedCodexMessages = messages;
+        this.codexDetailVersion += 1;
+        return;
+      }
+    }
+  }
+
+  private updatePendingCodexMessage(requestId: string, deliveryState: string): void {
+    if (requestId.length === 0) {
+      return;
+    }
+    const localId = `local-${requestId}`;
+    const messages = [...this.selectedCodexMessages];
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].id === localId) {
         messages[index].deliveryState = deliveryState;
         this.selectedCodexMessages = messages;
         this.codexDetailVersion += 1;
@@ -2934,23 +6025,81 @@ struct Index {
     return -1;
   }
 
+  private latestPersistedCodexMessageId(messages: CodexMessage[]): string {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (!messages[index].id.startsWith('local-')) {
+        return messages[index].id;
+      }
+    }
+    return '';
+  }
+
+  private reconcileRestoredCodexUnread(messages: CodexMessage[]): void {
+    const threadId = this.selectedCodexTaskId;
+    const latestId = this.latestPersistedCodexMessageId(messages);
+    if (threadId.length === 0 || latestId.length === 0) {
+      return;
+    }
+    const lastSeenId = this.codexLastSeenMessageIds[threadId] ?? '';
+    if (lastSeenId.length === 0) {
+      this.codexLastSeenMessageIds[threadId] = latestId;
+      this.setSelectedCodexUnread(this.codexUnreadCounts[threadId] ?? 0);
+      return;
+    }
+    const lastSeenIndex = this.codexMessageIndexById(messages, lastSeenId);
+    const firstUnreadIndex = lastSeenIndex >= 0 ? lastSeenIndex + 1 : 0;
+    let newCount = 0;
+    for (let index = firstUnreadIndex; index < messages.length; index += 1) {
+      if (messages[index].role !== 'user') {
+        newCount += 1;
+      }
+    }
+    const restoredCount = lastSeenIndex >= 0 ? newCount :
+      Math.max(this.codexUnreadCounts[threadId] ?? 0, newCount);
+    this.setSelectedCodexUnread(restoredCount);
+  }
+
+  private setSelectedCodexUnread(count: number): void {
+    if (this.selectedCodexTaskId.length === 0) {
+      return;
+    }
+    this.codexUnreadMessages = Math.max(0, Math.floor(count));
+    if (this.codexUnreadMessages > 0) {
+      this.codexUnreadCounts[this.selectedCodexTaskId] = this.codexUnreadMessages;
+    } else {
+      this.codexUnreadCounts[this.selectedCodexTaskId] = 0;
+    }
+    this.scheduleCodexUiStateSave();
+  }
+
+  private markSelectedCodexRead(): void {
+    if (this.selectedCodexTaskId.length === 0) {
+      return;
+    }
+    const latestId = this.latestPersistedCodexMessageId(this.selectedCodexMessages);
+    if (latestId.length > 0) {
+      this.codexLastSeenMessageIds[this.selectedCodexTaskId] = latestId;
+    }
+    this.setSelectedCodexUnread(0);
+  }
+
   private scheduleInitialCodexChatScroll(): void {
     this.codexHistoryReady = false;
     this.codexChatPinnedToBottom = true;
-    this.codexUnreadMessages = 0;
     if (this.codexChatScrollTimer >= 0) {
       clearTimeout(this.codexChatScrollTimer);
     }
     this.codexChatScrollTimer = setTimeout(() => {
       this.codexChatScrollTimer = -1;
-      const typingOffset = this.isSelectedCodexRunning() ? 1 : 0;
-      const targetIndex = Math.max(0, this.selectedCodexMessages.length - 1 + typingOffset);
-      try {
-        this.codexChatScroller.scrollToIndex(targetIndex, false, ScrollAlign.END);
-      } catch (_error) {
-      }
-      this.codexHistoryReady = true;
-    }, 72);
+      this.performCodexChatBottomScroll(false);
+      // A second pass runs after the content-cover transition and message
+      // bubble measurement, which prevents opening halfway through a thread.
+      this.codexChatScrollTimer = setTimeout(() => {
+        this.codexChatScrollTimer = -1;
+        this.performCodexChatBottomScroll(false);
+        this.codexHistoryReady = true;
+      }, 260);
+    }, 100);
   }
 
   private scheduleCodexChatAnchorRestore(prependedCount: number): void {
@@ -2971,16 +6120,36 @@ struct Index {
       clearTimeout(this.codexChatScrollTimer);
     }
     this.codexChatPinnedToBottom = true;
-    this.codexUnreadMessages = 0;
+    this.markSelectedCodexRead();
     this.codexChatScrollTimer = setTimeout(() => {
       this.codexChatScrollTimer = -1;
-      const typingOffset = this.isSelectedCodexRunning() ? 1 : 0;
-      const targetIndex = Math.max(0, this.selectedCodexMessages.length - 1 + typingOffset);
-      try {
-        this.codexChatScroller.scrollToIndex(targetIndex, smooth, ScrollAlign.END);
-      } catch (_error) {
-      }
+      this.performCodexChatBottomScroll(smooth);
+      // Keyboard and content-cover animations can resize the List after the
+      // first pass. Re-anchor once more after their final layout frame.
+      this.codexChatScrollTimer = setTimeout(() => {
+        this.codexChatScrollTimer = -1;
+        this.performCodexChatBottomScroll(false);
+      }, 240);
     }, 24);
+  }
+
+  private performCodexChatBottomScroll(smooth: boolean): void {
+    try {
+      this.codexChatScroller.scrollEdge(Edge.Bottom);
+      return;
+    } catch (_error) {
+    }
+    let itemCount = this.selectedCodexMessages.length;
+    if (this.codexHistoryHasMore && !this.codexNewTaskMode) {
+      itemCount += 1;
+    }
+    if (!this.codexNewTaskMode && this.isSelectedCodexRunning()) {
+      itemCount += 1;
+    }
+    try {
+      this.codexChatScroller.scrollToIndex(Math.max(0, itemCount - 1), smooth, ScrollAlign.END);
+    } catch (_error) {
+    }
   }
 
   private sameCodexMessage(left: CodexMessage, right: CodexMessage): boolean {
@@ -3006,7 +6175,8 @@ struct Index {
       const right = next[index];
       if (left.id !== right.id || left.title !== right.title ||
         left.preview !== right.preview || left.status !== right.status ||
-        left.cwd !== right.cwd) {
+        left.cwd !== right.cwd || left.updatedAt !== right.updatedAt ||
+        left.archived !== right.archived) {
         return false;
       }
     }
@@ -3067,16 +6237,13 @@ struct Index {
       return;
     }
     this.codexResolvedStatuses.set(threadId, status);
-    let changed = false;
-    for (let index = 0; index < this.codexTasks.length; index += 1) {
-      if (this.codexTasks[index].id === threadId && this.codexTasks[index].status !== status) {
-        this.codexTasks[index].status = status;
-        changed = true;
-        break;
-      }
-    }
-    if (changed) {
-      this.codexTasks = [...this.codexTasks];
+    const tasks = [...this.codexTasks];
+    const taskIndex = tasks.findIndex((task: CodexTask): boolean => task.id === threadId);
+    if (taskIndex >= 0 && tasks[taskIndex].status !== status) {
+      const task = this.cloneCodexTask(tasks[taskIndex]);
+      task.status = status;
+      tasks[taskIndex] = task;
+      this.codexTasks = tasks;
     }
   }
 
@@ -3206,6 +6373,36 @@ struct Index {
     return timestamp > 0 ? this.formatTimestamp(timestamp) : '时间未知';
   }
 
+  private visibleCodexActivities(): CodexActivity[] {
+    return this.selectedCodexActivities.slice(-20);
+  }
+
+  private latestCodexActivity(): CodexActivity {
+    if (this.selectedCodexActivities.length > 0) {
+      return this.selectedCodexActivities[this.selectedCodexActivities.length - 1];
+    }
+    const fallback = new CodexActivity();
+    fallback.title = '正在准备执行过程';
+    return fallback;
+  }
+
+  private codexActivityIcon(activity: CodexActivity): string {
+    if (activity.status === 'failed') return '×';
+    if (activity.status === 'running') return '◌';
+    if (activity.kind === 'reasoning') return '✦';
+    if (activity.kind === 'file') return '▧';
+    if (activity.kind === 'web') return '⌕';
+    if (activity.kind === 'image') return '◇';
+    return '✓';
+  }
+
+  private codexActivityColor(activity: CodexActivity): ResourceColor {
+    if (activity.status === 'failed') return '#FFD92D20';
+    if (activity.status === 'running') return '#FFB54708';
+    if (activity.kind === 'reasoning') return '#FF6941C6';
+    return '#FF067647';
+  }
+
   private visibleCodexMessages(): CodexMessage[] {
     return this.selectedCodexMessages.slice(-this.codexConversationLimit);
   }
@@ -3221,17 +6418,286 @@ struct Index {
     return `…${path.slice(path.length - 43)}`;
   }
 
+  private codexTaskUnreadCount(threadId: string): number {
+    if (threadId === this.selectedCodexTaskId) {
+      return this.codexUnreadMessages;
+    }
+    return this.codexUnreadCounts[threadId] ?? 0;
+  }
+
+  private codexUiKey(config: PairingConfig): string {
+    if (config.hasGateway() && config.targetDeviceId.length > 0) {
+      return this.gatewayCodexUiComputerKey(config.targetDeviceId);
+    }
+    return `lan:${config.host.trim()}:${config.port}`;
+  }
+
+  private gatewayCodexUiComputerKey(deviceId: string): string {
+    return deviceId.length > 0 ? `gateway:${deviceId}` : 'gateway:unselected';
+  }
+
+  private async activateCodexComputer(nextComputerKey: string): Promise<void> {
+    if (nextComputerKey === this.codexUiComputerKey) {
+      return;
+    }
+    const generation = this.codexComputerSwitchGeneration + 1;
+    this.codexComputerSwitchGeneration = generation;
+    const previousKey = this.codexUiComputerKey;
+    const previousState = this.currentCodexUiState();
+    if (this.codexUiStateSaveTimer >= 0) {
+      clearTimeout(this.codexUiStateSaveTimer);
+      this.codexUiStateSaveTimer = -1;
+    }
+    await codexUiStateStore.save(this.getContext(), previousKey, previousState);
+    if (generation !== this.codexComputerSwitchGeneration) {
+      return;
+    }
+    this.codexUiComputerKey = nextComputerKey;
+    this.resetCodexComputerView();
+    const state = await codexUiStateStore.load(this.getContext(), nextComputerKey);
+    if (generation !== this.codexComputerSwitchGeneration) {
+      return;
+    }
+    this.applyCodexUiState(state);
+    if (this.isConnected && this.selectedGatewayBridgeId.length > 0) {
+      this.codexLoading = true;
+      await remoteInputClient.requestCodexSnapshot();
+    }
+  }
+
+  private resetCodexComputerView(): void {
+    this.stopCodexAutoRefresh();
+    this.clearCodexDetailTimers();
+    this.codexAvailable = false;
+    this.codexError = '';
+    this.codexQuota = new CodexQuota();
+    this.codexTasks = [];
+    this.codexModels = [];
+    this.codexArchivedTasksLoaded = false;
+    this.codexCacheRestored = false;
+    this.selectedCodexTaskId = '';
+    this.selectedCodexTitle = '';
+    this.selectedCodexCwd = '';
+    this.selectedCodexArchived = false;
+    this.selectedCodexStatus = 'notLoaded';
+    this.selectedCodexActiveTurnId = '';
+    this.selectedCodexMessages = [];
+    this.selectedCodexActivities = [];
+    this.codexActivityExpanded = false;
+    this.pendingCodexThreadId = '';
+    this.isCodexConversationOpen = false;
+    this.codexUnreadMessages = 0;
+    this.codexCommand = '';
+    this.codexImagePreviewUri = '';
+    this.codexImageDataUrl = '';
+    this.codexImageMimeType = '';
+    this.codexLoading = false;
+    this.restoredCodexTaskId = '';
+    this.codexLastSeenMessageIds = {};
+    this.codexUnreadCounts = {};
+    this.pinnedCodexThreadIds = [];
+    this.closeCodexTaskMenu();
+    this.codexResolvedStatuses.clear();
+    this.clearApprovalSecondConfirmTimer();
+    this.approvalId = '';
+    this.approvalSecondConfirm = false;
+  }
+
+  private handleGatewayDeviceTap(device: GatewayPeerDevice): void {
+    this.gatewayDeviceName = device.displayName;
+    this.gatewayRevokeConfirm = false;
+    if (device.deviceId === this.selectedGatewayBridgeId) {
+      this.clearGatewaySwitchConfirmTimer();
+      this.gatewaySwitchConfirmId = '';
+      return;
+    }
+    if (this.gatewaySwitchConfirmId !== device.deviceId) {
+      this.clearGatewaySwitchConfirmTimer();
+      this.gatewaySwitchConfirmId = device.deviceId;
+      this.statusText = device.online ? '再次点击这台电脑确认切换' :
+        '这台电脑当前离线；再次点击后切换，消息会等待它上线';
+      this.statusIsError = !device.online;
+      this.gatewaySwitchConfirmTimer = setTimeout(() => {
+        this.gatewaySwitchConfirmTimer = -1;
+        this.gatewaySwitchConfirmId = '';
+      }, 8000);
+      return;
+    }
+    this.clearGatewaySwitchConfirmTimer();
+    this.gatewaySwitchConfirmId = '';
+    remoteInputClient.selectGatewayDevice(device.deviceId);
+    this.statusText = device.online ? '已切换电脑，正在同步任务…' :
+      '已切换到离线电脑，消息将在它上线后发送';
+    this.statusIsError = false;
+  }
+
+  private clearGatewaySwitchConfirmTimer(): void {
+    if (this.gatewaySwitchConfirmTimer >= 0) {
+      clearTimeout(this.gatewaySwitchConfirmTimer);
+      this.gatewaySwitchConfirmTimer = -1;
+    }
+  }
+
+  private selectedGatewayDevice(): GatewayPeerDevice | undefined {
+    return this.visibleGatewayDevices().find(
+      (device: GatewayPeerDevice): boolean => device.deviceId === this.selectedGatewayBridgeId);
+  }
+
+  private visibleGatewayDevices(): GatewayPeerDevice[] {
+    if (this.gatewayBridgeDevices.length > 0 || this.selectedGatewayBridgeId.length === 0) {
+      return this.gatewayBridgeDevices;
+    }
+    const selected = new GatewayPeerDevice();
+    selected.deviceId = this.selectedGatewayBridgeId;
+    selected.online = this.isConnected;
+    return [selected];
+  }
+
+  private selectedGatewayDeviceOnline(): boolean {
+    return this.selectedGatewayDevice()?.online ?? false;
+  }
+
+  private selectedGatewayDeviceStatusText(): string {
+    const device = this.selectedGatewayDevice();
+    if (this.activeConnectionTransport === 'lan') {
+      const lanName = device?.displayName || this.gatewayDeviceName || '当前电脑';
+      return `当前电脑：${lanName} · 局域网直连`;
+    }
+    if (device === undefined) {
+      return this.isConnected ? '当前电脑：局域网电脑 · 在线' : '尚未选择电脑';
+    }
+    const name = device.displayName || device.deviceId;
+    if (device.online) {
+      return `当前电脑：${name} · 在线`;
+    }
+    if (device.lastSeenAt <= 0) {
+      return `当前电脑：${name} · 离线`;
+    }
+    const elapsedSeconds = Math.max(0, Math.floor(Date.now() / 1000) - device.lastSeenAt);
+    if (elapsedSeconds < 60) {
+      return `当前电脑：${name} · 刚刚离线`;
+    }
+    if (elapsedSeconds < 3600) {
+      return `当前电脑：${name} · ${Math.floor(elapsedSeconds / 60)} 分钟前在线`;
+    }
+    return `当前电脑：${name} · ${Math.floor(elapsedSeconds / 3600)} 小时前在线`;
+  }
+
+  private gatewaySwitchConfirmationText(): string {
+    const device = this.gatewayBridgeDevices.find(
+      (item: GatewayPeerDevice): boolean => item.deviceId === this.gatewaySwitchConfirmId);
+    if (device === undefined) {
+      return '';
+    }
+    const name = device.displayName || device.deviceId;
+    return device.online ? `再次点击“${name}”确认切换` :
+      `“${name}”当前离线；再次点击仍可切换并等待上线`;
+  }
+
+  private async renameSelectedGatewayDevice(): Promise<void> {
+    if (this.selectedGatewayBridgeId.length === 0) {
+      return;
+    }
+    const ok = await remoteInputClient.renameGatewayDevice(
+      this.selectedGatewayBridgeId, this.gatewayDeviceName);
+    this.statusText = ok ? '电脑名称已保存' : '保存电脑名称失败';
+    this.statusIsError = !ok;
+  }
+
+  private async revokeSelectedGatewayDevice(): Promise<void> {
+    if (this.selectedGatewayBridgeId.length === 0) {
+      return;
+    }
+    if (!this.gatewayRevokeConfirm) {
+      this.gatewayRevokeConfirm = true;
+      this.statusText = '再次点按“撤销设备”确认';
+      return;
+    }
+    const ok = await remoteInputClient.revokeGatewayDevice(this.selectedGatewayBridgeId);
+    this.gatewayRevokeConfirm = false;
+    this.statusText = ok ? '已撤销这台电脑' : '撤销设备失败';
+    this.statusIsError = !ok;
+  }
+
+  private mergeLanPairing(lanConfig: PairingConfig): PairingConfig {
+    const merged = this.readConfigFromForm();
+    merged.host = lanConfig.host.trim();
+    merged.port = lanConfig.port;
+    merged.token = lanConfig.token;
+    merged.mode = merged.hasGateway() ? 'auto' : 'lan';
+    return merged;
+  }
+
+  private mergeGatewayPairing(gatewayConfig: PairingConfig): PairingConfig {
+    const merged = this.readConfigFromForm();
+    merged.gatewayUrl = gatewayConfig.gatewayUrl;
+    merged.gatewayToken = gatewayConfig.gatewayToken;
+    merged.pairingId = gatewayConfig.pairingId;
+    merged.deviceId = gatewayConfig.deviceId;
+    merged.targetDeviceId = gatewayConfig.targetDeviceId;
+    merged.lastReceivedSeq = gatewayConfig.lastReceivedSeq;
+    merged.gatewaySendCounter = gatewayConfig.gatewaySendCounter;
+    merged.gatewayPeerCounter = gatewayConfig.gatewayPeerCounter;
+    merged.gatewayPeerCounters = gatewayConfig.gatewayPeerCounters;
+    merged.gatewayPrivateKey = gatewayConfig.gatewayPrivateKey;
+    merged.gatewayPublicKey = gatewayConfig.gatewayPublicKey;
+    merged.gatewayPeerPublicKeys = gatewayConfig.gatewayPeerPublicKeys;
+    merged.gatewaySessionToken = gatewayConfig.gatewaySessionToken;
+    merged.gatewayDeviceCredential = gatewayConfig.gatewayDeviceCredential;
+    merged.mode = merged.hasLan() ? 'auto' : 'gateway';
+    return merged;
+  }
+
   private readConfigFromForm(): PairingConfig {
     const config = new PairingConfig();
+    config.mode = this.connectionMode;
     config.host = this.host.trim();
     config.port = Number(this.portText);
     config.token = this.token;
+    config.gatewayUrl = this.gatewayUrl;
+    config.gatewayToken = this.gatewayToken;
+    config.pairingId = this.gatewayPairingId;
+    config.deviceId = this.phoneDeviceId;
+    config.targetDeviceId = this.selectedGatewayBridgeId;
+    config.lastReceivedSeq = this.gatewayLastReceivedSeq;
+    config.gatewaySendCounter = this.gatewaySendCounter;
+    config.gatewayPeerCounter = this.gatewayPeerCounter;
+    try {
+      config.gatewayPeerCounters = JSON.parse(this.gatewayPeerCountersJson) as Record<string, number>;
+    } catch (_error) {
+      config.gatewayPeerCounters = {};
+    }
+    config.gatewayPrivateKey = this.gatewayPrivateKey;
+    config.gatewayPublicKey = this.gatewayPublicKey;
+    try {
+      config.gatewayPeerPublicKeys = JSON.parse(
+        this.gatewayPeerPublicKeysJson) as Record<string, string>;
+    } catch (_error) {
+      config.gatewayPeerPublicKeys = {};
+    }
+    config.gatewaySessionToken = this.gatewaySessionToken;
+    config.gatewayDeviceCredential = this.gatewayDeviceCredential;
     return config;
   }
 
   private applyConfig(config: PairingConfig): void {
+    this.connectionMode = config.mode;
     this.host = config.host;
     this.portText = config.port.toString();
     this.token = config.token;
+    this.gatewayUrl = config.gatewayUrl;
+    this.gatewayToken = config.gatewayToken;
+    this.gatewayPairingId = config.pairingId;
+    this.phoneDeviceId = config.deviceId;
+    this.selectedGatewayBridgeId = config.targetDeviceId;
+    this.gatewayLastReceivedSeq = config.lastReceivedSeq;
+    this.gatewaySendCounter = config.gatewaySendCounter;
+    this.gatewayPeerCounter = config.gatewayPeerCounter;
+    this.gatewayPeerCountersJson = JSON.stringify(config.gatewayPeerCounters);
+    this.gatewayPrivateKey = config.gatewayPrivateKey;
+    this.gatewayPublicKey = config.gatewayPublicKey;
+    this.gatewayPeerPublicKeysJson = JSON.stringify(config.gatewayPeerPublicKeys);
+    this.gatewaySessionToken = config.gatewaySessionToken;
+    this.gatewayDeviceCredential = config.gatewayDeviceCredential;
   }
 }

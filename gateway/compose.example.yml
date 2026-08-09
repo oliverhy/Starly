@@ -1,0 +1,14 @@
+services:
+  starly-gateway:
+    build: .
+    restart: unless-stopped
+    environment:
+      STARLY_GATEWAY_HOST: 0.0.0.0
+      STARLY_GATEWAY_PORT: 8780
+      STARLY_GATEWAY_DATA: /data
+      STARLY_GATEWAY_PAIRINGS: /data/pairings.json
+    volumes:
+      - ./data:/data
+    # 生产环境只让反向代理访问 8780，不要直接暴露明文 WebSocket。
+    ports:
+      - "127.0.0.1:8780:8780"

@@ -18,6 +18,7 @@ from PIL import Image
 JsonObject = dict[str, Any]
 EventCallback = Callable[[str, JsonObject], Awaitable[None]]
 LOCAL_DETAIL_MESSAGE_LIMIT = 15
+LOCAL_ACTIVITY_LIMIT = 30
 THREAD_ID_PATTERN = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 
@@ -67,11 +68,13 @@ def normalize_thread(thread: JsonObject) -> JsonObject:
         "status": _status_type(thread.get("status")),
         "cwd": cwd,
         "updatedAt": int(thread.get("updatedAt", 0) or 0),
+        "archived": bool(thread.get("archived", False)),
     }
 
 
 def normalize_snapshot(rate_response: JsonObject, usage_response: JsonObject,
-                       thread_response: JsonObject) -> JsonObject:
+                       thread_response: JsonObject,
+                       model_response: JsonObject | None = None) -> JsonObject:
     limits = rate_response.get("rateLimits")
     limits = limits if isinstance(limits, dict) else {}
     primary = limits.get("primary")
@@ -91,6 +94,8 @@ def normalize_snapshot(rate_response: JsonObject, usage_response: JsonObject,
     raw_threads = thread_response.get("data")
     raw_threads = raw_threads if isinstance(raw_threads, list) else []
     threads = [normalize_thread(item) for item in raw_threads if isinstance(item, dict)]
+    raw_models = (model_response or {}).get("data")
+    models = raw_models if isinstance(raw_models, list) else []
     return {
         "available": True,
         "error": "",
@@ -107,6 +112,7 @@ def normalize_snapshot(rate_response: JsonObject, usage_response: JsonObject,
             "lifetimeTokens": int(usage.get("lifetimeTokens", 0) or 0),
         },
         "threads": threads,
+        "models": [item for item in models if isinstance(item, dict) and not item.get("hidden")],
     }
 
 
@@ -226,6 +232,139 @@ def _timestamp_value(value: object) -> int:
         return 0
 
 
+def _redact_activity_text(value: object, limit: int = 600) -> str:
+    """Keep public progress summaries useful without relaying likely secrets."""
+    text = str(value or "").strip()
+    text = re.sub(r"-----BEGIN [^-]+PRIVATE KEY-----.*?-----END [^-]+PRIVATE KEY-----",
+                  "[已隐藏私钥]", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [已隐藏]", text,
+                  flags=re.IGNORECASE)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[已隐藏密钥]", text)
+    text = re.sub(
+        r"(?i)\b(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+",
+        lambda match: f"{match.group(1)}=[已隐藏]", text)
+    return text[:limit]
+
+
+def _tool_display_name(value: object) -> str:
+    name = str(value or "").strip().lower()
+    labels = {
+        "exec": "执行本地操作",
+        "wait": "等待后台任务",
+        "apply_patch": "修改文件",
+        "view_image": "查看图片",
+        "web_search": "搜索网页",
+        "imagegen": "生成图片",
+    }
+    return labels.get(name, "调用工具")
+
+
+def _rollout_activity(record: JsonObject, raw_line: bytes,
+                      completed_calls: set[str]) -> JsonObject | None:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    payload_type = str(payload.get("type", ""))
+    call_id = str(payload.get("call_id", ""))
+    timestamp = _timestamp_value(record.get("timestamp"))
+    turn_id = str(payload.get("turn_id", ""))
+    title = ""
+    text = ""
+    kind = "tool"
+    status = "completed"
+    if payload_type == "agent_reasoning":
+        text = _redact_activity_text(payload.get("text"))
+        if not text:
+            return None
+        title = "思考摘要"
+        kind = "reasoning"
+    elif payload_type in ("custom_tool_call", "function_call"):
+        title = _tool_display_name(payload.get("name"))
+        kind = "tool"
+        status = "completed" if call_id in completed_calls or \
+            str(payload.get("status", "")) == "completed" else "running"
+    elif payload_type == "patch_apply_end":
+        changes = payload.get("changes")
+        names: list[str] = []
+        if isinstance(changes, dict):
+            names = [Path(str(path)).name for path in list(changes.keys())[:6]]
+        title = "文件修改完成" if bool(payload.get("success", False)) else "文件修改失败"
+        text = "、".join(name for name in names if name)
+        kind = "file"
+        status = "completed" if bool(payload.get("success", False)) else "failed"
+    elif payload_type == "web_search_end":
+        title = "网页搜索完成"
+        kind = "web"
+    elif payload_type == "mcp_tool_call_end":
+        title = "外部工具调用完成"
+        kind = "tool"
+    elif payload_type == "image_generation_end":
+        title = "图片生成完成"
+        kind = "image"
+    else:
+        return None
+    return {
+        "id": hashlib.sha1(raw_line).hexdigest()[:24],
+        "kind": kind,
+        "title": title,
+        "text": text,
+        "status": status,
+        "timestamp": timestamp,
+        "turnId": turn_id,
+    }
+
+
+def _recent_rollout_activities(path: Path,
+                               limit: int = LOCAL_ACTIVITY_LIMIT) -> list[JsonObject]:
+    """Return public activity for the latest turn; never expose tool I/O or encrypted reasoning."""
+    newest_first: list[JsonObject] = []
+    completed_calls: set[str] = set()
+    saw_latest_turn = False
+    scanned = 0
+    for raw_line in _reverse_jsonl_lines(path):
+        scanned += 1
+        if scanned > 20_000:
+            break
+        try:
+            record = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        payload_type = str(payload.get("type", ""))
+        if payload_type in ("custom_tool_call_output", "function_call_output"):
+            call_id = str(payload.get("call_id", ""))
+            if call_id:
+                completed_calls.add(call_id)
+            continue
+        if payload_type in ("task_complete", "turn_aborted"):
+            saw_latest_turn = True
+            continue
+        if payload_type == "task_started":
+            if saw_latest_turn or newest_first:
+                break
+            saw_latest_turn = True
+            continue
+        activity = _rollout_activity(record, raw_line, completed_calls)
+        if activity is not None:
+            newest_first.append(activity)
+            saw_latest_turn = True
+    chronological = list(reversed(newest_first))
+    if len(chronological) <= limit:
+        return chronological
+    # Tool-heavy turns can otherwise push every reasoning summary out of the
+    # phone window. Reserve up to half the window for public reasoning, then
+    # fill the rest with the newest operational events while preserving order.
+    reasoning = [item for item in chronological if item.get("kind") == "reasoning"][-limit // 2:]
+    reasoning_ids = {str(item.get("id", "")) for item in reasoning}
+    remaining = limit - len(reasoning)
+    operational = [item for item in chronological
+                   if str(item.get("id", "")) not in reasoning_ids][-remaining:]
+    selected_ids = {str(item.get("id", "")) for item in reasoning + operational}
+    return [item for item in chronological if str(item.get("id", "")) in selected_ids]
+
+
 def _reverse_jsonl_lines(path: Path, chunk_size: int = 256 * 1024):
     """Yield a JSONL file from newest to oldest without loading it into memory."""
     with path.open("rb") as handle:
@@ -302,6 +441,53 @@ def _rollout_user_message(payload: JsonObject) -> tuple[str, list[str]]:
     if text.startswith(ignored_prefixes):
         text = ""
     return text, images + inline_images
+
+
+def _latest_rollout_settings(path: Path, max_records: int = 20_000) -> JsonObject:
+    """Read the settings that the desktop actually used for the latest turn."""
+    scanned = 0
+    for raw_line in _reverse_jsonl_lines(path):
+        scanned += 1
+        if scanned > max_records:
+            break
+        if b'"type":"turn_context"' not in raw_line and b'"type": "turn_context"' not in raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        payload = record.get("payload")
+        record_type = str(record.get("type", ""))
+        payload_type = str(payload.get("type", "")) if isinstance(payload, dict) else ""
+        if not isinstance(payload, dict) or \
+                (record_type != "turn_context" and payload_type != "turn_context"):
+            continue
+        collaboration = payload.get("collaboration_mode")
+        collaboration_settings = collaboration.get("settings") \
+            if isinstance(collaboration, dict) else {}
+        collaboration_settings = collaboration_settings \
+            if isinstance(collaboration_settings, dict) else {}
+        sandbox = payload.get("sandbox_policy")
+        sandbox = sandbox if isinstance(sandbox, dict) else {}
+        sandbox_type = re.sub(r"[^a-z]", "", str(sandbox.get("type", "")).lower())
+        approval_policy = str(payload.get("approval_policy", "")).lower()
+        if sandbox_type == "dangerfullaccess":
+            permission_mode = "fullAccess"
+        elif sandbox_type == "readonly":
+            permission_mode = "readOnly"
+        elif sandbox_type == "workspacewrite" and approval_policy == "never":
+            permission_mode = "autoApprove"
+        else:
+            permission_mode = "default"
+        return {
+            "model": str(payload.get("model", collaboration_settings.get("model", ""))),
+            "effort": str(payload.get(
+                "effort", collaboration_settings.get("reasoning_effort", ""))),
+            "permissionMode": permission_mode,
+            "serviceTier": str(payload.get(
+                "service_tier", payload.get("serviceTier", ""))),
+        }
+    return {}
 
 
 def read_rollout_thread_detail(thread_id: str,
@@ -399,11 +585,15 @@ def read_rollout_thread_detail(thread_id: str,
         "status": status,
         "cwd": meta.get("cwd", ""),
         "updatedAt": meta.get("updatedAt", 0),
+        "archived": meta.get("archived", False),
     })
     normalized["messages"] = messages
+    normalized["activities"] = _recent_rollout_activities(path)
     normalized["activeTurnId"] = latest_turn_id if status == "active" else ""
     normalized["hasMoreBefore"] = has_more_before
     normalized["updateMode"] = "older" if before_message_id else "latest"
+    normalized["rolloutEvent"] = latest_task_event
+    normalized.update(_latest_rollout_settings(path))
     return normalized
 
 
@@ -420,6 +610,7 @@ class CodexAppServerClient:
         self.thread_locks: dict[str, asyncio.Lock] = {}
         self.thread_status: dict[str, str] = {}
         self.thread_metadata: dict[str, JsonObject] = {}
+        self.approval_requests: dict[str, tuple[int, str, JsonObject]] = {}
 
     async def start(self) -> None:
         if self.process and self.process.returncode is None:
@@ -472,6 +663,7 @@ class CodexAppServerClient:
             if not future.done():
                 future.set_exception(restart_error)
         self.pending.clear()
+        self.approval_requests.clear()
 
     async def request(self, method: str, params: JsonObject | None = None,
                       timeout: float = 15) -> JsonObject:
@@ -487,20 +679,39 @@ class CodexAppServerClient:
         finally:
             self.pending.pop(request_id, None)
 
-    async def snapshot(self) -> JsonObject:
+    async def snapshot(self, include_archived: bool = False) -> JsonObject:
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                rate, usage, threads = await asyncio.gather(
+                requests = [
                     self.request("account/rateLimits/read"),
                     self.request("account/usage/read"),
                     self.request("thread/list", {"limit": 30, "archived": False}),
-                )
-                snapshot = normalize_snapshot(rate, usage, threads)
+                    self.request("model/list", {"limit": 50, "includeHidden": False}),
+                ]
+                if include_archived:
+                    requests.append(self.request(
+                        "thread/list", {"limit": 30, "archived": True}))
+                responses = await asyncio.gather(*requests)
+                rate, usage, threads, models = responses[:4]
+                snapshot = normalize_snapshot(rate, usage, threads, models)
+                for thread in snapshot["threads"]:
+                    thread["archived"] = False
+                if include_archived and len(responses) > 4:
+                    archived_snapshot = normalize_snapshot({}, {}, responses[4])
+                    for thread in archived_snapshot["threads"]:
+                        thread["archived"] = True
+                    known_ids = {str(thread.get("id", "")) for thread in snapshot["threads"]}
+                    snapshot["threads"].extend(
+                        thread for thread in archived_snapshot["threads"]
+                        if str(thread.get("id", "")) not in known_ids)
                 for thread in snapshot["threads"]:
                     thread_id = str(thread.get("id", ""))
                     if thread_id:
                         self.thread_metadata[thread_id] = dict(thread)
+                await self._reconcile_snapshot_thread_statuses(snapshot["threads"])
+                for thread in snapshot["threads"]:
+                    thread_id = str(thread.get("id", ""))
                     if thread_id in self.thread_status:
                         thread["status"] = self.thread_status[thread_id]
                 return snapshot
@@ -516,6 +727,43 @@ class CodexAppServerClient:
         if not error_text and last_error is not None:
             error_text = type(last_error).__name__
         return {"available": False, "error": error_text, "quota": {}, "threads": []}
+
+    async def _reconcile_snapshot_thread_statuses(
+            self, threads: list[JsonObject]) -> None:
+        """Resolve unknown/stale list states from the append-only rollout."""
+        candidates: list[tuple[JsonObject, str]] = []
+        for thread in threads:
+            thread_id = str(thread.get("id", ""))
+            if not thread_id:
+                continue
+            listed_status = str(thread.get("status", "notLoaded"))
+            if listed_status in ("idle", "systemError"):
+                # A terminal app-server list result is already authoritative
+                # and must replace an old phone/bridge-side active cache.
+                self.thread_status[thread_id] = listed_status
+            elif listed_status in ("active", "notLoaded") or \
+                    self.thread_status.get(thread_id) == "active":
+                candidates.append((thread, thread_id))
+        if not candidates:
+            return
+        details = await asyncio.gather(*(
+            asyncio.to_thread(
+                read_rollout_thread_detail, thread_id,
+                self.thread_metadata.get(thread_id))
+            for _, thread_id in candidates
+        ))
+        for (thread, thread_id), detail in zip(candidates, details):
+            if detail is None:
+                continue
+            persisted_status = str(detail.get("status", "notLoaded"))
+            persisted_updated_at = int(detail.get("updatedAt", 0) or 0)
+            listed_updated_at = int(thread.get("updatedAt", 0) or 0)
+            # A previous rollout can still exist for a brand-new turn for a
+            # brief moment. Only accept history at least as recent as the list
+            # entry. This also resolves notLoaded after a Bridge restart, when
+            # no in-memory active cache exists to trigger the old reconciliation.
+            if persisted_status != "notLoaded" and persisted_updated_at >= listed_updated_at:
+                self.thread_status[thread_id] = persisted_status
 
     async def thread_detail(self, thread_id: str, before_message_id: str = "",
                             limit: int = LOCAL_DETAIL_MESSAGE_LIMIT) -> JsonObject:
@@ -584,6 +832,7 @@ class CodexAppServerClient:
                             "turnId": str(turn.get("id", "")),
                         })
         normalized["messages"] = messages
+        normalized["activities"] = []
         normalized["activeTurnId"] = active_turn_id
         if active_turn_id:
             normalized["status"] = "active"
@@ -612,7 +861,9 @@ class CodexAppServerClient:
         payload["updateMode"] = "older" if before_message_id else "latest"
         return payload
 
-    async def send_message(self, thread_id: str, text: str) -> JsonObject:
+    async def send_message(self, thread_id: str, text: str, model: str = "",
+                           effort: str = "", permission_mode: str = "default",
+                           image_data_url: str = "", service_tier: str = "") -> JsonObject:
         # thread/list and thread/read can see persisted history without loading
         # it into this app-server process. turn/start only accepts a running or
         # resumed thread, so restore the selected history first.
@@ -622,7 +873,16 @@ class CodexAppServerClient:
             if not isinstance(thread, dict):
                 raise RuntimeError("Codex 没有返回恢复后的任务")
             detail = self._normalize_thread_detail(thread)
-            input_items = [{"type": "text", "text": text}]
+            input_items: list[JsonObject] = []
+            if text:
+                input_items.append({"type": "text", "text": text})
+            if image_data_url:
+                input_items.append({"type": "image", "url": image_data_url})
+            settings = self._turn_settings(model, effort, permission_mode, service_tier)
+            if settings:
+                await self.request("thread/settings/update", {
+                    "threadId": thread_id, **settings,
+                }, timeout=30)
             active_turn_id = str(detail.get("activeTurnId", ""))
             if active_turn_id:
                 result = await self.request("turn/steer", {
@@ -634,9 +894,74 @@ class CodexAppServerClient:
                 result = await self.request("turn/start", {
                     "threadId": thread_id,
                     "input": input_items,
+                    **settings,
                 }, timeout=30)
             self.thread_status[thread_id] = "active"
             return result
+
+    async def create_thread(self, cwd: str, text: str, model: str = "",
+                            effort: str = "", permission_mode: str = "default",
+                            service_tier: str = "", image_data_url: str = "") -> JsonObject:
+        settings = self._turn_settings(model, effort, permission_mode, service_tier)
+        thread_settings: JsonObject = {
+            "cwd": cwd,
+            "approvalPolicy": settings.get("approvalPolicy", "on-request"),
+            "sandbox": self._thread_sandbox(permission_mode),
+        }
+        if model:
+            thread_settings["model"] = model
+        response = await self.request("thread/start", thread_settings, timeout=30)
+        thread = response.get("thread")
+        if not isinstance(thread, dict) or not str(thread.get("id", "")):
+            raise RuntimeError("Codex 没有返回新任务编号")
+        thread_id = str(thread["id"])
+        input_items: list[JsonObject] = [{"type": "text", "text": text}]
+        if image_data_url:
+            input_items.append({"type": "image", "url": image_data_url})
+        await self.request("turn/start", {
+            "threadId": thread_id,
+            "input": input_items,
+            **settings,
+        }, timeout=30)
+        normalized = normalize_thread(thread)
+        normalized["cwd"] = cwd
+        normalized["status"] = "active"
+        self.thread_metadata[thread_id] = normalized
+        self.thread_status[thread_id] = "active"
+        return {"threadId": thread_id, "thread": normalized}
+
+    @staticmethod
+    def _thread_sandbox(permission_mode: str) -> str:
+        if permission_mode == "readOnly":
+            return "read-only"
+        if permission_mode == "fullAccess":
+            return "danger-full-access"
+        return "workspace-write"
+
+    @staticmethod
+    def _turn_settings(model: str, effort: str, permission_mode: str,
+                       service_tier: str = "") -> JsonObject:
+        settings: JsonObject = {}
+        if model:
+            settings["model"] = model
+        if effort:
+            settings["effort"] = effort
+        if service_tier:
+            settings["serviceTier"] = service_tier
+        if permission_mode == "readOnly":
+            settings["approvalPolicy"] = "on-request"
+            settings["sandboxPolicy"] = {"type": "readOnly", "networkAccess": False}
+        elif permission_mode == "fullAccess":
+            settings["approvalPolicy"] = "never"
+            settings["sandboxPolicy"] = {"type": "dangerFullAccess"}
+        elif permission_mode == "autoApprove":
+            settings["approvalPolicy"] = "never"
+            settings["sandboxPolicy"] = {
+                "type": "workspaceWrite", "networkAccess": False,
+                "writableRoots": [], "excludeTmpdirEnvVar": False,
+                "excludeSlashTmp": False,
+            }
+        return settings
 
     def _thread_lock(self, thread_id: str) -> asyncio.Lock:
         lock = self.thread_locks.get(thread_id)
@@ -647,6 +972,38 @@ class CodexAppServerClient:
 
     async def interrupt(self, thread_id: str, turn_id: str) -> JsonObject:
         return await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+
+    async def set_archived(self, thread_id: str, archived: bool) -> None:
+        method = "thread/archive" if archived else "thread/unarchive"
+        await self.request(method, {"threadId": thread_id}, timeout=30)
+        metadata = self.thread_metadata.get(thread_id)
+        if metadata is not None:
+            metadata["archived"] = archived
+
+    async def rename_thread(self, thread_id: str, name: str) -> None:
+        await self.request(
+            "thread/name/set", {"threadId": thread_id, "name": name}, timeout=30)
+        metadata = self.thread_metadata.get(thread_id)
+        if metadata is not None:
+            metadata["name"] = name
+            metadata["title"] = name
+
+    async def resolve_approval(self, approval_id: str, decision: str,
+                               permissions: JsonObject | None = None) -> None:
+        approval = self.approval_requests.pop(approval_id, None)
+        if approval is None:
+            raise RuntimeError("审批请求已失效或已处理")
+        request_id, method, requested_permissions = approval
+        if decision not in ("accept", "acceptForSession", "decline", "cancel"):
+            raise RuntimeError("审批决定无效")
+        if method == "item/permissions/requestApproval":
+            accepted_permissions = permissions if permissions is not None else requested_permissions
+            result: JsonObject = {
+                "permissions": accepted_permissions if decision.startswith("accept") else {}
+            }
+        else:
+            result = {"decision": decision}
+        await self._write({"id": request_id, "result": result})
 
     async def release_thread(self, thread_id: str) -> None:
         try:
@@ -691,17 +1048,23 @@ class CodexAppServerClient:
             if method and isinstance(params, dict):
                 self._track_status(method, params)
             if request_id is not None and method:
-                if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-                    await self._write({"id": request_id, "result": {"decision": "decline"}})
-                elif method == "item/permissions/requestApproval":
-                    await self._write({"id": request_id, "result": {"permissions": {}}})
+                if method in ("item/commandExecution/requestApproval",
+                              "item/fileChange/requestApproval",
+                              "item/permissions/requestApproval"):
+                    approval_id = f"approval-{request_id}"
+                    requested = params.get("permissions")
+                    self.approval_requests[approval_id] = (
+                        int(request_id), method, dict(requested) if isinstance(requested, dict) else {})
+                    event_params = dict(params)
+                    event_params["approvalId"] = approval_id
+                    event_params["approvalMethod"] = method
+                    if self.event_callback:
+                        asyncio.create_task(self.event_callback(method, event_params))
                 else:
                     await self._write({
                         "id": request_id,
                         "error": {"code": -32001, "message": "Starly 暂不支持此交互确认，请在电脑端完成"},
                     })
-                if isinstance(params, dict) and self.event_callback:
-                    asyncio.create_task(self.event_callback(method, params))
                 continue
             if method and isinstance(params, dict) and self.event_callback:
                 # Notifications may arrive before the response to turn/start.

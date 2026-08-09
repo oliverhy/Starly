@@ -1,0 +1,5 @@
+{
+  "replace-with-random-pairing-id": {
+    "token": "replace-with-at-least-32-random-characters"
+  }
+}

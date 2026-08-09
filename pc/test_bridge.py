@@ -11,10 +11,15 @@ from pathlib import Path
 from ctypes import wintypes
 from unittest import mock
 
-from pc.starly_bridge import (BridgeConfig, BridgeServer, CODEX_COMPOSER_FOCUS_SCRIPT,
+from pc.starly_bridge import (BridgeApp, BridgeConfig, BridgeServer, CODEX_COMPOSER_FOCUS_SCRIPT,
+                              CODEX_COMPOSER_SETTINGS_SCRIPT,
                               DEFAULT_DISCOVERY_PORT, DISCOVERY_PROTOCOL_VERSION,
                               DiscoveryProtocol, MAX_IMAGE_BYTES, MAX_TEXT_LENGTH,
-                              WindowsInput, find_available_port)
+                              WindowsInput, desktop_effort_labels,
+                              desktop_model_labels, desktop_permission_labels,
+                              desktop_speed_labels, find_available_port,
+                              format_paired_devices, normalize_approval,
+                              normalize_gateway_url)
 from pc.codex_client import (CodexAppServerClient, _item_content, normalize_snapshot,
                              normalize_thread, read_rollout_thread_detail)
 
@@ -28,9 +33,94 @@ class FakeConnection:
 
 
 class BridgeProtocolTests(unittest.TestCase):
+    def test_open_log_location_opens_bridge_config_directory(self) -> None:
+        app = BridgeApp.__new__(BridgeApp)
+        app.root = object()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir) / "StarlyBridge"
+            with mock.patch("pc.starly_bridge.CONFIG_DIR", log_dir), \
+                    mock.patch("pc.starly_bridge.os.startfile") as startfile:
+                app.open_log_location()
+
+            self.assertTrue(log_dir.is_dir())
+            startfile.assert_called_once_with(str(log_dir))
+
+    def test_paired_device_summary_includes_gateway_online_and_offline_phones(self) -> None:
+        summary = format_paired_devices({"192.168.2.71:37287"}, {
+            "phone-1": {"displayName": "新手机", "online": True},
+            "phone-2": {"displayName": "备用手机", "online": False},
+        })
+        self.assertIn("已配对 3 部手机 · 在线 2 部", summary)
+        self.assertIn("192.168.2.71:37287 · 局域网在线", summary)
+        self.assertIn("新手机 · 公网在线", summary)
+        self.assertIn("备用手机 · 公网已配对（离线）", summary)
+
+    def test_paired_device_summary_deduplicates_same_phone_across_channels(self) -> None:
+        summary = format_paired_devices({"phone-1"}, {
+            "phone-1": {"displayName": "主手机", "online": True},
+            "phone-2": {"displayName": "备用手机", "online": False},
+        })
+        self.assertIn("已配对 2 部手机 · 在线 1 部", summary)
+        self.assertIn("主手机 · 局域网在线 · 公网在线", summary)
+
+    def test_approval_normalization_extracts_nested_context(self) -> None:
+        approval = normalize_approval("item/commandExecution/requestApproval", {
+            "approvalId": "approval-1",
+            "item": {
+                "command": ["python", "-m", "unittest"],
+                "workingDirectory": r"C:\work\Starly",
+            },
+            "justification": "运行项目测试",
+        })
+        self.assertEqual(approval["command"], "python -m unittest")
+        self.assertEqual(approval["cwd"], r"C:\work\Starly")
+        self.assertEqual(approval["reason"], "运行项目测试")
+        self.assertEqual(approval["riskLevel"], "medium")
+        self.assertFalse(approval["highRisk"])
+
+    def test_approval_normalization_flags_destructive_and_permission_requests(self) -> None:
+        destructive = normalize_approval("item/commandExecution/requestApproval", {
+            "command": "Remove-Item -Recurse C:\\work\\cache",
+        })
+        write_command = normalize_approval("item/commandExecution/requestApproval", {
+            "command": "Set-Content C:\\Windows\\Temp\\probe.txt test",
+        })
+        permission = normalize_approval("item/permissions/requestApproval", {
+            "permissions": {"network": True, "fileSystem": "unrestricted"},
+        })
+        self.assertEqual(destructive["riskLevel"], "high")
+        self.assertTrue(destructive["highRisk"])
+        self.assertTrue(write_command["highRisk"])
+        self.assertEqual(permission["riskLevel"], "high")
+        self.assertIn("network=true", permission["permissionsSummary"])
+
     def test_token_is_delivery_strength(self) -> None:
         config = BridgeConfig()
         self.assertGreaterEqual(len(config.token), 32)
+        self.assertGreaterEqual(len(config.gateway_token), 32)
+
+    def test_gateway_token_can_be_separate_from_lan_token(self) -> None:
+        lan_token = "lan-token-with-at-least-32-characters"
+        gateway_token = "gateway-token-with-at-least-32-characters"
+        config = BridgeConfig(token=lan_token, gateway_token=gateway_token)
+        self.assertEqual(config.token, lan_token)
+        self.assertEqual(config.gateway_token, gateway_token)
+
+    def test_gateway_uses_persistent_random_device_identity(self) -> None:
+        config = BridgeConfig()
+        self.assertRegex(config.gateway_device_id, r"^bridge-[0-9a-f]{24}$")
+
+    def test_gateway_url_normalization_requires_secure_public_transport(self) -> None:
+        self.assertEqual(normalize_gateway_url("starly.example.com"),
+                         "wss://starly.example.com/ws")
+        self.assertEqual(normalize_gateway_url("wss://203.0.113.10:9443/"),
+                         "wss://203.0.113.10:9443/ws")
+        self.assertEqual(normalize_gateway_url("ws://127.0.0.1:8780/ws"),
+                         "ws://127.0.0.1:8780/ws")
+        with self.assertRaisesRegex(ValueError, "wss"):
+            normalize_gateway_url("ws://starly.example.com/ws")
+        with self.assertRaises(ValueError):
+            normalize_gateway_url("wss://user:secret@starly.example.com/ws")
 
     def test_pairing_code_has_exactly_six_digits(self) -> None:
         config = BridgeConfig()
@@ -163,24 +253,40 @@ class BridgeProtocolTests(unittest.TestCase):
         fake_input = FakeInput()
         server.input = fake_input
         with mock.patch("pc.starly_bridge.open_codex_thread", return_value=True) as opened, \
+                mock.patch("pc.starly_bridge.configure_codex_composer",
+                           return_value=(True, "configured")) as configured, \
                 mock.patch("pc.starly_bridge.focus_codex_composer",
                            return_value=(True, "focused")) as focused:
             ok, message = server._send_to_codex_desktop(
-                "thread-1", "指定任务", "继续处理这个要求", "ctrl_enter")
+                "thread-1", "指定任务", "继续处理这个要求", "ctrl_enter",
+                "gpt-5.6-sol", "high", "fullAccess", "fast")
 
         self.assertTrue(ok)
         self.assertIn("submitted", message)
         opened.assert_called_once_with("thread-1")
+        configured.assert_called_once_with("gpt-5.6-sol", "high", "fullAccess", "fast")
         focused.assert_called_once_with("指定任务")
         self.assertEqual(fake_input.received, ("继续处理这个要求", "ctrl_enter"))
 
-    def test_codex_composer_focus_does_not_require_workspace_title_in_header(self) -> None:
+    def test_codex_composer_focus_uses_real_control_bounds_before_coordinates(self) -> None:
         self.assertNotIn("$titleLoaded", CODEX_COMPOSER_FOCUS_SCRIPT)
-        self.assertIn("FocusedElement.Current", CODEX_COMPOSER_FOCUS_SCRIPT)
-        self.assertNotIn("TreeScope]::Descendants", CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertIn("TreeScope]::Descendants", CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertIn("ClassName -match '(^| )ProseMirror( |$)'",
+                      CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertIn("BoundingRectangle", CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertIn("IsOffscreen", CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertIn("@(0.35, 0.50, 0.62, 0.74)", CODEX_COMPOSER_FOCUS_SCRIPT)
+        self.assertNotIn("@(0.57, 0.70)", CODEX_COMPOSER_FOCUS_SCRIPT)
         self.assertNotIn("AutomationElement]::RootElement", CODEX_COMPOSER_FOCUS_SCRIPT)
 
-    def test_codex_send_falls_back_when_desktop_composer_is_unavailable(self) -> None:
+    def test_desktop_setting_labels_match_codex_choices(self) -> None:
+        self.assertIn("5.6 sol", [item.lower() for item in desktop_model_labels("gpt-5.6-sol")])
+        self.assertIn("High", desktop_effort_labels("high"))
+        self.assertIn("Full access", desktop_permission_labels("fullAccess"))
+        self.assertIn("Standard", desktop_speed_labels("standard"))
+        self.assertIn("Open model picker", CODEX_COMPOSER_SETTINGS_SCRIPT)
+
+    def test_codex_send_uses_background_mode_without_desktop_automation(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
         sent: list[tuple[str, str]] = []
         responses: list[dict[str, object]] = []
@@ -190,7 +296,8 @@ class BridgeProtocolTests(unittest.TestCase):
             async def thread_detail(self, _thread_id: str) -> dict[str, object]:
                 return {"title": "指定任务"}
 
-            async def send_message(self, thread_id: str, text: str) -> dict[str, object]:
+            async def send_message(self, thread_id: str, text: str,
+                                   *_args: object) -> dict[str, object]:
                 sent.append((thread_id, text))
                 return {}
 
@@ -203,7 +310,8 @@ class BridgeProtocolTests(unittest.TestCase):
 
         server.codex = FakeCodex()
         server.pending_desktop_open = set()
-        server._send_to_codex_desktop = lambda *_args: (False, "composer unavailable")
+        server._send_to_codex_desktop = mock.Mock(side_effect=AssertionError(
+            "background mode must not touch desktop UI"))
         server._send_json = fake_send_json
         server._schedule_codex_refresh = fake_refresh
 
@@ -213,8 +321,88 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(sent, [("thread-1", "继续处理")])
         self.assertIn("thread-1", server.pending_desktop_open)
         self.assertEqual(responses[0]["type"], "ack")
-        self.assertIn("后台可靠通道", str(responses[0]["message"]))
+        self.assertEqual(responses[0]["id"], "message-1")
+        self.assertEqual(responses[0]["operation"], "codex_send")
+        self.assertEqual(responses[0]["threadId"], "thread-1")
+        self.assertIn("默认后台通道", str(responses[0]["message"]))
         self.assertEqual(refreshes, 1)
+
+    def test_codex_desktop_mode_failure_never_falls_back(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        sent: list[tuple[str, str]] = []
+        responses: list[dict[str, object]] = []
+
+        class FakeCodex:
+            async def thread_detail(self, _thread_id: str) -> dict[str, object]:
+                return {"title": "指定任务"}
+
+            async def send_message(self, thread_id: str, text: str,
+                                   *_args: object) -> dict[str, object]:
+                sent.append((thread_id, text))
+                return {}
+
+        async def fake_send_json(_connection: object, message: dict[str, object]) -> None:
+            responses.append(message)
+
+        async def fake_send_error(_connection: object, message: str,
+                                  message_id: str = "") -> None:
+            responses.append({"type": "error", "id": message_id, "message": message})
+
+        server.codex = FakeCodex()
+        server._send_to_codex_desktop = lambda *_args: (False, "composer unavailable")
+        server._send_json = fake_send_json
+        server._send_error = fake_send_error
+
+        asyncio.run(server._codex_send(
+            object(), "thread-1", "继续处理", "enter", "message-1",
+            delivery_mode="desktop"))
+
+        self.assertEqual(sent, [])
+        self.assertEqual(responses[0]["type"], "error")
+        self.assertIn("桌面输入框发送失败", str(responses[0]["message"]))
+
+    def test_codex_image_desktop_mode_pastes_image_with_selected_settings(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        responses: list[dict[str, object]] = []
+        desktop_calls: list[tuple[object, ...]] = []
+        watched: list[str] = []
+
+        class FakeCodex:
+            async def thread_detail(self, _thread_id: str) -> dict[str, object]:
+                return {"title": "图片任务"}
+
+            async def send_message(self, *_args: object) -> dict[str, object]:
+                raise AssertionError("desktop image mode must not use the background server")
+
+        async def fake_send_json(_connection: object, message: dict[str, object]) -> None:
+            responses.append(message)
+
+        async def fake_watch(thread_id: str, _before: dict[str, object]) -> None:
+            watched.append(thread_id)
+
+        def fake_desktop(*args: object) -> tuple[bool, str]:
+            desktop_calls.append(args)
+            return True, "submitted"
+
+        server.codex = FakeCodex()
+        server._send_image_to_codex_desktop = fake_desktop
+        server._send_json = fake_send_json
+        server._watch_desktop_submission = fake_watch
+        image_data = "data:image/jpeg;base64," + base64.b64encode(b"image").decode("ascii")
+
+        asyncio.run(server._codex_image_send(
+            object(), "thread-2", "观察图片", "enter", image_data, "message-2",
+            "gpt-5.6-sol", "high", "fullAccess", "fast", "desktop"))
+
+        self.assertEqual(desktop_calls[0][0:5],
+                         ("thread-2", "图片任务", "观察图片", "enter", b"image"))
+        self.assertEqual(desktop_calls[0][5:],
+                         ("gpt-5.6-sol", "high", "fullAccess", "fast"))
+        self.assertEqual(watched, ["thread-2"])
+        self.assertEqual(responses[0]["type"], "ack")
+        self.assertEqual(responses[0]["id"], "message-2")
+        self.assertEqual(responses[0]["operation"], "codex_image_send")
+        self.assertEqual(responses[0]["threadId"], "thread-2")
 
     def test_protocol_rejects_non_object_json(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
@@ -236,6 +424,15 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["quota"]["remainingPercent"], 66)
         self.assertEqual(snapshot["quota"]["plan"], "prolite")
         self.assertEqual(snapshot["quota"]["lifetimeTokens"], 9000)
+
+    def test_codex_snapshot_includes_visible_model_catalog(self) -> None:
+        snapshot = normalize_snapshot({}, {}, {"data": []}, {"data": [
+            {"model": "gpt-5.6-sol", "hidden": False},
+            {"model": "hidden-model", "hidden": True},
+        ]})
+        self.assertEqual(snapshot["models"], [
+            {"model": "gpt-5.6-sol", "hidden": False},
+        ])
 
     def test_codex_snapshot_restarts_stalled_idle_client_once(self) -> None:
         client = CodexAppServerClient()
@@ -264,6 +461,64 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertTrue(snapshot["available"])
         self.assertEqual(stops, 1)
 
+    def test_codex_snapshot_can_merge_archived_tasks(self) -> None:
+        client = CodexAppServerClient()
+        requested_archived: list[bool] = []
+
+        async def fake_request(method: str, params: dict[str, object] | None = None,
+                               timeout: float = 15) -> dict[str, object]:
+            _ = timeout
+            if method == "thread/list":
+                archived = bool((params or {}).get("archived", False))
+                requested_archived.append(archived)
+                suffix = "archived" if archived else "active"
+                return {"data": [{"id": suffix, "title": suffix}]}
+            return {}
+
+        client.request = fake_request
+        snapshot = asyncio.run(client.snapshot(include_archived=True))
+
+        self.assertEqual(requested_archived, [False, True])
+        by_id = {item["id"]: item for item in snapshot["threads"]}
+        self.assertFalse(by_id["active"]["archived"])
+        self.assertTrue(by_id["archived"]["archived"])
+
+    def test_codex_archive_uses_official_app_server_methods(self) -> None:
+        client = CodexAppServerClient()
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_request(method: str, params: dict[str, object] | None = None,
+                               timeout: float = 15) -> dict[str, object]:
+            _ = timeout
+            calls.append((method, params or {}))
+            return {}
+
+        client.request = fake_request
+        asyncio.run(client.set_archived("thread-1", True))
+        asyncio.run(client.set_archived("thread-1", False))
+
+        self.assertEqual(calls, [
+            ("thread/archive", {"threadId": "thread-1"}),
+            ("thread/unarchive", {"threadId": "thread-1"}),
+        ])
+
+    def test_codex_rename_uses_official_app_server_method(self) -> None:
+        client = CodexAppServerClient()
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_request(method: str, params: dict[str, object] | None = None,
+                               timeout: float = 15) -> dict[str, object]:
+            _ = timeout
+            calls.append((method, params or {}))
+            return {}
+
+        client.request = fake_request
+        asyncio.run(client.rename_thread("thread-1", "新的任务名称"))
+
+        self.assertEqual(calls, [
+            ("thread/name/set", {"threadId": "thread-1", "name": "新的任务名称"}),
+        ])
+
     def test_codex_thread_title_falls_back_to_workspace(self) -> None:
         thread = normalize_thread({"id": "t1", "name": "\ufffd\ufffd", "cwd": r"C:\work\Starly"})
         self.assertEqual(thread["title"], "Starly")
@@ -285,6 +540,39 @@ class BridgeProtocolTests(unittest.TestCase):
 
         self.assertEqual(calls, ["thread/resume", "turn/start"])
 
+    def test_codex_message_applies_remote_model_effort_and_read_only_mode(self) -> None:
+        client = CodexAppServerClient()
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_request(method: str, params: dict[str, object] | None = None,
+                               timeout: float = 15) -> dict[str, object]:
+            _ = timeout
+            calls.append((method, params or {}))
+            if method == "thread/resume":
+                return {"thread": {"id": "thread-1", "turns": []}}
+            return {}
+
+        client.request = fake_request
+        asyncio.run(client.send_message(
+            "thread-1", "继续处理", "gpt-5.6-sol", "high", "readOnly", "", "priority"))
+
+        settings = calls[1][1]
+        self.assertEqual(calls[1][0], "thread/settings/update")
+        self.assertEqual(settings["model"], "gpt-5.6-sol")
+        self.assertEqual(settings["effort"], "high")
+        self.assertEqual(settings["serviceTier"], "priority")
+        self.assertEqual(settings["approvalPolicy"], "on-request")
+        self.assertEqual(settings["sandboxPolicy"], {
+            "type": "readOnly", "networkAccess": False,
+        })
+        self.assertEqual(calls[2][0], "turn/start")
+
+    def test_full_access_mode_disables_approval_and_sandbox(self) -> None:
+        settings = CodexAppServerClient._turn_settings(
+            "gpt-5.6-sol", "medium", "fullAccess")
+        self.assertEqual(settings["approvalPolicy"], "never")
+        self.assertEqual(settings["sandboxPolicy"], {"type": "dangerFullAccess"})
+
     def test_codex_history_preserves_remote_images(self) -> None:
         role, text, images = _item_content({
             "type": "userMessage",
@@ -305,6 +593,46 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(role, "assistant")
         self.assertEqual(text, "结果如下：预览")
         self.assertEqual(images, ["https://example.com/result.png"])
+
+    def test_rollout_exposes_public_activity_without_tool_io_or_encrypted_reasoning(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                {"timestamp": "2026-07-15T01:00:02Z", "type": "event_msg",
+                 "payload": {"type": "agent_reasoning", "text": "正在检查消息同步逻辑"}},
+                {"timestamp": "2026-07-15T01:00:03Z", "type": "response_item",
+                 "payload": {"type": "reasoning", "summary": ["公开摘要"],
+                             "encrypted_content": "hidden-chain"}},
+                {"timestamp": "2026-07-15T01:00:04Z", "type": "response_item",
+                 "payload": {"type": "custom_tool_call", "call_id": "call-1",
+                             "name": "exec", "input": "token=super-secret"}},
+                {"timestamp": "2026-07-15T01:00:05Z", "type": "response_item",
+                 "payload": {"type": "custom_tool_call_output", "call_id": "call-1",
+                             "output": "password=also-secret"}},
+                {"timestamp": "2026-07-15T01:00:06Z", "type": "event_msg",
+                 "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                           for item in records) + "\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                detail = read_rollout_thread_detail(thread_id)
+
+        self.assertIsNotNone(detail)
+        activities = detail["activities"]
+        self.assertEqual([item["title"] for item in activities],
+                         ["思考摘要", "执行本地操作"])
+        encoded = json.dumps(activities, ensure_ascii=False)
+        self.assertIn("正在检查消息同步逻辑", encoded)
+        self.assertNotIn("hidden-chain", encoded)
+        self.assertNotIn("super-secret", encoded)
+        self.assertNotIn("also-secret", encoded)
 
     def test_large_codex_history_uses_recent_local_messages(self) -> None:
         thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
@@ -343,6 +671,41 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(detail["activeTurnId"], "turn-1")
         self.assertEqual([item["text"] for item in detail["messages"]],
                          ["测试任务", "正在处理"])
+
+    def test_thread_detail_uses_latest_desktop_model_effort_and_permissions(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "turn_context",
+                 "payload": {
+                     "model": "gpt-5.5", "effort": "low",
+                     "approval_policy": "on-request",
+                     "sandbox_policy": {"type": "workspace-write"},
+                 }},
+                {"timestamp": "2026-07-15T01:00:02Z", "type": "turn_context",
+                 "payload": {
+                     "model": "gpt-5.6-sol", "effort": "medium",
+                     "approval_policy": "never",
+                     "sandbox_policy": {"type": "danger-full-access"},
+                 }},
+                {"timestamp": "2026-07-15T01:00:03Z", "type": "event_msg",
+                 "payload": {"type": "task_complete", "turn_id": "turn-2"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                            for item in records) + "\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                detail = read_rollout_thread_detail(thread_id)
+
+        assert detail is not None
+        self.assertEqual(detail["model"], "gpt-5.6-sol")
+        self.assertEqual(detail["effort"], "medium")
+        self.assertEqual(detail["permissionMode"], "fullAccess")
 
     def test_codex_history_pages_backward_in_stable_groups_of_fifteen(self) -> None:
         thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
@@ -420,6 +783,92 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(detail["activeTurnId"], "")
         self.assertEqual(client.thread_status[thread_id], "idle")
 
+    def test_snapshot_reconciles_stale_active_cache_from_rollout(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                {"timestamp": "2026-07-15T01:00:02Z", "type": "event_msg",
+                 "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                           for item in records) + "\n", encoding="utf-8")
+            client = CodexAppServerClient()
+            client.thread_status[thread_id] = "active"
+            # The app-server list can itself remain active after a task owned by
+            # Codex Desktop has completed, so active list entries must also be
+            # reconciled against the append-only rollout.
+            thread = {"id": thread_id, "status": "active", "updatedAt": 0}
+            client.thread_metadata[thread_id] = dict(thread)
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                asyncio.run(client._reconcile_snapshot_thread_statuses([thread]))
+
+        self.assertEqual(client.thread_status[thread_id], "idle")
+
+    def test_snapshot_resolves_not_loaded_after_bridge_restart(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                {"timestamp": "2026-07-15T01:00:02Z", "type": "event_msg",
+                 "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                           for item in records) + "\n", encoding="utf-8")
+            client = CodexAppServerClient()
+            thread = {
+                "id": thread_id,
+                "status": "notLoaded",
+                "updatedAt": int(rollout.stat().st_mtime),
+            }
+            client.thread_metadata[thread_id] = dict(thread)
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                asyncio.run(client._reconcile_snapshot_thread_statuses([thread]))
+
+        self.assertEqual(client.thread_status[thread_id], "idle")
+
+    def test_snapshot_does_not_apply_older_completed_rollout_to_new_turn(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "sessions" / "2026" / "07" / "15"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-07-15T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-07-15T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item, ensure_ascii=False)
+                                           for item in records) + "\n", encoding="utf-8")
+            client = CodexAppServerClient()
+            client.thread_status[thread_id] = "active"
+            thread = {
+                "id": thread_id,
+                "status": "notLoaded",
+                "updatedAt": int(rollout.stat().st_mtime) + 10,
+            }
+            client.thread_metadata[thread_id] = dict(thread)
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                asyncio.run(client._reconcile_snapshot_thread_statuses([thread]))
+
+        self.assertEqual(client.thread_status[thread_id], "active")
+
     def test_persisted_aborted_turn_is_idle(self) -> None:
         thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -445,6 +894,69 @@ class BridgeProtocolTests(unittest.TestCase):
         assert detail is not None
         self.assertEqual(detail["status"], "idle")
         self.assertEqual(detail["activeTurnId"], "")
+
+    def test_rollout_change_pushes_incremental_start_and_completion(self) -> None:
+        thread_id = "019f5e50-657d-7da2-8661-3700565b2d2e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / "sessions" / "2026" / "08" / "07"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / f"rollout-test-{thread_id}.jsonl"
+            records = [
+                {"timestamp": "2026-08-07T01:00:00Z", "type": "session_meta",
+                 "payload": {"session_id": thread_id, "cwd": r"C:\work\Starly"}},
+                {"timestamp": "2026-08-07T01:00:01Z", "type": "event_msg",
+                 "payload": {"type": "task_started", "turn_id": "turn-1"}},
+                {"timestamp": "2026-08-07T01:00:02Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text": "run now"}]}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item) for item in records) + "\n",
+                               encoding="utf-8")
+
+            server = BridgeServer.__new__(BridgeServer)
+            broadcasts: list[dict[str, object]] = []
+
+            class FakeCodex:
+                def __init__(self) -> None:
+                    self.thread_metadata: dict[str, dict[str, object]] = {}
+                    self.thread_status: dict[str, str] = {}
+
+            async def fake_broadcast(message: dict[str, object]) -> None:
+                broadcasts.append(message)
+
+            async def fake_refresh() -> None:
+                return None
+
+            server.codex = FakeCodex()
+            server.rollout_states = {}
+            server.rollout_debounce = {}
+            server.pending_desktop_open = set()
+            server._broadcast = fake_broadcast
+            server._schedule_codex_refresh = fake_refresh
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": temp_dir}):
+                asyncio.run(server._publish_rollout_change(thread_id))
+                records.extend([
+                    {"timestamp": "2026-08-07T01:00:03Z", "type": "event_msg",
+                     "payload": {"type": "agent_message", "message": "finished",
+                                 "turn_id": "turn-1"}},
+                    {"timestamp": "2026-08-07T01:00:04Z", "type": "event_msg",
+                     "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+                ])
+                rollout.write_text("\n".join(json.dumps(item) for item in records) + "\n",
+                                   encoding="utf-8")
+                asyncio.run(server._publish_rollout_change(thread_id))
+
+        deltas = [message["thread"] for message in broadcasts
+                  if message.get("type") == "codex_thread"]
+        events = [message["event"] for message in broadcasts
+                  if message.get("type") == "codex_event"]
+        self.assertEqual(len(deltas), 2)
+        self.assertEqual(deltas[0]["updateMode"], "delta")
+        self.assertEqual(deltas[0]["status"], "active")
+        self.assertEqual([item["text"] for item in deltas[1]["messages"]], ["finished"])
+        self.assertEqual(deltas[1]["status"], "idle")
+        self.assertEqual(events, ["turn/started", "turn/completed"])
 
     def test_desktop_thread_opens_only_after_turn_completed(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
@@ -553,6 +1065,65 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(BridgeServer._terminal_poll_event("notLoaded", True), "")
         self.assertEqual(BridgeServer._terminal_poll_event("queued", True), "")
 
+    def test_poll_recovers_after_transient_detail_read_failure(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        thread_id = "thread-transient-read"
+
+        class FakeCodex:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def thread_detail(self, requested_id: str) -> dict[str, object]:
+                self_test.assertEqual(requested_id, thread_id)
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("rollout temporarily locked")
+                if self.calls == 2:
+                    return {
+                        "id": thread_id, "status": "active", "activeTurnId": "turn-1",
+                        "messages": [], "activities": [],
+                    }
+                return {
+                    "id": thread_id, "status": "idle", "activeTurnId": "",
+                    "messages": [{"id": "reply", "role": "assistant", "text": "done"}],
+                    "activities": [],
+                }
+
+        self_test = self
+        broadcasts: list[dict[str, object]] = []
+        refreshes: list[bool] = []
+
+        async def fake_broadcast(message: dict[str, object]) -> None:
+            broadcasts.append(message)
+
+        async def fake_refresh() -> None:
+            refreshes.append(True)
+
+        async def fake_sleep(_seconds: float) -> None:
+            return None
+
+        server.codex = FakeCodex()
+        server.codex_poll_tasks = {}
+        server._broadcast = fake_broadcast
+        server._schedule_codex_refresh = fake_refresh
+        baseline = {
+            "id": thread_id, "status": "idle", "activeTurnId": "",
+            "messages": [], "activities": [],
+        }
+
+        async def exercise() -> None:
+            server.codex_poll_tasks[thread_id] = asyncio.current_task()
+            await server._poll_desktop_codex_thread(thread_id, baseline)
+
+        with mock.patch("pc.starly_bridge.asyncio.sleep", new=fake_sleep):
+            asyncio.run(exercise())
+
+        self.assertEqual(server.codex.calls, 3)
+        self.assertTrue(refreshes)
+        self.assertTrue(any(item.get("event") == "turn/completed" for item in broadcasts))
+        self.assertFalse(any(item.get("type") == "error" for item in broadcasts))
+        self.assertNotIn(thread_id, server.codex_poll_tasks)
+
     def test_latest_message_detects_fast_turn_without_assistant_reply(self) -> None:
         before = {"messages": [
             {"role": "assistant", "text": "old reply", "timestamp": 1,
@@ -639,6 +1210,99 @@ class BridgeProtocolTests(unittest.TestCase):
         asyncio.run(server._delayed_codex_refresh())
 
         self.assertEqual(events, ["codex_snapshot", "codex/refreshReady"])
+
+    def test_duplicate_snapshot_requests_share_recent_bridge_result(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        snapshots: list[dict[str, object]] = []
+
+        class FakeCodex:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def snapshot(self, include_archived: bool = False) -> dict[str, object]:
+                self.calls += 1
+                await asyncio.sleep(0.01)
+                return {"available": True, "threads": [], "models": [],
+                        "includeArchived": include_archived}
+
+        async def fake_send_json(_connection: object,
+                                 message: dict[str, object]) -> None:
+            snapshots.append(message)
+
+        server.codex = FakeCodex()
+        server.codex_snapshot_lock = None
+        server.codex_snapshot_cache = {}
+        server._send_json = fake_send_json
+
+        async def exercise() -> None:
+            await asyncio.gather(
+                server._send_codex_snapshot(object(), False),
+                server._send_codex_snapshot(object(), False),
+            )
+
+        asyncio.run(exercise())
+
+        self.assertEqual(server.codex.calls, 1)
+        self.assertEqual(len(snapshots), 2)
+
+    def test_failed_turn_is_announced_as_failed_phone_event(self) -> None:
+        server = BridgeServer.__new__(BridgeServer)
+        server.connections = {object()}
+        broadcasts: list[dict[str, object]] = []
+
+        async def fake_broadcast(message: dict[str, object]) -> None:
+            broadcasts.append(message)
+
+        async def fake_refresh() -> None:
+            return None
+
+        server._broadcast = fake_broadcast
+        server._schedule_codex_refresh = fake_refresh
+        server.pending_desktop_open = set()
+
+        asyncio.run(server._handle_codex_event("turn/completed", {
+            "threadId": "thread-failed",
+            "turn": {"id": "turn-1", "status": "failed"},
+        }))
+
+        self.assertEqual(broadcasts[0]["event"], "turn/failed")
+
+    def test_new_codex_task_uses_workspace_sandbox_and_remote_approvals(self) -> None:
+        client = CodexAppServerClient()
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_request(method: str, params: dict[str, object] | None = None,
+                               timeout: float = 15) -> dict[str, object]:
+            calls.append((method, params or {}))
+            if method == "thread/start":
+                return {"thread": {"id": "thread-new", "cwd": r"C:\work\Starly"}}
+            return {"turn": {"id": "turn-new"}}
+
+        client.request = fake_request
+        result = asyncio.run(client.create_thread(r"C:\work\Starly", "run tests"))
+
+        self.assertEqual(result["threadId"], "thread-new")
+        self.assertEqual(calls[0], ("thread/start", {
+            "cwd": r"C:\work\Starly",
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
+        }))
+        self.assertEqual(calls[1][0], "turn/start")
+
+    def test_remote_approval_is_answered_once(self) -> None:
+        client = CodexAppServerClient()
+        writes: list[dict[str, object]] = []
+        client.approval_requests["approval-7"] = (7, "item/commandExecution/requestApproval", {})
+
+        async def fake_write(value: dict[str, object]) -> None:
+            writes.append(value)
+
+        client._write = fake_write
+        asyncio.run(client.resolve_approval("approval-7", "accept"))
+
+        self.assertEqual(writes, [{"id": 7, "result": {"decision": "accept"}}])
+        with self.assertRaisesRegex(RuntimeError, "已失效"):
+            asyncio.run(client.resolve_approval("approval-7", "accept"))
 
 
 if __name__ == "__main__":

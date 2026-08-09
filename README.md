@@ -1,236 +1,260 @@
 # Starly
 
-Starly 是一套“鸿蒙手机语音输入 → Windows 当前输入框”的局域网输入工具。
+Starly 是一套自建的 HarmonyOS → Windows 远程输入与 Codex Remote 方案。它由三个独立组件组成：
 
-在手机上按住说话，应用会持续把中文语音转换为可编辑文字；松手后可以保留文字、滑向左上角直接发送，或滑向右上角进入编辑。电脑端接收文字后，将其输入到当前获得焦点的输入框，并根据手机上的滑动页签设置执行 `Ctrl + Enter` 或 `Enter`。
+| 组件 | 目录 | 作用 |
+| --- | --- | --- |
+| HarmonyOS 客户端 | `entry/` | 语音输入、Codex 任务、审批、设备和连接管理 |
+| Windows PC Bridge | `pc/` | 接收手机请求、控制桌面输入框、连接本机 Codex |
+| Starly Gateway | `gateway/` | 提供公网 WSS、设备配对、在线状态和密文转发 |
 
-> 本仓库只包含源代码和无敏感信息的配置示例，不包含签名证书、签名口令、配对密钥、HAP、EXE 或本机 SDK 路径。
+手机和 PC 可以在局域网内直连，也可以同时连接自建 Gateway。双通道模式会优先使用局域网，局域网不可用时自动回退到公网中继；家庭网络不需要开放入站端口。
+
+> 仓库只包含源码和无敏感信息的示例配置，不包含 HAP、EXE、证书、签名口令、设备密钥、配对凭证、服务器数据库或本机 SDK 路径。
 
 ## 主要功能
 
-- HarmonyOS 原生 ArkTS / ArkUI 应用。
-- 基于 HarmonyOS 6.1（API 23）的沉浸光感标题栏与液态玻璃界面。
-- 按住持续语音识别，松手停止。
-- 左上滑“发送”、右上滑“编辑”的手势操作。
-- 长按时显示跟随手指的中性玻璃点光源；滑向“发送”或“编辑”时，目标按钮呈现白色边缘泛光和高光扩散效果。
-- 识别结果可在手机端继续修改或清空。
-- 胶囊式滑动页签在 `Ctrl + Enter`、`Enter` 两种互斥发送方式间切换。
-- 支持单独遥控一次回车。
-- Scan Kit 扫描二维码配对，也可以手动填写电脑地址、端口和密钥。
-- 手机和电脑通过局域网 WebSocket 通信。
-- 应用从后台回到前台时，自动使用已保存的配对信息恢复电脑连接。
-- 电脑执行成功后返回确认，手机收到确认才清空输入框。
-- 新增“Codex 任务”页，可查看最近任务、任务状态与最近对话。
-- 可从手机继续向指定 Codex 任务发送要求，并停止由 Starly 接管的运行中任务。
-- 显示 Codex 当前使用窗口的剩余额度百分比、重置时间、套餐和累计 Token 用量。
-- Windows 客户端支持托盘运行、开机启动和更换配对密钥。
-- 限制为私有局域网、回环或链路本地地址，并使用随机配对密钥。
+### HarmonyOS 客户端
 
-## 工作方式
+- ArkTS / ArkUI 原生应用，支持手机、平板和 2in1 设备。
+- Core Speech Kit 中文语音识别，支持按住说话、松手保留、滑动发送和滑动编辑。
+- 文字和图片发送，发送成功回执到达后再清空输入框。
+- Remote 首页显示电脑在线状态、项目、最近任务、执行状态和相对更新时间。
+- 查看 Codex 对话、任务活动、模型、推理强度、速度、权限和账户额度。
+- 新建任务、继续任务、停止任务、搜索、置顶、未读、重命名、归档和恢复。
+- 将 Codex 命令、文件修改和权限审批转发到手机，高风险操作要求二次确认。
+- 任务完成、失败和等待审批通知。
+- 任务列表和最近对话按电脑缓存，冷启动先展示缓存，再在后台校准。
+- HarmonyOS HUKS 保护公网设备身份和长期凭证。
+
+### Windows PC Bridge
+
+- 托盘运行、开机启动、局域网自动发现、二维码和配对码。
+- 公网安全配对：一次性短码、双方核对码和 PC 明确允许。
+- 可自定义 Gateway 地址、Pairing ID 和首次接入 Token。
+- 普通输入模式通过 Windows `SendInput` 向当前焦点输入框发送文字。
+- Codex 支持两种发送方式：
+  - 后台任务模式：通过本机 Codex App Server 发送和读取任务。
+  - 桌面输入框模式：定位 Codex 桌面端的真实输入框，可选择 Enter 或 Ctrl+Enter。
+- 监听 Codex 本地任务事件，主动推送开始、回复、审批和完成状态；完整快照仅用于校准。
+- Windows DPAPI 保护局域网密钥、公网凭证、会话令牌和设备私钥。
+- PC 运行日志可在界面中直接打开所在目录。
+
+### Starly Gateway
+
+- 独立于 RustDesk `hbbs` / `hbbr`，可以部署在同一台 VPS，但应使用独立进程、端口和域名。
+- 手机和 PC 均只建立出站 WSS 连接。
+- 设备注册、一次性公网配对、在线状态、消息序号、确认、去重和断线补发。
+- 短期离线密文缓存和多电脑路由。
+- Gateway 只转发端到端密文，不能读取任务、图片、审批正文或 Codex 回复。
+- 提供 Ubuntu、Debian、CentOS/RHEL 系的一键安装脚本。
+- 支持域名证书和公网 IPv4 证书，并安装自动续期任务。
+
+## 架构
 
 ```text
-鸿蒙手机麦克风
-    ↓
-Core Speech Kit 中文识别
-    ↓
-手机端编辑 / 选择发送快捷键
-    ↓  WebSocket（局域网 + 配对密钥）
-Windows StarlyBridge
-    ↓
-SendInput 输入当前焦点窗口
-    ↓
-回执返回手机并清空已发送文字
+局域网优先：
+
+HarmonyOS ── WebSocket + 局域网配对密钥 ──▶ PC Bridge
+
+公网兜底：
+
+HarmonyOS ── WSS + 端到端密文 ──▶ Starly Gateway ──▶ PC Bridge
+                                                │
+                                                └─ 只保存路由元数据和短期密文
+
+PC 本地：
+
+PC Bridge ── stdio JSONL ──▶ Codex App Server
+         └─ UI Automation ─▶ Codex 桌面输入框
 ```
 
-Codex 功能使用另一条本地链路：
-
-```text
-鸿蒙手机“Codex 任务”页
-    ↓  已配对的局域网 WebSocket
-Windows StarlyBridge
-    ├─ 本机 stdio JSONL → Codex App Server（读取任务 / 状态 / 对话 / 额度）
-    └─ Windows UI Automation → 可见的 Codex 桌面端（打开指定任务 / 聚焦输入框 / 提交指令）
-```
-
-普通“语音输入”不会读取电脑输入框、屏幕或剪贴板，也不会主动切换电脑窗口，发送前需要先点中目标输入框。“Codex 任务”发送会按用户选中的任务自动切换 Codex 桌面窗口，并通过 Windows 无障碍控件树确认任务标题和输入框后提交。
+公网模式使用 X25519 设备密钥协商和 AES-256-GCM 消息加密。Gateway 无法解密业务正文。局域网兼容模式仍使用普通 WebSocket，因此只应在可信家庭或办公网络中使用。
 
 ## 项目结构
 
 ```text
 Starly/
-├─ AppScope/                  # HarmonyOS 应用级配置和图标
-├─ entry/                     # HarmonyOS 主 HAP 模块
+├─ AppScope/                       # HarmonyOS 应用级配置和图标
+├─ entry/                          # HarmonyOS 主 HAP 模块
 │  └─ src/main/ets/
-│     ├─ entryability/        # Stage 模型入口
-│     ├─ model/               # 配对信息模型
-│     ├─ pages/               # ArkUI 主页面
-│     └─ service/             # 语音、WebSocket、持久化服务
+│     ├─ entryability/             # Stage 模型入口
+│     ├─ model/                    # Codex 与配对数据模型
+│     ├─ pages/                    # ArkUI 页面
+│     └─ service/                  # 通信、加密、缓存、语音和通知
 ├─ pc/
-│  ├─ starly_bridge.py        # Windows 客户端主程序
-│  ├─ test_bridge.py          # 协议与安全边界测试
-│  ├─ integration_probe.py    # 已运行客户端握手检查
-│  ├─ requirements.txt        # Python 构建依赖
-│  └─ build.ps1               # Windows 单文件 EXE 构建脚本
-├─ build-profile.example.json5 # 不含签名信息的项目配置示例
-├─ build_all.ps1              # 两端构建与交付文件汇总
-└─ PLAN.md                    # 当前交付状态
+│  ├─ starly_bridge.py             # Windows Bridge 主程序
+│  ├─ codex_client.py              # Codex App Server 与任务记录适配
+│  ├─ gateway_client.py            # Gateway 长连接
+│  ├─ gateway_crypto.py            # PC 端端到端加密
+│  ├─ secret_store.py              # Windows DPAPI 存储
+│  ├─ build.ps1                    # Windows EXE 构建脚本
+│  └─ test_*.py                    # PC、协议和安全测试
+├─ gateway/
+│  ├─ starly_gateway.py            # WSS 中继服务
+│  ├─ install.sh                   # 通用一键安装器
+│  ├─ install-domain.sh            # 域名证书入口
+│  ├─ install-ip.sh                # 公网 IP 证书入口
+│  ├─ Dockerfile                   # 容器镜像
+│  └─ test_gateway.py              # Gateway 测试
+├─ build-profile.example.json5     # 无签名信息的 HarmonyOS 配置示例
+├─ build_all.ps1                   # 手机端与 PC 端本地构建
+└─ PLAN.md                         # 功能交付状态
 ```
 
-## 运行要求
+## 环境要求
 
 ### 手机端
 
 - HarmonyOS 6.1（API 23）或兼容版本。
-- 带麦克风的鸿蒙手机或平板。
-- DevEco Studio 与对应 HarmonyOS SDK，用于源码构建。
+- DevEco Studio 和对应 HarmonyOS SDK。
+- 真机需要启用开发者模式和 USB 调试。
 
-### 电脑端
+### PC Bridge
 
 - Windows 10 或 Windows 11。
-- 源码运行/构建需要 Python 3.14。
-- 安装 `pc/requirements.txt` 中的依赖。
-- 手机和电脑处于同一可信局域网。
-- 使用 Codex 任务功能时，需要已安装并登录 Codex 桌面端；普通语音输入功能不依赖 Codex。
+- Python 3.11 或更高版本（推荐使用项目当前开发版本）。
+- 使用 Codex Remote 功能时，需要安装并登录 Codex 桌面端。
 
-## 首次配置
+### Gateway
 
-仓库不会提交真实的 `build-profile.json5`，因为 DevEco Studio 自动签名会在其中写入本机证书路径和口令。
+- Ubuntu 22.04+、Debian 12+、CentOS Stream 9 或兼容 RHEL/Rocky/AlmaLinux。
+- 公网 IPv4，TCP 80 和 443 可访问。
+- 域名模式需要提前把 A 记录指向服务器。
 
-克隆后先复制示例：
+## 构建 HarmonyOS 客户端
+
+真实的 `build-profile.json5` 可能包含本机证书路径和签名口令，因此不会提交。首次克隆后先复制示例：
 
 ```powershell
 Copy-Item .\build-profile.example.json5 .\build-profile.json5
 ```
 
-然后用 DevEco Studio 打开项目，在项目签名设置中开启自动签名。请勿把生成后的 `build-profile.json5`、证书或口令提交到 Git。
+随后使用 DevEco Studio 配置自动签名，并选择 `entry` 模块构建 HAP。
 
-## 构建鸿蒙应用
-
-推荐直接使用 DevEco Studio 选择 `entry` 模块构建 HAP。
-
-也可以使用项目脚本，同时构建手机端和电脑端：
+也可以使用项目脚本同时构建 HAP 和 Windows Bridge：
 
 ```powershell
 .\build_all.ps1 -DevEcoRoot "你的 DevEco Studio 安装目录"
 ```
 
-或者提前设置环境变量：
+构建产物只保存在本地 `release/`，不会进入 Git。
 
-```powershell
-$env:DEVECO_STUDIO_HOME = "你的 DevEco Studio 安装目录"
-.\build_all.ps1
-```
+## 运行和构建 PC Bridge
 
-构建成功后，本地 `release/` 目录会包含：
-
-- `Starly.hap`
-- `StarlyBridge.exe`
-- `使用说明.md`
-
-`release/` 已被 Git 忽略，不会上传到仓库。
-
-## 构建 Windows 客户端
+源码运行：
 
 ```powershell
 python -m pip install -r .\pc\requirements.txt
+python -m pc.starly_bridge
+```
+
+构建单文件 EXE：
+
+```powershell
 powershell -ExecutionPolicy Bypass -File .\pc\build.ps1
 ```
 
-生成的单文件程序位于：
+生成文件位于 `pc/dist/StarlyBridge.exe`。Windows 防火墙首次询问时，只建议允许专用网络。
 
-```text
-pc/dist/StarlyBridge.exe
+## 配对与连接
+
+### 局域网配对
+
+1. 启动 PC Bridge。
+2. 手机打开 Starly 的配对页。
+3. 使用自动发现选择电脑，或扫描 PC 二维码。
+4. 手机和 PC 确认配对码。
+
+局域网模式不经过 Gateway，适合可信网络内的低延迟使用。
+
+### 公网安全配对
+
+1. 在 PC Bridge 中配置 Gateway URL、Pairing ID 和服务器首次接入 Token。
+2. PC 成功登记后生成一次性公网二维码或 8 位短码。
+3. 手机扫码或输入短码。
+4. 手机和 PC 核对相同的 6 位验证码。
+5. 仅在 PC 点击“允许”后，Gateway 才签发该手机的设备凭证。
+
+短码只能使用一次并会过期，二维码不包含长期服务器 Token。
+
+## 一键部署 Gateway
+
+完整说明见 [gateway/INSTALL.md](gateway/INSTALL.md)。
+
+域名证书版：
+
+```bash
+cd gateway
+sudo bash install-domain.sh starly.example.com admin@example.com
 ```
 
-电脑端首次启动时，Windows 防火墙可能询问网络权限。只建议允许“专用网络”。
+公网 IPv4 证书版：
 
-## 使用步骤
-
-1. 在电脑上运行 `StarlyBridge.exe`。
-2. 在手机上安装并打开 Starly，允许麦克风权限。
-3. 手机点击“扫码配对”，扫描电脑端二维码。
-4. 在电脑上点击需要输入文字的目标输入框，然后把 Starly 电脑端最小化到托盘。
-5. 在手机页签按钮或下方说明区域点击、左右滑动，选择 `Ctrl + 回车` 或 `回车`。
-6. 按住“按住说话”开始识别：
-   - 原地松手：停止识别并保留文字。
-   - 向左上滑后松手：识别完成后直接发送。
-   - 向右上滑后松手：识别完成后聚焦文字编辑框。
-7. 也可以手动编辑文字后点击“发送文字”。
-8. 切换到“Codex 任务”，可查看额度和最近任务；点击任务后可阅读最近消息，并选择“发送后按回车”或“发送后按 Ctrl+回车”继续发送要求，也可以停止运行中的任务。
-
-### Codex 状态和额度说明
-
-- “剩余额度”是 Codex 官方接口返回的当前使用窗口数据，由“100% − 已使用百分比”计算，不代表账户现金余额。
-- 重置时间由 Codex 返回，手机按本地时间显示。
-- “正在执行”表示 Starly 已在可见的 Codex 桌面端提交指令，并正在轮询该任务的活动轮次和回复。
-- 手机默认显示最近 30 个非归档任务，界面首屏列出其中最新的 10 个。
-- 从手机发送的是 Codex 任务消息，不是任意 Windows 命令。Starly 不提供远程 Shell 接口。
-- 如果 Codex 要求额外执行或文件权限，Starly 默认不代替用户批准；需要回到电脑端处理敏感确认。
-
-## 通信协议概览
-
-手机连接电脑端显示的 WebSocket 地址，并通过查询参数携带随机配对密钥。主要消息如下：
-
-```json
-{
-  "type": "input",
-  "id": "消息编号",
-  "text": "需要输入的文字",
-  "submitMode": "ctrl_enter"
-}
+```bash
+cd gateway
+sudo bash install-ip.sh 203.0.113.10 admin@example.com
 ```
 
-`submitMode` 支持：
+安装器会配置：
 
-- `ctrl_enter`：输入文字后按 Ctrl + Enter。
-- `enter`：输入文字后按 Enter。
+- `starly-gateway.service`
+- Nginx WSS 反向代理
+- TLS 证书及自动续期定时器
+- `/var/lib/starly-gateway` 持久化数据库
+- root 专用的首次 Pairing ID 和 Token 文件
 
-电脑端成功时返回 `ack`，失败时返回 `error`。电脑端还兼容旧版手机使用的布尔型 `submit` 字段。
+公网只应开放 80/443；Gateway 应只在 `127.0.0.1:8780` 监听，不要把明文 WebSocket 端口直接暴露到互联网。
 
-Codex 扩展消息包括 `codex_snapshot_request`、`codex_thread_request`、`codex_send` 和
-`codex_interrupt`。返回内容使用 `codex_snapshot`、`codex_thread` 与 `codex_event`。这些消息仍受同一局域网来源检查和配对密钥保护。
+## Codex Remote 使用说明
+
+- Remote 首页任务按最近更新时间排序，置顶任务除外。
+- “正在执行”来自 PC 任务事件；手机会在后台使用完整快照修正漏失状态。
+- 手机显示的模型、推理强度、速度和额度来自当前 PC 的 Codex 接口，不是手机内置固定列表。
+- 桌面输入框模式依赖可见的 Codex 窗口和 Windows UI Automation。
+- 后台任务模式不要求 Codex 输入框获得焦点。
+- Starly 不提供任意远程 Shell。Codex 发起的命令或高权限操作仍需经过 Codex 权限体系和手机审批。
+- 手机与 Codex 桌面端同时操作同一任务时，以 PC 的最新任务事件和持久化记录为准。
 
 ## 测试
 
-运行 Windows 协议测试：
+PC 与 Gateway 完整回归测试：
 
 ```powershell
-python -m unittest -v pc.test_bridge
+python -m unittest discover -s pc -p "test_*.py"
+python -m unittest discover -s gateway -p "test_*.py"
 ```
 
-电脑端已经运行时，可以检查打包程序的握手与 Ping：
+语法检查：
 
 ```powershell
-python .\pc\integration_probe.py
+python -m py_compile .\pc\starly_bridge.py .\pc\codex_client.py .\gateway\starly_gateway.py
 ```
 
-鸿蒙端单元测试位于 `entry/src/test/`，可以在 DevEco Studio 中运行。
+HarmonyOS 客户端可以在 DevEco Studio 中构建，并使用 `hdc install -r` 安装签名后的 Debug HAP 到真机。
 
-## 安全说明
+## 安全边界
 
-- 电脑端只接受私有局域网、回环或链路本地来源。
-- 配对密钥由电脑端随机生成，可随时更换。
-- 单次文字最大长度为 8000 个字符，并带有操作频率限制。
-- Codex App Server 只由 Windows 桥接程序在本机启动并通过标准输入输出通信，不对局域网直接开放。
-- 向指定 Codex 任务发送指令时，桥接会恢复并置前 Codex 桌面窗口；只有在任务标题匹配且 `ProseMirror` 输入框获得焦点后才会输入并按回车。
-- 桥接程序不会自动批准 Codex 提出的命令、文件修改或额外权限请求。
-- 当前传输为带随机密钥的普通 WebSocket，适用于家庭或办公可信网络，不建议用于公共 Wi-Fi。
-- 普通权限程序无法向“以管理员身份运行”的窗口模拟输入；两者应使用相同权限级别。
-- 密码框、远程桌面、游戏及部分安全软件可能拒绝 Windows 模拟输入。
-- 正式发布前需要替换为发布账号的正式 HarmonyOS 签名；Windows EXE 可按需要增加代码签名。
+- 公网只允许 `wss://`；只有回环地址可以在本地测试时使用 `ws://`。
+- 公网任务、回复、图片和审批正文进入 Gateway 前已经端到端加密。
+- Gateway 日志不应记录 Token、任务正文或 Codex 回复。
+- PC 使用 DPAPI，HarmonyOS 使用 HUKS 保护长期秘密。
+- 设备凭证绑定设备 ID、角色和公钥；被撤销设备不能重新使用旧凭证。
+- 每个方向都使用持久化计数器和认证元数据防止重复、篡改和重放。
+- 连接、配对和消息发送均有限速。
+- Codex App Server 只在 PC 本机通过标准输入输出通信，不直接开放到局域网或公网。
+- 普通权限 Bridge 无法向以管理员身份运行的窗口模拟输入，两者需要处于相同权限级别。
 
-## 隐私与仓库规则
+## 禁止提交的内容
 
-以下内容禁止提交：
-
-- `build-profile.json5` 中的真实签名配置。
-- `local.properties` 和任何本机 SDK 路径。
+- 真实 `build-profile.json5`、HarmonyOS 证书和签名口令。
+- `%APPDATA%/StarlyBridge/config.json`。
+- Gateway 的 `data/`、SQLite 数据库、Pairing ID、Token 和设备凭证。
 - `.cer`、`.p7b`、`.p12`、`.pem`、`.key` 等证书或私钥。
-- 电脑端 `%APPDATA%/StarlyBridge/config.json` 中的配对密钥。
-- `release/`、HAP、EXE、构建缓存和 Python 缓存。
+- HAP、APP、EXE、构建缓存、运行日志、调试截图和本机生成文件。
 
-如果签名口令曾经进入公开仓库，应立即撤销旧证书并更换全部相关口令，仅删除历史文件并不足够。
+如果任何真实密钥曾进入 Git 历史，应立即撤销并轮换；仅删除当前文件不足以消除泄露风险。
 
 ## 当前状态
 
-项目目前已完成手机端语音识别、手势发送、两种回车模式、扫码配对、Windows 输入桥接、Codex 任务与额度面板、托盘运行和本地交付构建。AppGallery 正式发布签名仍需由发布账号配置。
+手机端、PC Bridge 和 Gateway 源码均位于本仓库。项目已完成局域网和公网真机联调，目前仍处于开发测试阶段，暂未发布正式 Release 或 AppGallery 版本。

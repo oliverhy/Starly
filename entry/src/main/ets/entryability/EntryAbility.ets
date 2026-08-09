@@ -3,6 +3,7 @@ import { KeyboardAvoidMode, window } from '@kit.ArkUI';
 import pairingStore from '../service/PairingStore';
 import speechService from '../service/SpeechService';
 import remoteInputClient from '../service/RemoteInputClient';
+import taskNotificationService from '../service/TaskNotificationService';
 
 type AppPermission = 'ohos.permission.MICROPHONE';
 
@@ -21,9 +22,15 @@ export default class EntryAbility extends UIAbility {
   onWindowStageCreate(windowStage: window.WindowStage): void {
     windowStage.loadContent('pages/Index', () => {
       try {
-        windowStage.getMainWindowSync().getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
+        // Keep the focused Codex composer above the IME even inside a full-screen
+        // content cover. RESIZE does not reliably resize overlay covers on all
+        // HarmonyOS devices, while caret-aware offset follows the actual editor.
+        windowStage.getMainWindowSync().getUIContext().setKeyboardAvoidMode(
+          KeyboardAvoidMode.OFFSET_WITH_CARET);
       } catch (_error) {
       }
+      // Notification authorization can only be requested after UI content is loaded.
+      taskNotificationService.ensureEnabled(this.context);
     });
   }
 

@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import secrets
 import socket
 import struct
@@ -30,9 +31,23 @@ import websockets
 from PIL import Image, ImageDraw, ImageTk
 
 try:
-    from pc.codex_client import CodexAppServerClient
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:  # Source checkouts can still use the slower polling fallback.
+    FileSystemEvent = object  # type: ignore[assignment,misc]
+    FileSystemEventHandler = object  # type: ignore[assignment,misc]
+    Observer = None  # type: ignore[assignment,misc]
+
+try:
+    from pc.codex_client import CodexAppServerClient, read_rollout_thread_detail
+    from pc.gateway_client import GatewayBridgeClient, GatewayRelayConnection
+    from pc.gateway_crypto import GatewayCrypto, generate_device_identity
+    from pc.secret_store import protect_secret, unprotect_secret
 except ImportError:
-    from codex_client import CodexAppServerClient
+    from codex_client import CodexAppServerClient, read_rollout_thread_detail
+    from gateway_client import GatewayBridgeClient, GatewayRelayConnection
+    from gateway_crypto import GatewayCrypto, generate_device_identity
+    from secret_store import protect_secret, unprotect_secret
 
 
 APP_NAME = "StarlyBridge"
@@ -45,12 +60,133 @@ PAIRING_FAILURE_WINDOW_SECONDS = 60
 MAX_TEXT_LENGTH = 8000
 MAX_IMAGE_BYTES = 6 * 1024 * 1024
 MAX_PHONE_DETAIL_MESSAGES = 15
+MAX_PHONE_ACTIVITIES = 30
 MAX_WIRE_MESSAGE_SIZE = 16 * 1024 * 1024
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = CONFIG_DIR / "bridge.log"
 SINGLE_INSTANCE_MUTEX = "Local\\StarlyBridge.SingleInstance"
 _single_instance_handle: int | None = None
+ROLLOUT_THREAD_PATTERN = re.compile(r"([0-9a-fA-F-]{36})\.jsonl$")
+
+
+class RolloutEventHandler(FileSystemEventHandler):  # type: ignore[misc,valid-type]
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self.callback = callback
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        self._handle(event)
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        self._handle(event)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        destination = str(getattr(event, "dest_path", ""))
+        if destination:
+            self.callback(destination)
+
+    def _handle(self, event: FileSystemEvent) -> None:
+        if not bool(getattr(event, "is_directory", False)):
+            self.callback(str(getattr(event, "src_path", "")))
+
+
+def normalize_gateway_url(value: str) -> str:
+    """Return a canonical Gateway /ws URL and reject insecure public transports."""
+    raw = value.strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "wss://" + raw
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("服务器地址或端口格式不正确") from error
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("服务器地址不能包含账号、查询参数或片段")
+    local_hosts = {"127.0.0.1", "localhost", "::1"}
+    if scheme != "wss" and not (scheme == "ws" and hostname in local_hosts):
+        raise ValueError("公网服务器必须使用 wss:// 加密连接")
+    path = parsed.path.rstrip("/")
+    if path in ("", "/"):
+        path = "/ws"
+    if path != "/ws":
+        raise ValueError("服务器地址路径必须为 /ws")
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    rendered_port = f":{port}" if port is not None else ""
+    return f"{scheme}://{rendered_host}{rendered_port}/ws"
+
+
+def _approval_value(params: dict[str, object], *names: str) -> object:
+    for name in names:
+        value = params.get(name)
+        if value not in (None, "", [], {}):
+            return value
+    for container_name in ("item", "request", "context", "commandExecution", "fileChange"):
+        container = params.get(container_name)
+        if isinstance(container, dict):
+            for name in names:
+                value = container.get(name)
+                if value not in (None, "", [], {}):
+                    return value
+    return ""
+
+
+def normalize_approval(method: str, params: dict[str, object]) -> dict[str, object]:
+    """Add stable, display-safe approval context and conservative risk metadata."""
+    normalized = dict(params)
+    command_value = _approval_value(params, "command", "cmd", "commandLine")
+    if isinstance(command_value, list):
+        command = " ".join(str(part) for part in command_value)
+    else:
+        command = str(command_value or "")
+    cwd = str(_approval_value(params, "cwd", "workingDirectory", "workdir") or "")
+    reason = str(_approval_value(params, "reason", "message", "justification") or "")
+    permissions_value = _approval_value(params, "permissions", "requestedPermissions")
+    permissions = permissions_value if isinstance(permissions_value, dict) else {}
+    permission_summary = ", ".join(
+        f"{key}={json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
+        for key, value in sorted(permissions.items()))
+
+    risk_reasons: list[str] = []
+    command_lower = command.lower()
+    destructive_patterns = (
+        r"\b(rm|rmdir|del|erase|format|diskpart|shutdown|reboot|sudo|runas)\b",
+        r"\b(remove-item|clear-disk|format-volume|stop-computer|restart-computer)\b",
+        r"\b(set-content|add-content|out-file|move-item|copy-item|rename-item)\b",
+        r"\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f)",
+        r"\b(reg\s+delete|bcdedit|cipher\s+/w)\b",
+        r"\b(invoke-expression|iex)\b",
+    )
+    if any(re.search(pattern, command_lower) for pattern in destructive_patterns):
+        risk_reasons.append("命令可能删除数据、修改系统状态或提升权限")
+    if method == "item/permissions/requestApproval" or permissions:
+        risk_reasons.append("操作请求扩大当前权限范围")
+    if re.search(r"(?:curl|wget|irm|invoke-webrequest).*(?:\||iex|sh\b|bash\b)", command_lower):
+        risk_reasons.append("命令可能下载并直接执行远程内容")
+
+    high_risk = bool(risk_reasons)
+    risk_level = "high" if high_risk else (
+        "medium" if method in (
+            "item/commandExecution/requestApproval", "item/fileChange/requestApproval") else "low")
+    if not risk_reasons and risk_level == "medium":
+        risk_reasons.append("操作将执行命令或修改文件，请核对内容")
+
+    normalized.update({
+        "approvalMethod": method,
+        "command": command,
+        "cwd": cwd,
+        "reason": reason,
+        "permissions": permissions,
+        "permissionsSummary": permission_summary,
+        "riskLevel": risk_level,
+        "riskReasons": risk_reasons,
+        "highRisk": high_risk,
+    })
+    return normalized
 
 
 def open_codex_thread(thread_id: str) -> bool:
@@ -83,6 +219,31 @@ public static class StarlyCodexUi {
     uint flags, uint dx, uint dy, uint data, UIntPtr extra);
 }
 '@
+function Test-ComposerFocus([int]$processId) {
+  try {
+    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+    return ($focused.Current.ProcessId -eq $processId -and
+            $focused.Current.ClassName -match '(^| )ProseMirror( |$)')
+  } catch { return $false }
+}
+function Invoke-ComposerFocus($element, [int]$processId) {
+  try {
+    $element.SetFocus()
+    Start-Sleep -Milliseconds 100
+    if (Test-ComposerFocus $processId) { return $true }
+  } catch {}
+  try {
+    $rect = $element.Current.BoundingRectangle
+    if ($rect.Width -lt 1 -or $rect.Height -lt 1) { return $false }
+    $clickX = [int]($rect.X + $rect.Width / 2)
+    $clickY = [int]($rect.Y + [Math]::Min($rect.Height / 2, $rect.Height - 12))
+    [StarlyCodexUi]::SetCursorPos($clickX, $clickY) | Out-Null
+    [StarlyCodexUi]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+    [StarlyCodexUi]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 140
+    return (Test-ComposerFocus $processId)
+  } catch { return $false }
+}
 $threadLabel = $env:STARLY_CODEX_THREAD_TITLE
 $deadline = [DateTime]::UtcNow.AddSeconds(12)
 while ([DateTime]::UtcNow -lt $deadline) {
@@ -118,24 +279,60 @@ while ([DateTime]::UtcNow -lt $deadline) {
   Start-Sleep -Milliseconds 160
   [StarlyCodexUi]::GetWindowRect($handle, [ref]$windowRect) | Out-Null
   $windowWidth = $windowRect.Right - $windowRect.Left
+  $windowHeight = $windowRect.Bottom - $windowRect.Top
 
-  # A real click plus FocusedElement verifies the exact state SendInput needs.
-  foreach ($bottomOffset in @(72, 108)) {
-    foreach ($widthFactor in @(0.57, 0.70)) {
+  # Locate the real contenteditable control first. This keeps working when a
+  # browser, terminal, or preview is docked beside the Codex conversation.
+  try {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+    $candidates = @()
+    foreach ($element in $root.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.Condition]::TrueCondition)) {
+      try {
+        $rect = $element.Current.BoundingRectangle
+        $bottom = $rect.Y + $rect.Height
+        $insideWindow = $rect.X -ge $windowRect.Left -and
+          $rect.X + $rect.Width -le $windowRect.Right -and
+          $rect.Y -ge $windowRect.Top -and $bottom -le $windowRect.Bottom
+        if ($element.Current.ProcessId -eq $mainProcessId -and
+            $element.Current.ClassName -match '(^| )ProseMirror( |$)' -and
+            -not $element.Current.IsOffscreen -and $element.Current.IsEnabled -and
+            $insideWindow -and $rect.Width -ge 160 -and $rect.Height -ge 32 -and
+            $bottom -ge ($windowRect.Top + $windowHeight * 0.55)) {
+          $candidates += [PSCustomObject]@{
+            Element = $element
+            Left = $rect.X
+            Bottom = $bottom
+          }
+        }
+      } catch {}
+    }
+    # The Codex conversation is the left-most content pane when another tool
+    # is docked on the right. Bottom position breaks ties between candidates.
+    foreach ($candidate in @($candidates | Sort-Object Left,
+        @{Expression='Bottom'; Descending=$true})) {
+      if (Invoke-ComposerFocus $candidate.Element $mainProcessId) {
+        Write-Output ('FOCUSED|' + $threadLabel + '|ProseMirror|automation')
+        exit 0
+      }
+    }
+  } catch {}
+
+  # Coordinate fallback tries the left conversation pane first, then wider
+  # layouts. Every click is verified before any keyboard input is injected.
+  foreach ($bottomOffset in @(72, 108, 145)) {
+    foreach ($widthFactor in @(0.35, 0.50, 0.62, 0.74)) {
       $clickX = [int]($windowRect.Left + $windowWidth * $widthFactor)
       $clickY = [int]($windowRect.Bottom - $bottomOffset)
       [StarlyCodexUi]::SetCursorPos($clickX, $clickY) | Out-Null
       [StarlyCodexUi]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
       [StarlyCodexUi]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
       Start-Sleep -Milliseconds 160
-      try {
-        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement.Current
-        if ($focused.ProcessId -eq $mainProcessId -and
-            $focused.ClassName -match '(^| )ProseMirror( |$)') {
-          Write-Output ('FOCUSED|' + $threadLabel + '|' + $focused.ClassName)
-          exit 0
-        }
-      } catch {}
+      if (Test-ComposerFocus $mainProcessId) {
+        Write-Output ('FOCUSED|' + $threadLabel + '|ProseMirror|fallback')
+        exit 0
+      }
     }
   }
   Start-Sleep -Milliseconds 300
@@ -168,6 +365,160 @@ def focus_codex_composer(thread_title: str) -> tuple[bool, str]:
         return True, output
     detail = output or result.stderr.strip() or f"退出码 {result.returncode}"
     return False, f"未找到 Codex 桌面端输入框（{detail}）"
+
+
+def desktop_model_labels(model: str) -> list[str]:
+    value = model.strip()
+    if not value:
+        return []
+    labels = [value]
+    pretty = re.sub(r"^gpt-", "GPT-", value, flags=re.IGNORECASE)
+    parts = pretty.split("-")
+    if len(parts) >= 3:
+        labels.extend([pretty, "-".join(parts[1:]), " ".join(parts[1:])])
+    return list(dict.fromkeys(label for label in labels if label))
+
+
+def desktop_effort_labels(effort: str) -> list[str]:
+    return {
+        "none": ["None", "无"], "minimal": ["Minimal", "最低"],
+        "low": ["Low", "低"], "medium": ["Medium", "中"],
+        "high": ["High", "高"], "xhigh": ["Extra high", "XHigh", "极高"],
+        "max": ["Max", "最高"], "ultra": ["Ultra", "超高"],
+    }.get(effort.strip().lower(), [effort.strip()] if effort.strip() else [])
+
+
+def desktop_permission_labels(permission_mode: str) -> list[str]:
+    return {
+        "default": ["Default permissions", "Default", "默认权限"],
+        "autoapprove": ["Auto-review", "Auto review", "自动审批", "自动审核"],
+        "readonly": ["Read only", "Read-only", "只读"],
+        "fullaccess": ["Full access", "完全访问权限", "完全访问"],
+    }.get(permission_mode.strip().lower(), [])
+
+
+def desktop_speed_labels(service_tier: str) -> list[str]:
+    return {
+        "fast": ["Fast", "Priority", "快速"],
+        "priority": ["Fast", "Priority", "快速"],
+        "standard": ["Standard", "标准"],
+    }.get(service_tier.strip().lower(), [])
+
+
+CODEX_COMPOSER_SETTINGS_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class StarlyCodexSettingsUi {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint f,uint x,uint y,uint d,UIntPtr e);
+}
+'@
+function Split-Labels([string]$value) {
+  if ([string]::IsNullOrWhiteSpace($value)) { return @() }
+  return @($value -split [char]31 | Where-Object { $_ })
+}
+function Matches([string]$name, [string[]]$labels) {
+  foreach ($label in $labels) {
+    if ($name.Equals($label, [StringComparison]::OrdinalIgnoreCase) -or
+        $name.IndexOf($label, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+  }
+  return $false
+}
+function Invoke-Element($element) {
+  try { ($element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)).Invoke(); return $true } catch {}
+  try { ($element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)).Select(); return $true } catch {}
+  try {
+    $r = $element.Current.BoundingRectangle
+    [StarlyCodexSettingsUi]::SetCursorPos([int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2)) | Out-Null
+    [StarlyCodexSettingsUi]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
+    [StarlyCodexSettingsUi]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
+    return $true
+  } catch { return $false }
+}
+function Descendants($root) {
+  return @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition))
+}
+function Select-Value($root, [string[]]$triggers, [string[]]$options, [string]$kind) {
+  if ($options.Count -eq 0) { return }
+  $all = Descendants $root
+  foreach ($element in $all) {
+    try {
+      $type = $element.Current.ControlType
+      if (($type -eq [System.Windows.Automation.ControlType]::Button -or
+           $type -eq [System.Windows.Automation.ControlType]::MenuItem -or
+           $type -eq [System.Windows.Automation.ControlType]::ListItem) -and
+          (Matches $element.Current.Name $options)) { return }
+    } catch {}
+  }
+  $trigger = $null
+  foreach ($element in $all) {
+    try {
+      if ($element.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
+          (Matches $element.Current.Name $triggers)) { $trigger = $element; break }
+    } catch {}
+  }
+  if ($null -eq $trigger -or -not (Invoke-Element $trigger)) { throw "trigger:$kind" }
+  Start-Sleep -Milliseconds 220
+  foreach ($element in (Descendants $root)) {
+    try { if (Matches $element.Current.Name $options) { if (Invoke-Element $element) { Start-Sleep -Milliseconds 180; return } } } catch {}
+  }
+  throw "option:$kind"
+}
+$process = @(Get-Process ChatGPT -ErrorAction SilentlyContinue | Where-Object {
+  try { $_.Path -like '*OpenAI.Codex_*' -and $_.MainWindowHandle -ne 0 } catch { $false }
+} | Sort-Object { $_.MainWindowHandle } | Select-Object -First 1)
+if ($process.Count -eq 0) { Write-Output 'SETTING_FAILED|window'; exit 3 }
+$handle = [IntPtr]$process[0].MainWindowHandle
+[StarlyCodexSettingsUi]::ShowWindow($handle,9) | Out-Null
+[StarlyCodexSettingsUi]::SetForegroundWindow($handle) | Out-Null
+Start-Sleep -Milliseconds 250
+$deadline = [DateTime]::UtcNow.AddSeconds(12)
+$lastError = 'task-not-ready'
+while ([DateTime]::UtcNow -lt $deadline) {
+  try {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+    Select-Value $root @('Open model picker','Model','模型') (Split-Labels $env:STARLY_MODEL_LABELS) 'model'
+    Select-Value $root @('Reasoning effort','Effort','推理强度') (Split-Labels $env:STARLY_EFFORT_LABELS) 'effort'
+    Select-Value $root @('Speed','Service tier','速度') (Split-Labels $env:STARLY_SPEED_LABELS) 'speed'
+    Select-Value $root @('Default permissions','Auto-review','Read only','Full access','Permissions','权限') (Split-Labels $env:STARLY_PERMISSION_LABELS) 'permission'
+    Write-Output 'CONFIGURED'; exit 0
+  } catch { $lastError = $_.Exception.Message; Start-Sleep -Milliseconds 350 }
+}
+Write-Output ('SETTING_FAILED|' + $lastError); exit 4
+"""
+
+
+def configure_codex_composer(model: str, effort: str, permission_mode: str,
+                             service_tier: str) -> tuple[bool, str]:
+    environment = os.environ.copy()
+    environment["STARLY_MODEL_LABELS"] = "\x1f".join(desktop_model_labels(model))
+    environment["STARLY_EFFORT_LABELS"] = "\x1f".join(desktop_effort_labels(effort))
+    environment["STARLY_SPEED_LABELS"] = "\x1f".join(desktop_speed_labels(service_tier))
+    environment["STARLY_PERMISSION_LABELS"] = "\x1f".join(
+        desktop_permission_labels(permission_mode))
+    flags = 0x08000000 if os.name == "nt" else 0
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             CODEX_COMPOSER_SETTINGS_SCRIPT], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=18,
+            creationflags=flags, env=environment, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, f"无法设置 Codex 桌面输入框：{error}"
+    output = result.stdout.strip()
+    if result.returncode == 0 and output.endswith("CONFIGURED"):
+        return True, output
+    detail = output or result.stderr.strip() or f"退出码 {result.returncode}"
+    return False, f"Codex 桌面选项定位失败：{detail}"
 
 
 def acquire_single_instance() -> bool:
@@ -209,10 +560,35 @@ def find_available_port(preferred: int = DEFAULT_PORT) -> int:
 
 class BridgeConfig:
     def __init__(self, port: int = DEFAULT_PORT, token: str = "",
-                 pairing_code: str = "") -> None:
+                 pairing_code: str = "", gateway_url: str = "",
+                 gateway_pairing_id: str = "", gateway_last_seq: int = 0,
+                 gateway_send_counter: int = 0,
+                 gateway_received_counters: dict[str, int] | None = None,
+                 gateway_private_key: str = "", gateway_public_key: str = "",
+                 gateway_session_token: str = "", gateway_token: str = "",
+                 gateway_device_credential: str = "",
+                 gateway_device_id: str = "") -> None:
         self.port = port
         self.token = token or secrets.token_urlsafe(32)
         self.pairing_code = pairing_code if self._is_valid_pairing_code(pairing_code) else self.new_pairing_code()
+        self.gateway_url = gateway_url.strip()
+        self.gateway_pairing_id = gateway_pairing_id.strip() or secrets.token_hex(16)
+        self.gateway_last_seq = max(0, gateway_last_seq)
+        self.gateway_send_counter = max(0, gateway_send_counter)
+        self.gateway_received_counters = dict(gateway_received_counters or {})
+        if not gateway_private_key or not gateway_public_key:
+            gateway_private_key, gateway_public_key = generate_device_identity()
+        self.gateway_private_key = gateway_private_key
+        self.gateway_public_key = gateway_public_key
+        self.gateway_session_token = gateway_session_token
+        self.gateway_token = gateway_token or self.token
+        self.gateway_device_credential = gateway_device_credential
+        self.gateway_device_id = (gateway_device_id.strip() or
+                                  f"bridge-{secrets.token_hex(12)}")
+
+    @property
+    def gateway_enabled(self) -> bool:
+        return self.gateway_url.startswith("wss://") or self.gateway_url.startswith("ws://127.0.0.1")
 
     @staticmethod
     def _is_valid_pairing_code(value: str) -> bool:
@@ -232,12 +608,59 @@ class BridgeConfig:
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             port = int(data.get("port", DEFAULT_PORT))
-            token = str(data.get("token", ""))
+            protected_token = str(data.get("token_protected", ""))
+            plaintext_token = str(data.get("token", ""))
+            token = (unprotect_secret(protected_token) if protected_token else plaintext_token) or \
+                secrets.token_urlsafe(32)
+            protected_gateway_token = str(data.get("gateway_token_protected", ""))
+            plaintext_gateway_token = str(data.get("gateway_token", ""))
+            environment_gateway_token = os.environ.get("STARLY_GATEWAY_TOKEN", "").strip()
+            gateway_token = environment_gateway_token or (
+                unprotect_secret(protected_gateway_token) if protected_gateway_token else
+                plaintext_gateway_token or token)
+            needs_secret_migration = bool(
+                plaintext_token or not protected_token or plaintext_gateway_token or
+                environment_gateway_token or
+                (gateway_token and not protected_gateway_token))
             pairing_code = str(data.get("pairing_code", ""))
-            if not 1 <= port <= 65535 or len(token) < 32:
+            gateway_url = os.environ.get(
+                "STARLY_GATEWAY_URL", str(data.get("gateway_url", ""))).strip()
+            gateway_pairing_id = os.environ.get(
+                "STARLY_GATEWAY_PAIRING_ID", str(data.get("gateway_pairing_id", ""))).strip()
+            gateway_last_seq = int(data.get("gateway_last_seq", 0) or 0)
+            gateway_send_counter = int(data.get("gateway_send_counter", 0) or 0)
+            raw_received_counters = data.get("gateway_received_counters", {})
+            gateway_received_counters = {
+                str(key): max(0, int(value))
+                for key, value in raw_received_counters.items()
+            } if isinstance(raw_received_counters, dict) else {}
+            protected_private_key = str(data.get("gateway_private_key_protected", ""))
+            gateway_private_key = (unprotect_secret(protected_private_key)
+                                   if protected_private_key else "")
+            gateway_public_key = str(data.get("gateway_public_key", ""))
+            needs_identity_migration = not gateway_private_key or not gateway_public_key
+            protected_session_token = str(data.get("gateway_session_token_protected", ""))
+            gateway_session_token = (unprotect_secret(protected_session_token)
+                                     if protected_session_token else "")
+            protected_device_credential = str(
+                data.get("gateway_device_credential_protected", ""))
+            gateway_device_credential = (unprotect_secret(protected_device_credential)
+                                         if protected_device_credential else "")
+            gateway_device_id = str(data.get("gateway_device_id", "")).strip()
+            # Existing installations were registered under the hostname. Keep
+            # that identity when migrating an already-issued device credential.
+            if not gateway_device_id and gateway_device_credential:
+                gateway_device_id = socket.gethostname()
+            needs_device_id_migration = not str(data.get("gateway_device_id", "")).strip()
+            if not 1 <= port <= 65535 or len(token) < 32 or len(gateway_token) < 32:
                 raise ValueError("invalid config")
-            config = cls(port, token, pairing_code)
-            if pairing_code != config.pairing_code:
+            config = cls(port, token, pairing_code, gateway_url,
+                         gateway_pairing_id, gateway_last_seq,
+                         gateway_send_counter, gateway_received_counters,
+                         gateway_private_key, gateway_public_key, gateway_session_token,
+                         gateway_token, gateway_device_credential, gateway_device_id)
+            if (pairing_code != config.pairing_code or needs_secret_migration or
+                    needs_identity_migration or needs_device_id_migration):
                 config.save()
             return config
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -250,8 +673,23 @@ class BridgeConfig:
         CONFIG_PATH.write_text(
             json.dumps({
                 "port": self.port,
-                "token": self.token,
+                "token_protected": protect_secret(self.token),
+                "gateway_token_protected": protect_secret(self.gateway_token),
                 "pairing_code": self.pairing_code,
+                "gateway_url": self.gateway_url,
+                "gateway_pairing_id": self.gateway_pairing_id,
+                "gateway_device_id": self.gateway_device_id,
+                "gateway_last_seq": self.gateway_last_seq,
+                "gateway_send_counter": self.gateway_send_counter,
+                "gateway_received_counters": self.gateway_received_counters,
+                "gateway_private_key_protected": protect_secret(self.gateway_private_key),
+                "gateway_public_key": self.gateway_public_key,
+                "gateway_session_token_protected": (
+                    protect_secret(self.gateway_session_token)
+                    if self.gateway_session_token else ""),
+                "gateway_device_credential_protected": (
+                    protect_secret(self.gateway_device_credential)
+                    if self.gateway_device_credential else ""),
             }, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -613,12 +1051,20 @@ class BridgeServer:
         self.thread: threading.Thread | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.stop_event: asyncio.Event | None = None
-        self.connections: set[websockets.ServerConnection] = set()
+        self.connections: set[object] = set()
         self.codex: CodexAppServerClient | None = None
         self.codex_refresh_task: asyncio.Task[None] | None = None
+        self.codex_snapshot_lock: asyncio.Lock | None = None
+        self.codex_snapshot_cache: dict[bool, tuple[float, dict[str, object]]] = {}
         self.pending_desktop_open: set[str] = set()
         self.codex_poll_tasks: dict[str, asyncio.Task[None]] = {}
+        self.rollout_observer: object | None = None
+        self.rollout_debounce: dict[str, asyncio.TimerHandle] = {}
+        self.rollout_states: dict[str, dict[str, object]] = {}
         self.discovery_transport: asyncio.DatagramTransport | None = None
+        self.gateway_client: GatewayBridgeClient | None = None
+        self.gateway_task: asyncio.Task[None] | None = None
+        self.gateway_connections: dict[str, GatewayRelayConnection] = {}
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -642,6 +1088,36 @@ class BridgeServer:
         self.loop = asyncio.get_running_loop()
         self.stop_event = asyncio.Event()
         self.codex = CodexAppServerClient(self._handle_codex_event)
+        self._start_rollout_observer()
+        if self.config.gateway_enabled:
+            gateway_crypto = GatewayCrypto(
+                self.config.gateway_token,
+                self.config.gateway_pairing_id,
+                self.config.gateway_device_id,
+                self.config.gateway_send_counter,
+                self.config.gateway_received_counters,
+                self._handle_gateway_send_counter,
+                self._handle_gateway_receive_counter,
+                self.config.gateway_private_key,
+            )
+            self.gateway_client = GatewayBridgeClient(
+                self.config.gateway_url,
+                self.config.gateway_pairing_id,
+                self.config.gateway_device_id,
+                self.config.gateway_token,
+                self._handle_gateway_payload,
+                self._handle_gateway_state,
+                self.config.gateway_last_seq,
+                self._handle_gateway_sequence,
+                gateway_crypto,
+                self.config.gateway_public_key,
+                self.config.gateway_session_token,
+                self._handle_gateway_session,
+                self.config.gateway_device_credential,
+                self._handle_gateway_credential,
+                self._handle_gateway_control,
+            )
+            self.gateway_task = asyncio.create_task(self.gateway_client.run())
         discovery_ready = False
         try:
             transport, _protocol = await self.loop.create_datagram_endpoint(
@@ -666,11 +1142,222 @@ class BridgeServer:
                 self.event_queue.put(("server", f"正在监听端口 {self.config.port}{discovery_text}"))
                 await self.stop_event.wait()
         finally:
+            self._stop_rollout_observer()
+            for handle in self.rollout_debounce.values():
+                handle.cancel()
+            self.rollout_debounce.clear()
+            if self.gateway_client:
+                await self.gateway_client.stop()
+            if self.gateway_task:
+                self.gateway_task.cancel()
+                await asyncio.gather(self.gateway_task, return_exceptions=True)
+            for gateway_connection in self.gateway_connections.values():
+                self.connections.discard(gateway_connection)
+            self.gateway_connections.clear()
             if self.discovery_transport is not None:
                 self.discovery_transport.close()
                 self.discovery_transport = None
             if self.codex:
                 await self.codex.stop()
+
+    def _start_rollout_observer(self) -> None:
+        if Observer is None or self.loop is None:
+            self.event_queue.put(("server", "Codex 实时监听不可用，将使用轮询兜底"))
+            return
+        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        observer = Observer()
+        handler = RolloutEventHandler(self._handle_rollout_path_change)
+        watched = 0
+        for folder_name in ("sessions", "archived_sessions"):
+            folder = codex_home / folder_name
+            if folder.is_dir():
+                observer.schedule(handler, str(folder), recursive=True)
+                watched += 1
+        if watched == 0:
+            self.event_queue.put(("server", "尚未发现 Codex 会话目录，将使用轮询兜底"))
+            return
+        observer.start()
+        self.rollout_observer = observer
+        self.event_queue.put(("server", "Codex 任务实时监听已启动"))
+
+    def _stop_rollout_observer(self) -> None:
+        observer = self.rollout_observer
+        self.rollout_observer = None
+        if observer is None:
+            return
+        try:
+            observer.stop()  # type: ignore[attr-defined]
+            observer.join(timeout=2)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _handle_rollout_path_change(self, path_value: str) -> None:
+        match = ROLLOUT_THREAD_PATTERN.search(Path(path_value).name)
+        loop = self.loop
+        if match is None or loop is None or loop.is_closed():
+            return
+        thread_id = match.group(1)
+        loop.call_soon_threadsafe(self._debounce_rollout_push, thread_id)
+
+    def _debounce_rollout_push(self, thread_id: str) -> None:
+        previous = self.rollout_debounce.pop(thread_id, None)
+        if previous is not None:
+            previous.cancel()
+        loop = asyncio.get_running_loop()
+        self.rollout_debounce[thread_id] = loop.call_later(
+            0.22, lambda: asyncio.create_task(self._publish_rollout_change(thread_id)))
+
+    async def _publish_rollout_change(self, thread_id: str) -> None:
+        self.rollout_debounce.pop(thread_id, None)
+        if self.codex is None:
+            return
+        try:
+            detail = await asyncio.to_thread(
+                read_rollout_thread_detail, thread_id,
+                self.codex.thread_metadata.get(thread_id))
+        except (OSError, UnicodeError):
+            return
+        if detail is None:
+            return
+        previous = self.rollout_states.get(thread_id, {})
+        previous_messages = previous.get("messages")
+        known_messages = previous_messages if isinstance(previous_messages, dict) else {}
+        previous_activities = previous.get("activities")
+        known_activities = previous_activities if isinstance(previous_activities, dict) else {}
+        current_messages = self._message_signatures(detail)
+        current_activities = self._activity_signatures(detail)
+        messages = detail.get("messages")
+        changed_messages = [message for message in messages
+                            if isinstance(message, dict) and
+                            known_messages.get(self._message_id(message)) !=
+                            self._message_signature(message)] \
+            if isinstance(messages, list) else []
+        activities = detail.get("activities")
+        changed_activities = [activity for activity in activities
+                              if isinstance(activity, dict) and
+                              known_activities.get(str(activity.get("id", ""))) !=
+                              self._activity_signature(activity)] \
+            if isinstance(activities, list) else []
+        status = str(detail.get("status", "idle"))
+        rollout_event = str(detail.get("rolloutEvent", ""))
+        active_turn_id = str(detail.get("activeTurnId", ""))
+        updated_at = int(detail.get("updatedAt", 0) or 0)
+        previous_event = str(previous.get("rolloutEvent", ""))
+        previous_status = str(previous.get("status", ""))
+        self.rollout_states[thread_id] = {
+            "messages": current_messages,
+            "activities": current_activities,
+            "status": status,
+            "rolloutEvent": rollout_event,
+            "activeTurnId": active_turn_id,
+            "updatedAt": updated_at,
+        }
+        self.codex.thread_status[thread_id] = status
+        metadata = self.codex.thread_metadata.setdefault(thread_id, {})
+        metadata.update({
+            "id": thread_id,
+            "name": str(detail.get("title", "")),
+            "title": str(detail.get("title", "")),
+            "preview": str(detail.get("preview", "")),
+            "cwd": str(detail.get("cwd", "")),
+            "updatedAt": updated_at,
+            "archived": bool(detail.get("archived", False)),
+            "status": status,
+        })
+        delta = dict(self._phone_thread_detail(detail))
+        delta["messages"] = changed_messages
+        delta["activities"] = changed_activities
+        delta["updateMode"] = "delta"
+        await self._broadcast({"type": "codex_thread", "thread": delta})
+
+        phone_event = ""
+        if rollout_event != previous_event:
+            if rollout_event == "task_started":
+                phone_event = "turn/started"
+            elif rollout_event in ("task_complete", "turn_aborted"):
+                phone_event = "turn/completed"
+        elif previous_status and status != previous_status:
+            phone_event = "turn/started" if status == "active" else "turn/completed"
+        if phone_event:
+            await self._broadcast({
+                "type": "codex_event", "event": phone_event,
+                "params": {"threadId": thread_id, "updatedAt": updated_at},
+            })
+            if phone_event == "turn/completed" and thread_id in self.pending_desktop_open:
+                self.pending_desktop_open.discard(thread_id)
+                asyncio.create_task(self._open_completed_codex_thread(thread_id))
+            elif phone_event == "turn/completed":
+                await self._schedule_codex_refresh()
+
+    async def _handle_gateway_payload(self, payload: dict[str, object],
+                                      source_device_id: str) -> None:
+        if self.gateway_client is None or not source_device_id:
+            return
+        gateway_connection = self.gateway_connections.get(source_device_id)
+        if gateway_connection is None:
+            self.event_queue.put(("gateway_phone_seen", source_device_id))
+            gateway_connection = GatewayRelayConnection(
+                self.gateway_client, source_device_id)
+            self.gateway_connections[source_device_id] = gateway_connection
+            self.connections.add(gateway_connection)
+        await self._handle_message(
+            gateway_connection,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _handle_gateway_state(self, connected: bool, message: str) -> None:
+        self.event_queue.put(("gateway_connected" if connected else "gateway_disconnected", message))
+
+    def _handle_gateway_sequence(self, seq: int) -> None:
+        self.config.gateway_last_seq = max(self.config.gateway_last_seq, seq)
+        self.config.save()
+
+    def _handle_gateway_send_counter(self, counter: int) -> None:
+        self.config.gateway_send_counter = max(self.config.gateway_send_counter, counter)
+        self.config.save()
+
+    def _handle_gateway_receive_counter(self, device_id: str, counter: int) -> None:
+        self.config.gateway_received_counters[device_id] = max(
+            self.config.gateway_received_counters.get(device_id, 0), counter)
+        self.config.save()
+
+    def _handle_gateway_session(self, session_token: str) -> None:
+        self.config.gateway_session_token = session_token
+        self.config.save()
+
+    def _handle_gateway_credential(self, credential: str) -> None:
+        self.config.gateway_device_credential = credential
+        self.config.save()
+
+    async def _handle_gateway_control(self, message: dict[str, object]) -> None:
+        message_type = str(message.get("type", ""))
+        if message_type in ("gateway_pairing_created", "gateway_pairing_request",
+                            "gateway_pairing_approved"):
+            self.event_queue.put((message_type, json.dumps(
+                message, ensure_ascii=False, separators=(",", ":"))))
+        elif message_type == "gateway_peer_snapshot":
+            self.event_queue.put(("gateway_phone_snapshot", json.dumps(
+                message, ensure_ascii=False, separators=(",", ":"))))
+        elif message_type == "gateway_presence" and message.get("role") == "phone":
+            self.event_queue.put(("gateway_phone_presence", json.dumps(
+                message, ensure_ascii=False, separators=(",", ":"))))
+
+    def create_public_pairing(self) -> None:
+        if not self.loop or not self.gateway_client:
+            self.event_queue.put(("error", "公网 Gateway 未连接"))
+            return
+        asyncio.run_coroutine_threadsafe(self.gateway_client.send_control({
+            "type": "gateway_pairing_create",
+        }), self.loop)
+
+    def decide_public_pairing(self, request_id: str, approved: bool) -> None:
+        if not self.loop or not self.gateway_client:
+            return
+        asyncio.run_coroutine_threadsafe(self.gateway_client.send_control({
+            "type": "gateway_pairing_decision",
+            "requestId": request_id,
+            "approved": approved,
+        }), self.loop)
 
     async def _handle_client(self, connection: websockets.ServerConnection) -> None:
         remote = connection.remote_address
@@ -686,7 +1373,10 @@ class BridgeServer:
             await connection.close(code=4001, reason="invalid token")
             self.event_queue.put(("error", f"拒绝了来自 {remote_ip} 的无效配对请求"))
             return
-        self.event_queue.put(("client_connected", peer_label))
+        supplied_device_id = str(query.get("deviceId", [""])[0]).strip()
+        lan_device_id = (supplied_device_id if re.fullmatch(
+            r"phone-[A-Za-z0-9._-]{8,120}", supplied_device_id) else peer_label)
+        self.event_queue.put(("client_connected", lan_device_id))
         self.connections.add(connection)
         await self._send_json(connection, {
             "type": "hello",
@@ -707,9 +1397,9 @@ class BridgeServer:
             pass
         finally:
             self.connections.discard(connection)
-            self.event_queue.put(("client_disconnected", peer_label))
+            self.event_queue.put(("client_disconnected", lan_device_id))
 
-    async def _handle_message(self, connection: websockets.ServerConnection, raw: str | bytes) -> None:
+    async def _handle_message(self, connection: object, raw: str | bytes) -> None:
         if not isinstance(raw, str):
             await self._send_error(connection, "不支持二进制消息")
             return
@@ -741,7 +1431,8 @@ class BridgeServer:
         elif message_type == "ping":
             ok, result = True, "pong"
         elif message_type == "codex_snapshot_request":
-            await self._send_codex_snapshot(connection)
+            await self._send_codex_snapshot(
+                connection, bool(message.get("includeArchived", False)))
             return
         elif message_type == "codex_thread_request":
             thread_id = str(message.get("threadId", ""))
@@ -761,8 +1452,9 @@ class BridgeServer:
             thread_id = str(message.get("threadId", ""))
             text = str(message.get("text", "")).strip()
             submit_mode = str(message.get("submitMode", "enter"))
+            image_data_url = str(message.get("imageData", ""))
             try:
-                image_bytes = self._decode_image_data(message.get("imageData", ""))
+                self._decode_image_data(image_data_url)
             except ValueError as error:
                 await self._send_error(connection, str(error), message_id)
                 return
@@ -771,7 +1463,12 @@ class BridgeServer:
                 await self._send_error(connection, "Codex 浠诲姟鎴栨秷鎭唴瀹规棤鏁?", message_id)
                 return
             await self._codex_image_send(connection, thread_id, text, submit_mode,
-                                         image_bytes, message_id)
+                                         image_data_url, message_id,
+                                         str(message.get("model", "")),
+                                         str(message.get("effort", "")),
+                                         str(message.get("permissionMode", "default")),
+                                         str(message.get("serviceTier", "")),
+                                         str(message.get("deliveryMode", "background")))
             return
         elif message_type == "codex_send":
             thread_id = str(message.get("threadId", ""))
@@ -781,7 +1478,61 @@ class BridgeServer:
                     submit_mode not in ("enter", "ctrl_enter")):
                 await self._send_error(connection, "Codex 任务或消息内容无效", message_id)
                 return
-            await self._codex_send(connection, thread_id, text, submit_mode, message_id)
+            await self._codex_send(connection, thread_id, text, submit_mode, message_id,
+                                   str(message.get("model", "")),
+                                   str(message.get("effort", "")),
+                                   str(message.get("permissionMode", "default")),
+                                   str(message.get("serviceTier", "")),
+                                   str(message.get("deliveryMode", "background")))
+            return
+        elif message_type == "codex_create":
+            cwd = str(message.get("cwd", "")).strip()
+            text = str(message.get("text", "")).strip()
+            model = str(message.get("model", "")).strip()
+            effort = str(message.get("effort", "")).strip()
+            permission_mode = str(message.get("permissionMode", "default")).strip()
+            service_tier = str(message.get("serviceTier", "")).strip()
+            delivery_mode = str(message.get("deliveryMode", "background")).strip()
+            image_data_url = str(message.get("imageData", "")).strip()
+            if delivery_mode == "desktop":
+                await self._send_error(
+                    connection,
+                    "桌面输入框模式暂不支持新建任务，请先在电脑端新建，或切换为默认模式",
+                    message_id)
+                return
+            if not cwd or not text or len(text) > MAX_TEXT_LENGTH:
+                await self._send_error(connection, "新任务的工作区或内容无效", message_id)
+                return
+            try:
+                if image_data_url:
+                    self._decode_image_data(image_data_url)
+                resolved_cwd = Path(cwd).expanduser().resolve(strict=True)
+                if not resolved_cwd.is_dir():
+                    raise ValueError("工作区不是目录")
+                assert self.codex is not None
+                known_roots = {
+                    Path(str(meta.get("cwd", ""))).resolve()
+                    for meta in self.codex.thread_metadata.values()
+                    if str(meta.get("cwd", "")).strip()
+                }
+                configured = os.environ.get("STARLY_WORKSPACE_ROOTS", "")
+                for root in configured.split(os.pathsep):
+                    if root.strip():
+                        known_roots.add(Path(root).expanduser().resolve())
+                if not any(resolved_cwd == root or root in resolved_cwd.parents
+                           for root in known_roots):
+                    raise ValueError(
+                        "工作区未授权；请先在 Codex 中打开，或加入 STARLY_WORKSPACE_ROOTS")
+                created = await self.codex.create_thread(
+                    str(resolved_cwd), text, model, effort, permission_mode, service_tier,
+                    image_data_url)
+                await self._send_json(connection, {
+                    "type": "codex_created", "id": message_id, **created,
+                    "operation": "codex_create",
+                })
+                await self._schedule_codex_refresh()
+            except Exception as error:
+                await self._send_error(connection, f"新建 Codex 任务失败：{error}", message_id)
             return
         elif message_type == "codex_interrupt":
             thread_id = str(message.get("threadId", ""))
@@ -791,6 +1542,70 @@ class BridgeServer:
                 return
             await self._codex_interrupt(connection, thread_id, turn_id, message_id)
             return
+        elif message_type == "codex_approval_decision":
+            approval_id = str(message.get("approvalId", ""))
+            decision = str(message.get("decision", ""))
+            permissions = message.get("permissions")
+            if (not approval_id or decision not in
+                    ("accept", "acceptForSession", "decline", "cancel") or
+                    (permissions is not None and not isinstance(permissions, dict))):
+                await self._send_error(connection, "审批决定参数无效", message_id)
+                return
+            try:
+                assert self.codex is not None
+                await self.codex.resolve_approval(
+                    approval_id, decision,
+                    permissions if isinstance(permissions, dict) else None)
+                await self._send_json(connection, {
+                    "type": "ack", "id": message_id, "message": "审批决定已提交",
+                })
+            except Exception as error:
+                await self._send_error(connection, f"提交审批决定失败：{error}", message_id)
+            return
+        elif message_type == "codex_archive":
+            thread_id = str(message.get("threadId", ""))
+            archived = bool(message.get("archived", True))
+            if not thread_id:
+                await self._send_error(connection, "缺少 Codex 任务编号", message_id)
+                return
+            try:
+                assert self.codex is not None
+                await self.codex.set_archived(thread_id, archived)
+                await self._send_json(connection, {
+                    "type": "ack", "id": message_id,
+                    "message": "任务已归档" if archived else "任务已恢复",
+                })
+                await self._broadcast({
+                    "type": "codex_event",
+                    "event": "thread/archived" if archived else "thread/unarchived",
+                    "params": {"threadId": thread_id},
+                })
+            except Exception as error:
+                await self._send_error(connection, f"更新任务归档状态失败：{error}", message_id)
+            return
+        elif message_type == "codex_rename":
+            thread_id = str(message.get("threadId", "")).strip()
+            name = str(message.get("name", "")).strip()
+            if not thread_id:
+                await self._send_error(connection, "缺少 Codex 任务编号", message_id)
+                return
+            if not name or len(name) > 80:
+                await self._send_error(connection, "任务名称应为 1 到 80 个字符", message_id)
+                return
+            try:
+                assert self.codex is not None
+                await self.codex.rename_thread(thread_id, name)
+                await self._send_json(connection, {
+                    "type": "ack", "id": message_id, "message": "任务已重命名",
+                })
+                await self._broadcast({
+                    "type": "codex_event",
+                    "event": "thread/renamed",
+                    "params": {"threadId": thread_id},
+                })
+            except Exception as error:
+                await self._send_error(connection, f"重命名任务失败：{error}", message_id)
+            return
         else:
             await self._send_error(connection, "未知操作", message_id)
             return
@@ -799,6 +1614,7 @@ class BridgeServer:
         await self._send_json(connection, {
             "type": response_type,
             "id": message_id,
+            "operation": str(message_type or ""),
             "message": result,
         })
 
@@ -820,37 +1636,61 @@ class BridgeServer:
 
     async def _codex_image_send(self, connection: websockets.ServerConnection,
                                 thread_id: str, text: str, submit_mode: str,
-                                image_bytes: bytes, message_id: str) -> None:
+                                image_data_url: str, message_id: str,
+                                model: str = "", effort: str = "",
+                                permission_mode: str = "default",
+                                service_tier: str = "",
+                                delivery_mode: str = "background") -> None:
         assert self.codex is not None
         try:
+            if delivery_mode not in ("background", "desktop"):
+                raise ValueError("未知的发送方式")
+            if delivery_mode == "background":
+                await self.codex.send_message(
+                    thread_id, text, model, effort, permission_mode,
+                    image_data_url, service_tier)
+                self.pending_desktop_open.add(thread_id)
+                await self._send_json(connection, {
+                    "type": "ack", "id": message_id,
+                    "operation": "codex_image_send", "threadId": thread_id,
+                    "message": "图片和消息已通过默认后台通道发送",
+                })
+                await self._schedule_codex_refresh()
+                return
+
             before = await self.codex.thread_detail(thread_id)
             thread_title = str(before.get("title", "")).strip()
+            image_bytes = self._decode_image_data(image_data_url)
             ok, result = await asyncio.to_thread(
                 self._send_image_to_codex_desktop, thread_id, thread_title,
-                text, submit_mode, image_bytes)
+                text, submit_mode, image_bytes, model, effort,
+                permission_mode, service_tier)
             if not ok:
                 raise RuntimeError(result)
             await self._send_json(connection, {
                 "type": "ack", "id": message_id,
-                "message": "消息已发送给 Codex，电脑端已粘贴图片并按" +
-                           (" Ctrl+回车" if submit_mode == "ctrl_enter" else "回车"),
+                "operation": "codex_image_send", "threadId": thread_id,
+                "message": "图片和消息已通过 Codex 桌面输入框发送",
             })
-            await self._broadcast({
-                "type": "codex_event", "event": "turn/started",
-                "params": {"threadId": thread_id},
-            })
-            previous_poll = self.codex_poll_tasks.get(thread_id)
-            if previous_poll and not previous_poll.done():
-                previous_poll.cancel()
-            self.codex_poll_tasks[thread_id] = asyncio.create_task(
-                self._poll_desktop_codex_thread(thread_id, before))
-            await self._schedule_codex_refresh()
+            await self._watch_desktop_submission(thread_id, before)
         except Exception as error:
-            await self._send_error(connection, f"发送图片给 Codex 失败：{error}", message_id)
+            prefix = ("桌面输入框发送失败" if delivery_mode == "desktop"
+                      else "发送图片给 Codex 失败")
+            await self._send_error(connection, f"{prefix}：{error}", message_id)
 
-    async def _send_codex_snapshot(self, connection: websockets.ServerConnection) -> None:
+    async def _send_codex_snapshot(self, connection: websockets.ServerConnection,
+                                   include_archived: bool = False) -> None:
         assert self.codex is not None
-        snapshot = await self.codex.snapshot()
+        if self.codex_snapshot_lock is None:
+            self.codex_snapshot_lock = asyncio.Lock()
+        async with self.codex_snapshot_lock:
+            now = time.monotonic()
+            cached = self.codex_snapshot_cache.get(include_archived)
+            if cached is not None and now - cached[0] <= 3.0:
+                snapshot = cached[1]
+            else:
+                snapshot = await self.codex.snapshot(include_archived)
+                self.codex_snapshot_cache[include_archived] = (time.monotonic(), snapshot)
         await self._send_json(connection, {"type": "codex_snapshot", **snapshot})
 
     async def _send_codex_thread(self, connection: websockets.ServerConnection,
@@ -870,52 +1710,74 @@ class BridgeServer:
             await self._send_error(connection, f"读取 Codex 任务失败：{error}", message_id)
 
     async def _codex_send(self, connection: websockets.ServerConnection, thread_id: str,
-                          text: str, submit_mode: str, message_id: str) -> None:
+                          text: str, submit_mode: str, message_id: str,
+                          model: str = "", effort: str = "",
+                          permission_mode: str = "default",
+                          service_tier: str = "",
+                          delivery_mode: str = "background") -> None:
         assert self.codex is not None
         try:
+            if delivery_mode not in ("background", "desktop"):
+                raise ValueError("未知的发送方式")
+            if delivery_mode == "background":
+                await self.codex.send_message(
+                    thread_id, text, model, effort, permission_mode, "", service_tier)
+                self.pending_desktop_open.add(thread_id)
+                await self._send_json(connection, {
+                    "type": "ack", "id": message_id,
+                    "operation": "codex_send", "threadId": thread_id,
+                    "message": "消息已通过默认后台通道发送",
+                })
+                await self._schedule_codex_refresh()
+                return
+
             before = await self.codex.thread_detail(thread_id)
             thread_title = str(before.get("title", "")).strip()
             ok, result = await asyncio.to_thread(
-                self._send_to_codex_desktop, thread_id, thread_title, text, submit_mode)
-            used_background_channel = False
+                self._send_to_codex_desktop, thread_id, thread_title, text,
+                submit_mode, model, effort, permission_mode, service_tier)
             if not ok:
-                # UI Automation is inherently sensitive to Chromium navigation
-                # and focus timing. The app-server route provides a reliable
-                # fallback so an accepted phone command cannot be silently lost.
-                await self.codex.send_message(thread_id, text)
-                self.pending_desktop_open.add(thread_id)
-                used_background_channel = True
+                raise RuntimeError(result)
             await self._send_json(connection, {
                 "type": "ack", "id": message_id,
-                "message": "消息已发送给 Codex，" +
-                           ("桌面输入框暂不可用，已自动切换后台可靠通道" if used_background_channel else
-                            "电脑端已确认接收"),
+                "operation": "codex_send", "threadId": thread_id,
+                "message": "消息已通过 Codex 桌面输入框发送",
             })
-            if used_background_channel:
-                await self._schedule_codex_refresh()
-                return
-            await self._broadcast({
-                "type": "codex_event", "event": "turn/started",
-                "params": {"threadId": thread_id},
-            })
-            previous_poll = self.codex_poll_tasks.get(thread_id)
-            if previous_poll and not previous_poll.done():
-                previous_poll.cancel()
-            self.codex_poll_tasks[thread_id] = asyncio.create_task(
-                self._poll_desktop_codex_thread(thread_id, before))
-            await self._schedule_codex_refresh()
+            await self._watch_desktop_submission(thread_id, before)
         except Exception as error:
             error_text = str(error)
             if "thread not found" in error_text.lower():
                 error_text = "任务暂时无法恢复，请刷新任务列表后重新选择"
-            await self._send_error(connection, f"发送给 Codex 失败：{error_text}", message_id)
+            prefix = ("桌面输入框发送失败" if delivery_mode == "desktop"
+                      else "发送给 Codex 失败")
+            await self._send_error(connection, f"{prefix}：{error_text}", message_id)
+
+    async def _watch_desktop_submission(self, thread_id: str,
+                                        before: dict[str, object]) -> None:
+        await self._broadcast({
+            "type": "codex_event", "event": "turn/started",
+            "params": {"threadId": thread_id},
+        })
+        previous_poll = self.codex_poll_tasks.get(thread_id)
+        if previous_poll and not previous_poll.done():
+            previous_poll.cancel()
+        if self.rollout_observer is None:
+            self.codex_poll_tasks[thread_id] = asyncio.create_task(
+                self._poll_desktop_codex_thread(thread_id, before))
+        await self._schedule_codex_refresh()
 
     def _send_to_codex_desktop(self, thread_id: str, thread_title: str,
-                               text: str, submit_mode: str) -> tuple[bool, str]:
+                               text: str, submit_mode: str, model: str = "",
+                               effort: str = "", permission_mode: str = "default",
+                               service_tier: str = "") -> tuple[bool, str]:
         if not thread_title:
             return False, "无法确认 Codex 任务标题"
         if not open_codex_thread(thread_id):
             return False, "无法打开电脑端 Codex 任务"
+        configured, setting_result = configure_codex_composer(
+            model, effort, permission_mode, service_tier)
+        if not configured:
+            return False, setting_result
         focused, focus_result = focus_codex_composer(thread_title)
         if not focused:
             return False, focus_result
@@ -926,11 +1788,17 @@ class BridgeServer:
 
     def _send_image_to_codex_desktop(self, thread_id: str, thread_title: str,
                                      text: str, submit_mode: str,
-                                     image_bytes: bytes) -> tuple[bool, str]:
+                                     image_bytes: bytes, model: str = "",
+                                     effort: str = "", permission_mode: str = "default",
+                                     service_tier: str = "") -> tuple[bool, str]:
         if not thread_title:
             return False, "无法确认 Codex 任务标题"
         if not open_codex_thread(thread_id):
             return False, "无法打开电脑端 Codex 任务"
+        configured, setting_result = configure_codex_composer(
+            model, effort, permission_mode, service_tier)
+        if not configured:
+            return False, setting_result
         focused, focus_result = focus_codex_composer(thread_title)
         if not focused:
             return False, focus_result
@@ -946,12 +1814,30 @@ class BridgeServer:
         saw_new_message = False
         baseline_message = self._latest_message_signature(baseline_detail)
         known_messages = self._message_signatures(baseline_detail)
+        known_activities = self._activity_signatures(baseline_detail)
         last_status = str(baseline_detail.get("status", ""))
         last_active_turn_id = str(baseline_detail.get("activeTurnId", ""))
+        consecutive_read_errors = 0
         try:
-            for _ in range(300):
-                await asyncio.sleep(1)
-                detail = await self.codex.thread_detail(thread_id)
+            # Keep following the desktop-owned turn until it reaches a terminal
+            # state. Long Codex tasks can legitimately run for more than five
+            # minutes; the task is cancelled when a newer poll replaces it or
+            # when StarlyBridge shuts down.
+            while True:
+                retry_delay = min(10, 2 ** min(consecutive_read_errors, 4))
+                await asyncio.sleep(retry_delay)
+                try:
+                    detail = await self.codex.thread_detail(thread_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Codex Desktop can briefly rotate or lock its rollout while
+                    # persisting a turn. Keep following the same task instead of
+                    # abandoning completion detection after one failed read.
+                    consecutive_read_errors += 1
+                    await self._schedule_codex_refresh()
+                    continue
+                consecutive_read_errors = 0
                 active_turn_id = str(detail.get("activeTurnId", ""))
                 status = str(detail.get("status", "idle"))
                 latest_message = self._latest_message_signature(detail)
@@ -968,12 +1854,24 @@ class BridgeServer:
                         if known_messages.get(message_id) != signature:
                             changed_messages.append(message)
                             known_messages[message_id] = signature
+                changed_activities: list[dict[str, object]] = []
+                activities = detail.get("activities")
+                if isinstance(activities, list):
+                    for activity in activities:
+                        if not isinstance(activity, dict):
+                            continue
+                        activity_id = str(activity.get("id", ""))
+                        signature = self._activity_signature(activity)
+                        if activity_id and known_activities.get(activity_id) != signature:
+                            changed_activities.append(activity)
+                            known_activities[activity_id] = signature
                 if changed_messages or (latest_message and latest_message != baseline_message):
                     saw_new_message = True
                 status_changed = status != last_status or active_turn_id != last_active_turn_id
-                if changed_messages or status_changed:
+                if changed_messages or changed_activities or status_changed:
                     delta = dict(self._phone_thread_detail(detail))
                     delta["messages"] = changed_messages
+                    delta["activities"] = changed_activities
                     delta["updateMode"] = "delta"
                     await self._broadcast({"type": "codex_thread", "thread": delta})
                 baseline_message = latest_message or baseline_message
@@ -993,11 +1891,6 @@ class BridgeServer:
                     return
         except asyncio.CancelledError:
             raise
-        except Exception as error:
-            await self._broadcast({
-                "type": "error",
-                "message": f"同步电脑端 Codex 回复失败：{error}",
-            })
         finally:
             current = self.codex_poll_tasks.get(thread_id)
             if current is asyncio.current_task():
@@ -1048,6 +1941,31 @@ class BridgeServer:
         return result
 
     @staticmethod
+    def _activity_signature(activity: dict[str, object]) -> str:
+        return json.dumps({
+            "id": str(activity.get("id", "")),
+            "kind": str(activity.get("kind", "")),
+            "title": str(activity.get("title", "")),
+            "text": str(activity.get("text", "")),
+            "status": str(activity.get("status", "")),
+            "timestamp": int(activity.get("timestamp", 0) or 0),
+            "turnId": str(activity.get("turnId", "")),
+        }, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def _activity_signatures(cls, detail: dict[str, object]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        activities = detail.get("activities")
+        if not isinstance(activities, list):
+            return result
+        for activity in activities:
+            if isinstance(activity, dict):
+                activity_id = str(activity.get("id", ""))
+                if activity_id:
+                    result[activity_id] = cls._activity_signature(activity)
+        return result
+
+    @staticmethod
     def _terminal_poll_event(status: str, saw_activity: bool) -> str:
         if not saw_activity:
             return ""
@@ -1067,6 +1985,9 @@ class BridgeServer:
         if isinstance(messages, list) and len(messages) > MAX_PHONE_DETAIL_MESSAGES:
             payload["messages"] = messages[-MAX_PHONE_DETAIL_MESSAGES:]
             payload["hasMoreBefore"] = True
+        activities = detail.get("activities")
+        if isinstance(activities, list) and len(activities) > MAX_PHONE_ACTIVITIES:
+            payload["activities"] = activities[-MAX_PHONE_ACTIVITIES:]
         return payload
 
     async def _codex_interrupt(self, connection: websockets.ServerConnection, thread_id: str,
@@ -1075,13 +1996,22 @@ class BridgeServer:
         try:
             await self.codex.interrupt(thread_id, turn_id)
             await self._send_json(connection, {
-                "type": "ack", "id": message_id, "message": "已请求停止 Codex 任务",
+                "type": "ack", "id": message_id, "operation": "codex_interrupt",
+                "threadId": thread_id, "message": "已请求停止 Codex 任务",
             })
             await self._schedule_codex_refresh()
         except Exception as error:
             await self._send_error(connection, f"停止 Codex 任务失败：{error}", message_id)
 
     async def _handle_codex_event(self, method: str, params: dict[str, object]) -> None:
+        if method in ("item/commandExecution/requestApproval",
+                      "item/fileChange/requestApproval",
+                      "item/permissions/requestApproval"):
+            await self._broadcast({
+                "type": "codex_approval",
+                "approval": normalize_approval(method, params),
+            })
+            return
         if method in ("thread/status/changed", "turn/started", "turn/completed",
                       "account/rateLimits/updated"):
             phone_event = method
@@ -1181,7 +2111,8 @@ class BridgeServer:
     @classmethod
     def _safe_log_value(cls, value: object, key: str = "") -> object:
         key_lower = key.lower()
-        if key_lower in ("token", "authorization", "pairingtoken"):
+        if key_lower in ("token", "authorization", "pairingtoken",
+                          "devicecredential", "secret", "sessiontoken"):
             return "[已隐藏]"
         if isinstance(value, dict):
             return {str(item_key): cls._safe_log_value(item_value, str(item_key))
@@ -1234,6 +2165,31 @@ def create_tray_image() -> Image.Image:
     return image
 
 
+def format_paired_devices(lan_devices: set[str],
+                          gateway_devices: dict[str, dict[str, object]]) -> str:
+    """Render paired phones without confusing Gateway pairing with LAN sockets."""
+    device_ids = set(lan_devices) | set(gateway_devices)
+    paired_count = len(device_ids)
+    online_count = sum(
+        1 for device_id in device_ids
+        if device_id in lan_devices or
+        bool(gateway_devices.get(device_id, {}).get("online", False)))
+    if paired_count == 0:
+        return "暂无已配对手机"
+    lines = [f"已配对 {paired_count} 部手机 · 在线 {online_count} 部"]
+    for device_id in sorted(device_ids):
+        device = gateway_devices.get(device_id, {})
+        display_name = str(device.get("displayName", "")).strip() or device_id
+        states: list[str] = []
+        if device_id in lan_devices:
+            states.append("局域网在线")
+        if device_id in gateway_devices:
+            states.append("公网在线" if bool(device.get("online", False))
+                          else "公网已配对（离线）")
+        lines.append(f"• {display_name} · {' · '.join(states)}")
+    return "\n".join(lines)
+
+
 class BridgeApp:
     def __init__(self) -> None:
         self.config = BridgeConfig.load()
@@ -1244,18 +2200,26 @@ class BridgeApp:
         self.server = BridgeServer(self.config, self.events)
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("520x720")
-        self.root.minsize(480, 640)
+        self.root.geometry("540x860")
+        self.root.minsize(500, 720)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.status_var = tk.StringVar(value="正在启动…")
         self.address_var = tk.StringVar()
         self.pairing_code_var = tk.StringVar()
-        self.paired_devices_var = tk.StringVar(value="暂无手机连接")
+        self.public_pairing_code_var = tk.StringVar(value="点击下方按钮生成")
+        self.public_pairing_expiry_var = tk.StringVar(value="一次性配对码有效期 2 分钟")
+        self.gateway_config_var = tk.StringVar(value=self._gateway_config_summary())
+        self.paired_devices_var = tk.StringVar(value="暂无已配对手机")
         self.connected_devices: set[str] = set()
+        self.gateway_devices: dict[str, dict[str, object]] = {}
+        self.lan_pairing_collapsed = False
+        self.public_pairing_collapsed = False
         self.qr_collapsed = True
         self.log_collapsed = False
         self.log_text: tk.Text
         self.qr_photo: ImageTk.PhotoImage | None = None
+        self.public_qr_photo: ImageTk.PhotoImage | None = None
+        self.gateway_settings_window: tk.Toplevel | None = None
         self.tray: pystray.Icon | None = None
         self._build_ui()
         self._refresh_pairing_view()
@@ -1279,23 +2243,60 @@ class BridgeApp:
         qr_header = ttk.Frame(qr_frame)
         qr_header.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(qr_header, text="手机会自动发现本机，请输入下方 6 位码").pack(side=tk.LEFT)
-        self.qr_toggle_button = ttk.Button(qr_header, text="备用方式", command=self.toggle_qr)
-        self.qr_toggle_button.pack(side=tk.RIGHT)
+        self.lan_pairing_toggle_button = ttk.Button(
+            qr_header, text="收起", command=self.toggle_lan_pairing, width=8)
+        self.lan_pairing_toggle_button.pack(side=tk.RIGHT)
+        self.lan_pairing_body = ttk.Frame(qr_frame)
+        self.lan_pairing_body.pack(fill=tk.X)
         ttk.Label(
-            qr_frame,
+            self.lan_pairing_body,
             textvariable=self.pairing_code_var,
             font=("Consolas", 34, "bold"),
             foreground="#175CD3",
         ).pack(pady=(3, 2))
-        ttk.Label(qr_frame, textvariable=self.address_var, foreground="#475467").pack()
-        ttk.Button(qr_frame, text="换一个六位配对码", command=self.regenerate_pairing_code).pack(pady=(10, 2))
-        self.qr_body = ttk.Frame(qr_frame)
+        ttk.Label(self.lan_pairing_body, textvariable=self.address_var, foreground="#475467").pack()
+        ttk.Button(
+            self.lan_pairing_body, text="换一个六位配对码",
+            command=self.regenerate_pairing_code).pack(pady=(10, 2))
+        self.qr_toggle_button = ttk.Button(
+            self.lan_pairing_body, text="展开二维码和密钥选项", command=self.toggle_qr)
+        self.qr_toggle_button.pack(pady=(6, 0))
+        self.qr_body = ttk.Frame(self.lan_pairing_body)
         self.qr_label = ttk.Label(self.qr_body)
         self.qr_label.pack(pady=(10, 8))
         button_row = ttk.Frame(self.qr_body)
         button_row.pack(fill=tk.X, pady=(12, 0))
         ttk.Button(button_row, text="复制配对信息", command=self.copy_pairing).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
         ttk.Button(button_row, text="更换长期密钥", command=self.regenerate_token).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(6, 0))
+        public_frame = ttk.LabelFrame(outer, text="公网安全配对", padding=12)
+        public_frame.pack(fill=tk.X, pady=(10, 0))
+        public_header = ttk.Frame(public_frame)
+        public_header.pack(fill=tk.X, pady=(0, 7))
+        ttk.Label(public_header, text="手机扫码或输入 8 位短码，电脑端确认后才会授权",
+                  foreground="#475467").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.public_pairing_toggle_button = ttk.Button(
+            public_header, text="收起", command=self.toggle_public_pairing, width=8)
+        self.public_pairing_toggle_button.pack(side=tk.RIGHT, padx=(8, 0))
+        self.public_pairing_body = ttk.Frame(public_frame)
+        self.public_pairing_body.pack(fill=tk.X)
+        gateway_header = ttk.Frame(self.public_pairing_body)
+        gateway_header.pack(fill=tk.X, pady=(0, 7))
+        ttk.Label(gateway_header, textvariable=self.gateway_config_var,
+                  foreground="#175CD3", wraplength=330).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(gateway_header, text="配置服务器",
+                   command=self._open_gateway_settings).pack(side=tk.RIGHT, padx=(8, 0))
+        public_row = ttk.Frame(self.public_pairing_body)
+        public_row.pack(fill=tk.X, pady=(8, 0))
+        self.public_qr_label = ttk.Label(public_row)
+        self.public_qr_label.pack(side=tk.LEFT, padx=(0, 12))
+        public_info = ttk.Frame(public_row)
+        public_info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(public_info, textvariable=self.public_pairing_code_var,
+                  font=("Consolas", 21, "bold"), foreground="#175CD3").pack(anchor=tk.W)
+        ttk.Label(public_info, textvariable=self.public_pairing_expiry_var,
+                  foreground="#667085", wraplength=250).pack(anchor=tk.W, pady=(3, 8))
+        ttk.Button(public_info, text="生成公网配对码",
+                   command=self.server.create_public_pairing).pack(anchor=tk.W)
         paired_frame = ttk.LabelFrame(outer, text="已配对手机", padding=12)
         paired_frame.pack(fill=tk.X, pady=(10, 0))
         ttk.Label(paired_frame, textvariable=self.paired_devices_var, foreground="#175CD3",
@@ -1312,6 +2313,8 @@ class BridgeApp:
         ttk.Label(log_header, text="显示精简收发摘要，完整日志仍保存到本机").pack(side=tk.LEFT)
         self.log_toggle_button = ttk.Button(log_header, text="收起日志", command=self.toggle_log)
         self.log_toggle_button.pack(side=tk.RIGHT)
+        ttk.Button(log_header, text="打开日志位置", command=self.open_log_location).pack(
+            side=tk.RIGHT, padx=(0, 8))
         self.log_body = ttk.Frame(log_frame)
         self.log_body.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(self.log_body, height=8, state=tk.DISABLED, wrap=tk.WORD,
@@ -1327,6 +2330,165 @@ class BridgeApp:
             foreground="#667085",
             wraplength=460,
         ).pack(anchor=tk.W)
+
+    def _gateway_config_summary(self) -> str:
+        if not self.config.gateway_enabled:
+            return "尚未配置公网服务器"
+        credential_state = ("设备凭据已保护" if self.config.gateway_device_credential
+                            else "等待首次安全登记")
+        return f"{self.config.gateway_url} · {credential_state}"
+
+    def _open_gateway_settings(self) -> None:
+        existing = self.gateway_settings_window
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        dialog = tk.Toplevel(self.root)
+        self.gateway_settings_window = dialog
+        dialog.title("公网服务器设置")
+        dialog.geometry("570x390")
+        dialog.minsize(530, 360)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+
+        body = ttk.Frame(dialog, padding=20)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="连接自建 Starly Gateway",
+                  font=("Microsoft YaHei UI", 16, "bold")).grid(
+                      row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 6))
+        ttk.Label(
+            body,
+            text="公网只允许 WSS。Pairing ID 和首次接入 Token 位于服务器的 "
+                 "/root/starly-gateway-credentials.txt。",
+            foreground="#667085", wraplength=510,
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 16))
+
+        url_var = tk.StringVar(master=dialog, value=self.config.gateway_url)
+        pairing_var = tk.StringVar(master=dialog, value=self.config.gateway_pairing_id)
+        token_var = tk.StringVar(master=dialog, value="")
+        ttk.Label(body, text="服务器地址").grid(row=2, column=0, sticky=tk.W, pady=6)
+        url_entry = ttk.Entry(body, textvariable=url_var, width=48)
+        url_entry.grid(row=2, column=1, sticky=tk.EW, pady=6)
+        ttk.Label(body, text="Pairing ID").grid(row=3, column=0, sticky=tk.W, pady=6)
+        ttk.Entry(body, textvariable=pairing_var, width=48).grid(
+            row=3, column=1, sticky=tk.EW, pady=6)
+        ttk.Label(body, text="首次接入 Token").grid(row=4, column=0, sticky=tk.W, pady=6)
+        ttk.Entry(body, textvariable=token_var, width=48, show="●").grid(
+            row=4, column=1, sticky=tk.EW, pady=6)
+        ttk.Label(
+            body,
+            text="Token 留空会保留当前凭据。输入新 Token 会重新登记设备；密钥只会经 "
+                 "Windows DPAPI 加密保存，不写入日志或二维码。",
+            foreground="#667085", wraplength=510,
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(10, 18))
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=6, column=0, columnspan=2, sticky=tk.EW)
+        ttk.Button(buttons, text="停用公网连接",
+                   command=lambda: self._disable_gateway(dialog)).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(
+            buttons, text="保存并重新连接",
+            command=lambda: self._save_gateway_settings(
+                dialog, url_var.get(), pairing_var.get(), token_var.get()),
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+        body.columnconfigure(1, weight=1)
+        url_entry.focus_set()
+
+    def _save_gateway_settings(self, dialog: tk.Toplevel, raw_url: str,
+                               raw_pairing_id: str, raw_token: str) -> None:
+        try:
+            gateway_url = normalize_gateway_url(raw_url)
+        except ValueError as error:
+            messagebox.showerror("服务器地址无效", str(error), parent=dialog)
+            return
+        pairing_id = raw_pairing_id.strip()
+        token = raw_token.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{8,128}", pairing_id):
+            messagebox.showerror(
+                "Pairing ID 无效", "Pairing ID 应为 8–128 位字母、数字、点、下划线或短横线。",
+                parent=dialog)
+            return
+        if token and not 32 <= len(token) <= 512:
+            messagebox.showerror(
+                "Token 无效", "首次接入 Token 长度应为 32–512 个字符。", parent=dialog)
+            return
+        pairing_changed = pairing_id != self.config.gateway_pairing_id
+        url_changed = gateway_url != self.config.gateway_url
+        if pairing_changed and not token:
+            messagebox.showerror(
+                "需要首次接入 Token", "更换 Pairing ID 时必须输入新服务器生成的 Token。",
+                parent=dialog)
+            return
+        if not token and not self.config.gateway_token:
+            messagebox.showerror(
+                "需要首次接入 Token", "首次配置服务器时必须输入 Token。", parent=dialog)
+            return
+        if (pairing_changed or (url_changed and token)) and not messagebox.askyesno(
+                "重新登记公网设备",
+                "将清除旧服务器签发的会话和设备凭据，并生成新的 PC 设备身份。是否继续？",
+                parent=dialog):
+            return
+
+        self.server.stop()
+        reset_identity = pairing_changed or (url_changed and bool(token))
+        self.config.gateway_url = gateway_url
+        self.config.gateway_pairing_id = pairing_id
+        if token:
+            self.config.gateway_token = token
+            self.config.gateway_session_token = ""
+            self.config.gateway_device_credential = ""
+        if reset_identity:
+            self.config.gateway_device_id = f"bridge-{secrets.token_hex(12)}"
+            private_key, public_key = generate_device_identity()
+            self.config.gateway_private_key = private_key
+            self.config.gateway_public_key = public_key
+            self.config.gateway_last_seq = 0
+            self.config.gateway_send_counter = 0
+            self.config.gateway_received_counters = {}
+            self.config.gateway_session_token = ""
+            self.config.gateway_device_credential = ""
+        self.config.save()
+        self.server = BridgeServer(self.config, self.events)
+        self.server.start()
+        self.gateway_config_var.set(self._gateway_config_summary())
+        self.public_pairing_code_var.set("连接成功后可生成")
+        self.public_pairing_expiry_var.set("公网地址和凭据已安全保存")
+        self.public_qr_label.configure(image="")
+        dialog.destroy()
+        self.status_var.set("正在连接自建公网服务器…")
+        self._append_log("公网 Gateway 配置已更新，正在重新连接")
+
+    def _disable_gateway(self, dialog: tk.Toplevel) -> None:
+        if self.config.gateway_enabled and not messagebox.askyesno(
+                "停用公网连接", "停用后仍可继续使用局域网连接。是否继续？", parent=dialog):
+            return
+        self.server.stop()
+        self.config.gateway_url = ""
+        self.config.gateway_pairing_id = secrets.token_hex(16)
+        self.config.gateway_token = secrets.token_urlsafe(32)
+        self.config.gateway_session_token = ""
+        self.config.gateway_device_credential = ""
+        self.config.gateway_device_id = f"bridge-{secrets.token_hex(12)}"
+        private_key, public_key = generate_device_identity()
+        self.config.gateway_private_key = private_key
+        self.config.gateway_public_key = public_key
+        self.config.gateway_last_seq = 0
+        self.config.gateway_send_counter = 0
+        self.config.gateway_received_counters = {}
+        self.config.save()
+        self.server = BridgeServer(self.config, self.events)
+        self.server.start()
+        self.gateway_config_var.set(self._gateway_config_summary())
+        self.public_pairing_code_var.set("请先配置公网服务器")
+        self.public_pairing_expiry_var.set("局域网连接不受影响")
+        self.public_qr_label.configure(image="")
+        dialog.destroy()
+        self.status_var.set("已停用公网连接")
+        self._append_log("公网 Gateway 已停用")
 
     def _pairing_uri(self) -> str:
         return "starly://pair?" + urllib.parse.urlencode({
@@ -1367,6 +2529,86 @@ class BridgeApp:
                 self.connected_devices.discard(message)
                 self._refresh_paired_devices()
                 display_message = f"手机已断开：{message}"
+            elif event_type == "gateway_phone_snapshot":
+                try:
+                    snapshot = json.loads(message)
+                    online_ids = {str(value) for value in snapshot.get("peerDevices", [])
+                                  if str(value)}
+                    devices: dict[str, dict[str, object]] = {}
+                    for value in snapshot.get("knownPeerDevices", []):
+                        if not isinstance(value, dict):
+                            continue
+                        device_id = str(value.get("deviceId", "")).strip()
+                        if not device_id:
+                            continue
+                        devices[device_id] = {
+                            "displayName": str(value.get("displayName", "")).strip(),
+                            "online": device_id in online_ids,
+                        }
+                    for device_id in online_ids:
+                        devices.setdefault(device_id, {
+                            "displayName": "", "online": True,
+                        })
+                    self.gateway_devices = devices
+                    self._refresh_paired_devices()
+                    display_message = "公网手机列表已同步"
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    display_message = "公网手机列表无法识别"
+            elif event_type == "gateway_phone_presence":
+                try:
+                    presence = json.loads(message)
+                    device_id = str(presence.get("deviceId", "")).strip()
+                    if device_id:
+                        device = self.gateway_devices.setdefault(device_id, {
+                            "displayName": "", "online": False,
+                        })
+                        device["online"] = bool(presence.get("online", False))
+                        self._refresh_paired_devices()
+                    display_message = ("公网手机已上线" if presence.get("online", False)
+                                       else "公网手机已离线")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    display_message = "公网手机状态无法识别"
+            elif event_type == "gateway_phone_seen":
+                device = self.gateway_devices.setdefault(message, {
+                    "displayName": "", "online": False,
+                })
+                device["online"] = True
+                self._refresh_paired_devices()
+                display_message = f"收到公网手机消息：{message}"
+            elif event_type == "gateway_pairing_created":
+                try:
+                    pairing = json.loads(message)
+                    self._show_public_pairing(pairing)
+                    display_message = "公网一次性配对码已生成，2 分钟内有效"
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    display_message = "公网配对信息无效"
+            elif event_type == "gateway_pairing_request":
+                try:
+                    pairing = json.loads(message)
+                    request_id = str(pairing.get("requestId", ""))
+                    phone_name = str(pairing.get("phoneName", "Starly Phone"))
+                    verification = str(pairing.get("verificationCode", ""))
+                    approved = messagebox.askyesno(
+                        "公网配对请求",
+                        f"是否允许手机“{phone_name}”连接？\n\n"
+                        f"安全校验码：{verification}\n\n"
+                        "请确认手机上显示的数字一致。")
+                    self.server.decide_public_pairing(request_id, approved)
+                    display_message = "已允许公网配对" if approved else "已拒绝公网配对"
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    display_message = "无法处理公网配对请求"
+            elif event_type == "gateway_pairing_approved":
+                self.public_pairing_code_var.set("配对已完成")
+                self.public_pairing_expiry_var.set("一次性信息已作废")
+                self.public_qr_label.configure(image="")
+                display_message = "手机已通过公网安全配对"
+            elif event_type in ("gateway_connected", "gateway_disconnected"):
+                self.gateway_config_var.set(self._gateway_config_summary())
+                if event_type == "gateway_disconnected":
+                    for device in self.gateway_devices.values():
+                        device["online"] = False
+                    self._refresh_paired_devices()
+                display_message = message
             elif event_type == "wire":
                 display_message = self._compact_wire_message(message)
             else:
@@ -1381,23 +2623,55 @@ class BridgeApp:
                     pass
         self.root.after(120, self._poll_events)
 
+    def _show_public_pairing(self, pairing: dict[str, object]) -> None:
+        gateway_url = self.config.gateway_url.split("?", 1)[0] + "?pair=1"
+        uri = "starly://public-pair?" + urllib.parse.urlencode({
+            "v": "2",
+            "url": gateway_url,
+            "session": str(pairing.get("sessionId", "")),
+            "secret": str(pairing.get("secret", "")),
+            "expires": str(pairing.get("expiresAt", "")),
+        })
+        qr = qrcode.QRCode(version=None, box_size=4, border=2)
+        qr.add_data(uri)
+        qr.make(fit=True)
+        image = qr.make_image(fill_color="#101828", back_color="white").convert("RGB")
+        image.thumbnail((145, 145), Image.Resampling.LANCZOS)
+        self.public_qr_photo = ImageTk.PhotoImage(image)
+        self.public_qr_label.configure(image=self.public_qr_photo)
+        self.public_pairing_code_var.set(str(pairing.get("code", "")))
+        self.public_pairing_expiry_var.set("二维码和短码只能使用一次，2 分钟后失效")
+
     def _refresh_paired_devices(self) -> None:
-        if not self.connected_devices:
-            self.paired_devices_var.set("暂无手机连接")
-            return
-        devices = sorted(self.connected_devices)
-        lines = [f"当前已配对 {len(devices)} 部手机"]
-        lines.extend(f"• {device}" for device in devices)
-        self.paired_devices_var.set("\n".join(lines))
+        self.paired_devices_var.set(format_paired_devices(
+            self.connected_devices, self.gateway_devices))
 
     def toggle_qr(self) -> None:
         self.qr_collapsed = not self.qr_collapsed
         if self.qr_collapsed:
             self.qr_body.pack_forget()
-            self.qr_toggle_button.configure(text="备用方式")
+            self.qr_toggle_button.configure(text="展开二维码和密钥选项")
         else:
             self.qr_body.pack(fill=tk.X)
-            self.qr_toggle_button.configure(text="收起备用方式")
+            self.qr_toggle_button.configure(text="收起二维码和密钥选项")
+
+    def toggle_lan_pairing(self) -> None:
+        self.lan_pairing_collapsed = not self.lan_pairing_collapsed
+        if self.lan_pairing_collapsed:
+            self.lan_pairing_body.pack_forget()
+            self.lan_pairing_toggle_button.configure(text="展开")
+        else:
+            self.lan_pairing_body.pack(fill=tk.X)
+            self.lan_pairing_toggle_button.configure(text="收起")
+
+    def toggle_public_pairing(self) -> None:
+        self.public_pairing_collapsed = not self.public_pairing_collapsed
+        if self.public_pairing_collapsed:
+            self.public_pairing_body.pack_forget()
+            self.public_pairing_toggle_button.configure(text="展开")
+        else:
+            self.public_pairing_body.pack(fill=tk.X)
+            self.public_pairing_toggle_button.configure(text="收起")
 
     def toggle_log(self) -> None:
         self.log_collapsed = not self.log_collapsed
@@ -1407,6 +2681,15 @@ class BridgeApp:
         else:
             self.log_body.pack(fill=tk.BOTH, expand=True)
             self.log_toggle_button.configure(text="收起日志")
+
+    def open_log_location(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(CONFIG_DIR))
+        except OSError as error:
+            messagebox.showerror(
+                "无法打开日志位置", f"资源管理器无法打开日志目录：{error}",
+                parent=self.root)
 
     @staticmethod
     def _compact_wire_message(message: str) -> str:
@@ -1485,7 +2768,9 @@ class BridgeApp:
         self._append_log("六位配对码已手动更新")
 
     def regenerate_token(self) -> None:
-        if not messagebox.askyesno("更换密钥", "现有手机连接会失效，需要重新扫码。是否继续？"):
+        if not messagebox.askyesno(
+                "更换局域网密钥",
+                "现有局域网直连会失效，需要重新配对；公网 Gateway 不受影响。是否继续？"):
             return
         self.server.stop()
         self.config.token = secrets.token_urlsafe(32)
@@ -1493,7 +2778,7 @@ class BridgeApp:
         self.server = BridgeServer(self.config, self.events)
         self.server.start()
         self._refresh_pairing_view()
-        self._append_log("配对密钥已更换")
+        self._append_log("局域网配对密钥已更换")
 
     def _autostart_command(self) -> str:
         executable = Path(sys.executable).resolve()
