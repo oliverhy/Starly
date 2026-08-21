@@ -9,6 +9,7 @@ const PAIRING_WAIT_MS: number = 1100;
 
 export class DiscoveredComputer {
   name: string = '';
+  deviceId: string = '';
   host: string = '';
   port: number = 8765;
   pairingPort: number = DISCOVERY_PORT;
@@ -35,6 +36,7 @@ class PairingDiscoveryService {
         }
         const computer = new DiscoveredComputer();
         computer.name = String(message['computer'] ?? '电脑');
+        computer.deviceId = String(message['deviceId'] ?? '');
         computer.host = info.remoteInfo.address;
         computer.port = this.validPort(Number(message['port'] ?? 8765), 8765);
         computer.pairingPort = this.validPort(Number(message['pairingPort'] ?? DISCOVERY_PORT), DISCOVERY_PORT);

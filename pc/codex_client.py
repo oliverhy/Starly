@@ -21,6 +21,7 @@ JsonObject = dict[str, Any]
 EventCallback = Callable[[str, JsonObject], Awaitable[None]]
 LOCAL_DETAIL_MESSAGE_LIMIT = 15
 LOCAL_ACTIVITY_LIMIT = 30
+SNAPSHOT_THREAD_LIMIT = 100
 THREAD_ID_PATTERN = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 
@@ -832,12 +833,14 @@ class CodexAppServerClient:
                 requests = [
                     self.request("account/rateLimits/read"),
                     self.request("account/usage/read"),
-                    self.request("thread/list", {"limit": 30, "archived": False}),
+                    self.request("thread/list", {
+                        "limit": SNAPSHOT_THREAD_LIMIT, "archived": False}),
                     self.request("model/list", {"limit": 50, "includeHidden": False}),
                 ]
                 if include_archived:
                     requests.append(self.request(
-                        "thread/list", {"limit": 30, "archived": True}))
+                        "thread/list", {
+                            "limit": SNAPSHOT_THREAD_LIMIT, "archived": True}))
                 responses = await asyncio.gather(*requests)
                 rate, usage, threads, models = responses[:4]
                 snapshot = normalize_snapshot(rate, usage, threads, models)

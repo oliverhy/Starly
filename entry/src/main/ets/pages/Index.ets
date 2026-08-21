@@ -1067,17 +1067,17 @@ struct Index {
       if (!this.isConnected) {
         return '中继未连接';
       }
-      return this.selectedGatewayDeviceOnline() ? '电脑在线' : '电脑离线';
+      return this.selectedGatewayDeviceOnline() ? '公网在线' : '电脑离线';
     }
     if (this.isConnected) {
-      return '电脑在线';
+      return '局域网在线';
     }
     return this.connectionMode === 'lan' ? '电脑离线' : '中继未连接';
   }
 
   private titleConnectionIcon(): string {
     const label = this.titleConnectionLabel();
-    if (label === '电脑在线') return '✓';
+    if (label === '公网在线' || label === '局域网在线') return '✓';
     if (label === '电脑离线') return '●';
     if (label === '中继未连接') return '!';
     return '•';
@@ -1085,7 +1085,7 @@ struct Index {
 
   private titleConnectionColor(): string {
     const label = this.titleConnectionLabel();
-    if (label === '电脑在线') return '#067647';
+    if (label === '公网在线' || label === '局域网在线') return '#067647';
     if (label === '电脑离线') return '#B54708';
     if (label === '中继未连接') return '#B42318';
     return '#667085';
@@ -1296,6 +1296,14 @@ struct Index {
               .fontSize(10)
               .lineHeight(15)
               .fontColor($r('app.color.text_secondary'))
+            if (this.gatewayPairingId.length > 0 &&
+              (this.host.trim().length === 0 || this.token.length < 16)) {
+              Text('当前仅有公网配对。请在下方完成一次局域网配对，才能自动优先直连。')
+                .width('100%')
+                .fontSize(10)
+                .lineHeight(15)
+                .fontColor('#FFB54708')
+            }
           }
           .width('100%')
           .padding(12)
@@ -4396,6 +4404,21 @@ struct Index {
         this.selectedComputerKey = '';
         this.pairingDiscoveryMessage = '没有发现电脑';
       } else {
+        const matchingGatewayComputer = this.selectedGatewayBridgeId.length > 0 ?
+          computers.find((computer: DiscoveredComputer): boolean =>
+            computer.deviceId.length > 0 && computer.deviceId === this.selectedGatewayBridgeId) : undefined;
+        if (matchingGatewayComputer !== undefined) {
+          this.selectedComputerKey = matchingGatewayComputer.key();
+          this.pairingDiscoveryMessage =
+            `已发现公网配对的同一台电脑 ${matchingGatewayComputer.name}`;
+          return;
+        }
+        if (this.selectedGatewayBridgeId.length > 0 && !this.readConfigFromForm().hasLan()) {
+          this.selectedComputerKey = '';
+          this.pairingDiscoveryMessage =
+            `发现 ${computers.length} 台电脑，但没有匹配当前公网电脑`;
+          return;
+        }
         let selectionStillExists = false;
         for (let index = 0; index < computers.length; index += 1) {
           if (computers[index].key() === this.selectedComputerKey) {
@@ -4879,8 +4902,12 @@ struct Index {
       this.publicPairingStatus = '公网配对成功，正在连接电脑…';
       this.statusText = '公网配对成功';
       this.statusIsError = false;
-      this.closePairingAfterConnect = true;
+      const needsLanPairing = !config.hasLan();
+      this.closePairingAfterConnect = !needsLanPairing;
       await remoteInputClient.connect(config);
+      if (needsLanPairing) {
+        await this.prepareLanPairingAfterGateway(config.targetDeviceId);
+      }
     } catch (error) {
       this.publicPairingStatus = `${error}`.replace('Error: ', '');
       this.statusText = this.publicPairingStatus;
@@ -4888,6 +4915,27 @@ struct Index {
     } finally {
       this.isPublicPairing = false;
     }
+  }
+
+  private async prepareLanPairingAfterGateway(targetDeviceId: string): Promise<void> {
+    this.pairingNetworkMode = 'lan';
+    await this.discoverPairingComputers();
+    const matched = this.discoveredComputers.find(
+      (computer: DiscoveredComputer): boolean => computer.deviceId.length > 0 &&
+        computer.deviceId === targetDeviceId);
+    if (matched !== undefined) {
+      this.selectedComputerKey = matched.key();
+      this.pairingDiscoveryMessage =
+        `已发现同一台电脑 ${matched.name}，请输入电脑端 6 位局域网配对码`;
+      this.statusText = '公网已连接；补充局域网配对后将自动优先直连';
+      this.statusIsError = false;
+      return;
+    }
+    this.selectedComputerKey = '';
+    this.pairingDiscoveryMessage =
+      '公网已连接，但未在当前局域网发现同一台电脑；连接同一 Wi-Fi 后重新搜索';
+    this.statusText = '当前使用公网中继；完成局域网配对后可自动优先直连';
+    this.statusIsError = false;
   }
 
   private handleCodexDetailTouch(event: TouchEvent): void {
@@ -5360,12 +5408,18 @@ struct Index {
   private codexHomeProjects(): string[] {
     const projects = [...this.codexProjects()];
     projects.sort((left: string, right: string): number =>
-      this.codexProjectTaskCount(right) - this.codexProjectTaskCount(left));
-    return projects.slice(0, 5);
+      this.codexProjectLatestUpdatedAt(right) - this.codexProjectLatestUpdatedAt(left));
+    return projects;
   }
 
-  private codexProjectTaskCount(cwd: string): number {
-    return this.codexTasks.filter((task: CodexTask): boolean => task.cwd === cwd).length;
+  private codexProjectLatestUpdatedAt(cwd: string): number {
+    let latest = 0;
+    this.codexTasks.forEach((task: CodexTask): void => {
+      if (task.cwd === cwd && task.updatedAt > latest) {
+        latest = task.updatedAt;
+      }
+    });
+    return latest;
   }
 
   private codexProjectName(cwd: string): string {
@@ -5406,8 +5460,9 @@ struct Index {
         `${task.title}\n${task.preview}\n${project}`.toLowerCase().includes(query));
     });
     projects.sort((left: string, right: string): number => {
-      const countDifference = this.codexProjectTaskCount(right) - this.codexProjectTaskCount(left);
-      return countDifference !== 0 ? countDifference :
+      const timeDifference = this.codexProjectLatestUpdatedAt(right) -
+        this.codexProjectLatestUpdatedAt(left);
+      return timeDifference !== 0 ? timeDifference :
         this.codexProjectName(left).localeCompare(this.codexProjectName(right));
     });
     return projects;
@@ -7176,14 +7231,14 @@ struct Index {
     const device = this.selectedGatewayDevice();
     if (this.activeConnectionTransport === 'lan') {
       const lanName = device?.displayName || this.gatewayDeviceName || '当前电脑';
-      return `当前电脑：${lanName} · 局域网直连`;
+      return `局域网直连 · ${lanName}`;
     }
     if (device === undefined) {
       return this.isConnected ? '当前电脑：局域网电脑 · 在线' : '尚未选择电脑';
     }
     const name = device.displayName || device.deviceId;
     if (device.online) {
-      return `当前电脑：${name} · 在线`;
+      return `公网中继 · ${name}`;
     }
     if (device.lastSeenAt <= 0) {
       return `当前电脑：${name} · 离线`;

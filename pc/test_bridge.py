@@ -24,8 +24,8 @@ from pc.starly_bridge import (BridgeApp, BridgeConfig, BridgeServer, CODEX_COMPO
                               desktop_speed_labels, find_available_port,
                               format_paired_devices, normalize_approval,
                               normalize_gateway_url)
-from pc.codex_client import (CodexAppServerClient, _item_content, normalize_snapshot,
-                             normalize_thread, read_rollout_thread_detail,
+from pc.codex_client import (SNAPSHOT_THREAD_LIMIT, CodexAppServerClient, _item_content,
+                             normalize_snapshot, normalize_thread, read_rollout_thread_detail,
                              read_thread_goal)
 from pc.codex_queue import CodexQueueItem, CodexQueueStore
 
@@ -206,6 +206,7 @@ class BridgeProtocolTests(unittest.TestCase):
         offer = json.loads(transport.packets[0][0].decode("utf-8"))
         self.assertEqual(offer["type"], "starly_offer")
         self.assertEqual(offer["pairingPort"], DEFAULT_DISCOVERY_PORT)
+        self.assertEqual(offer["deviceId"], server.config.gateway_device_id)
         self.assertNotIn("token", offer)
         self.assertNotIn("code", offer)
 
@@ -235,6 +236,7 @@ class BridgeProtocolTests(unittest.TestCase):
 
         response = json.loads(transport.packets[0][0].decode("utf-8"))
         self.assertEqual(response["type"], "starly_paired")
+        self.assertEqual(response["deviceId"], server.config.gateway_device_id)
         self.assertEqual(response["token"], server.config.token)
         self.assertNotEqual(server.config.pairing_code, "123456")
 
@@ -469,6 +471,7 @@ class BridgeProtocolTests(unittest.TestCase):
     def test_codex_snapshot_can_merge_archived_tasks(self) -> None:
         client = CodexAppServerClient()
         requested_archived: list[bool] = []
+        requested_limits: list[int] = []
 
         async def fake_request(method: str, params: dict[str, object] | None = None,
                                timeout: float = 15) -> dict[str, object]:
@@ -476,6 +479,7 @@ class BridgeProtocolTests(unittest.TestCase):
             if method == "thread/list":
                 archived = bool((params or {}).get("archived", False))
                 requested_archived.append(archived)
+                requested_limits.append(int((params or {}).get("limit", 0)))
                 suffix = "archived" if archived else "active"
                 return {"data": [{"id": suffix, "title": suffix}]}
             return {}
@@ -484,6 +488,7 @@ class BridgeProtocolTests(unittest.TestCase):
         snapshot = asyncio.run(client.snapshot(include_archived=True))
 
         self.assertEqual(requested_archived, [False, True])
+        self.assertEqual(requested_limits, [SNAPSHOT_THREAD_LIMIT, SNAPSHOT_THREAD_LIMIT])
         by_id = {item["id"]: item for item in snapshot["threads"]}
         self.assertFalse(by_id["active"]["archived"])
         self.assertTrue(by_id["archived"]["archived"])
