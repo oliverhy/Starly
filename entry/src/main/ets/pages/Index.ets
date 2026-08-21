@@ -6,8 +6,9 @@ import { vibrator } from '@kit.SensorServiceKit';
 import { PairingConfig, PublicPairingRequest, parsePairingUri,
   parsePublicPairingUri } from '../model/PairingConfig';
 import {
-  CodexActivity, CodexMessage, CodexModelOption, CodexQuota, CodexReasoningOption, CodexSnapshot,
-  CodexTask, CodexThreadDetail,
+  CodexActivity, CodexGoal, CodexMessage, CodexModelOption, CodexQueueItem, CodexQuota,
+  CodexReasoningOption,
+  CodexSnapshot, CodexTask, CodexThreadDetail,
   isCodexTerminalStatus, normalizeCodexDetailStatus, parseCodexSnapshot, parseCodexThread,
   resolveCodexDisplayStatus
 } from '../model/CodexModels';
@@ -19,6 +20,7 @@ import remoteInputClient, {
 import speechService, { SpeechListener } from '../service/SpeechService';
 import imageTransferService from '../service/ImageTransferService';
 import taskNotificationService from '../service/TaskNotificationService';
+import notificationNavigationService from '../service/NotificationNavigationService';
 import codexUiStateStore, { CodexUiState } from '../service/CodexUiStateStore';
 import publicPairingService from '../service/PublicPairingService';
 
@@ -32,6 +34,14 @@ class PopupVisibilityEvent {
   isVisible: boolean = false;
 }
 
+class PendingCodexSend {
+  requestId: string = '';
+  threadId: string = '';
+  text: string = '';
+  image: string = '';
+  timer: number = -1;
+}
+
 class PageRemoteListener implements RemoteClientListener {
   private connectionCallback: (isConnected: boolean, message: string) => void;
   private acknowledgeCallback: (messageId: string, operation: string, message: string) => void;
@@ -39,6 +49,8 @@ class PageRemoteListener implements RemoteClientListener {
   private snapshotCallback: (snapshot: CodexSnapshot) => void;
   private threadCallback: (detail: CodexThreadDetail) => void;
   private eventCallback: (event: string, threadId: string) => void;
+  private queueSnapshotCallback: (items: CodexQueueItem[]) => void;
+  private queueEventCallback: (item: CodexQueueItem) => void;
   private approvalCallback: (approval: CodexApprovalRequest) => void;
   private createdCallback: (threadId: string) => void;
   private gatewaySequenceCallback: (lastReceivedSeq: number) => void;
@@ -54,6 +66,8 @@ class PageRemoteListener implements RemoteClientListener {
     snapshotCallback: (snapshot: CodexSnapshot) => void,
     threadCallback: (detail: CodexThreadDetail) => void,
     eventCallback: (event: string, threadId: string) => void,
+    queueSnapshotCallback: (items: CodexQueueItem[]) => void,
+    queueEventCallback: (item: CodexQueueItem) => void,
     approvalCallback: (approval: CodexApprovalRequest) => void,
     createdCallback: (threadId: string) => void,
     gatewaySequenceCallback: (lastReceivedSeq: number) => void,
@@ -68,6 +82,8 @@ class PageRemoteListener implements RemoteClientListener {
     this.snapshotCallback = snapshotCallback;
     this.threadCallback = threadCallback;
     this.eventCallback = eventCallback;
+    this.queueSnapshotCallback = queueSnapshotCallback;
+    this.queueEventCallback = queueEventCallback;
     this.approvalCallback = approvalCallback;
     this.createdCallback = createdCallback;
     this.gatewaySequenceCallback = gatewaySequenceCallback;
@@ -98,6 +114,14 @@ class PageRemoteListener implements RemoteClientListener {
 
   onCodexEvent(event: string, threadId: string): void {
     this.eventCallback(event, threadId);
+  }
+
+  onCodexQueueSnapshot(items: CodexQueueItem[]): void {
+    this.queueSnapshotCallback(items);
+  }
+
+  onCodexQueueEvent(item: CodexQueueItem): void {
+    this.queueEventCallback(item);
   }
 
   onCodexApproval(approval: CodexApprovalRequest): void {
@@ -216,6 +240,7 @@ struct Index {
   @State codexModels: CodexModelOption[] = [];
   @State codexRelativeTimeNow: number = Date.now();
   @State codexInitialSyncPending: boolean = true;
+  private pendingNotificationThreadId: string = '';
   @State codexSearchText: string = '';
   @State selectedCodexProject: string = '';
   @State codexNewTaskMode: boolean = false;
@@ -239,6 +264,11 @@ struct Index {
   @State codexTaskMenuX: number = 12;
   @State codexTaskMenuY: number = 120;
   @State codexTaskMenuExpanded: boolean = false;
+  @State codexQueueItems: CodexQueueItem[] = [];
+  @State codexQueueMenuId: string = '';
+  @State codexQueueMenuX: number = 12;
+  @State codexQueueMenuY: number = 120;
+  @State codexQueueMenuExpanded: boolean = false;
   @State areCodexTasksExpanded: boolean = true;
   @State codexTaskDisplayLimit: number = 10;
   @State selectedCodexTaskId: string = '';
@@ -249,6 +279,8 @@ struct Index {
   @State selectedCodexActiveTurnId: string = '';
   @State selectedCodexMessages: CodexMessage[] = [];
   @State selectedCodexActivities: CodexActivity[] = [];
+  @State selectedCodexGoal: CodexGoal = new CodexGoal();
+  @State codexGoalExpanded: boolean = false;
   @State codexActivityExpanded: boolean = false;
   @State pendingCodexThreadId: string = '';
   @State isCodexConversationOpen: boolean = false;
@@ -287,10 +319,7 @@ struct Index {
   private codexAutoRefreshInFlight: boolean = false;
   private codexReconcileTick: number = 0;
   private pendingDraftSendId: string = '';
-  private pendingCodexSendId: string = '';
-  private pendingCodexSendText: string = '';
-  private pendingCodexSendImage: string = '';
-  private pendingCodexAckTimer: number = -1;
+  private pendingCodexSends: Map<string, PendingCodexSend> = new Map<string, PendingCodexSend>();
   private codexDetailRetryTimer: number = -1;
   private codexDetailWatchdogTimer: number = -1;
   private codexDetailRetryCount: number = 0;
@@ -313,6 +342,7 @@ struct Index {
   private gatewaySwitchConfirmTimer: number = -1;
   private keyboardChatScrollTimer: number = -1;
   private codexTaskMenuAnimationTimer: number = -1;
+  private codexQueueMenuAnimationTimer: number = -1;
   private keyboardHeightListener: ((height: number) => void) | null = null;
   private codexUiComputerKey: string = 'unpaired';
   private codexComputerSwitchGeneration: number = 0;
@@ -347,6 +377,9 @@ struct Index {
 
   aboutToAppear(): void {
     this.registerKeyboardHeightListener();
+    notificationNavigationService.setListener((threadId: string): void => {
+      this.handleNotificationTaskOpen(threadId);
+    });
     remoteInputClient.setListener(new PageRemoteListener(
       (isConnected: boolean, message: string): void => {
         this.isConnected = isConnected;
@@ -354,6 +387,7 @@ struct Index {
         this.statusText = message;
         this.statusIsError = false;
         if (isConnected) {
+          this.openPendingNotificationTask();
           if (this.mainSection === 'codex') {
             this.codexInitialSyncPending = true;
             this.startCodexAutoRefresh();
@@ -369,22 +403,17 @@ struct Index {
       },
       (messageId: string, operation: string, message: string): void => {
         this.lastAction = message;
-        if (this.isCodexSendOperation(operation) &&
-          messageId.length > 0 && messageId === this.pendingCodexSendId) {
+        if (this.isCodexSendOperation(operation) && messageId.length > 0) {
+          const pending = this.pendingCodexSends.get(messageId);
           this.updatePendingCodexMessage(messageId, 'sent');
           this.clearAcknowledgedCodexComposer(messageId);
-          const acknowledgedThreadId = this.pendingCodexThreadId.length > 0 ?
-            this.pendingCodexThreadId : this.selectedCodexTaskId;
-          this.pendingCodexThreadId = acknowledgedThreadId;
-          this.rememberCodexTaskStatus(acknowledgedThreadId, 'active');
-          if (acknowledgedThreadId === this.selectedCodexTaskId) {
-            this.selectedCodexStatus = 'active';
-          }
+          const acknowledgedThreadId = pending?.threadId ?? this.selectedCodexTaskId;
+          this.statusText = acknowledgedThreadId.length > 0 ?
+            '指令已加入电脑队列' : '电脑已收到指令';
         } else if (operation === 'input' && messageId === this.pendingDraftSendId) {
           this.draft = '';
           this.pendingDraftSendId = '';
         }
-        this.statusText = '电脑已执行';
         this.statusIsError = false;
       },
       (message: string, messageId?: string, operation?: string): void => {
@@ -393,10 +422,9 @@ struct Index {
         this.statusText = message;
         this.statusIsError = true;
         if (messageId !== undefined && messageId.length > 0 &&
-          messageId === this.pendingCodexSendId && this.isCodexSendOperation(operation ?? '')) {
-          this.pendingCodexThreadId = '';
+          this.pendingCodexSends.has(messageId) && this.isCodexSendOperation(operation ?? '')) {
           this.updatePendingCodexMessage(messageId, 'failed');
-          this.clearPendingCodexAcknowledgement();
+          this.clearPendingCodexAcknowledgement(messageId);
         } else if (message.includes('Codex')) {
           this.pendingCodexThreadId = '';
           this.updateLatestPendingCodexMessage('failed');
@@ -499,7 +527,7 @@ struct Index {
         } else if (event === 'turn/completed' && threadId.length > 0) {
           taskNotificationService.publish(
             'Codex 任务已完成', this.codexTaskNotificationLabel(threadId),
-            `complete-${threadId}-${Date.now()}`);
+            `complete-${threadId}-${Date.now()}`, threadId);
           if (threadId === this.pendingCodexThreadId) {
             this.pendingCodexThreadId = '';
           }
@@ -515,7 +543,7 @@ struct Index {
         } else if (event === 'turn/failed' && threadId.length > 0) {
           taskNotificationService.publish(
             'Codex 任务失败', this.codexTaskNotificationLabel(threadId),
-            `failed-${threadId}-${Date.now()}`);
+            `failed-${threadId}-${Date.now()}`, threadId);
           this.rememberCodexTaskStatus(threadId, 'systemError');
           if (threadId === this.selectedCodexTaskId) {
             this.selectedCodexStatus = 'systemError';
@@ -537,6 +565,12 @@ struct Index {
           this.requestSelectedCodexThread();
         }
       },
+      (items: CodexQueueItem[]): void => {
+        this.applyCodexQueueSnapshot(items);
+      },
+      (item: CodexQueueItem): void => {
+        this.applyCodexQueueEvent(item);
+      },
       (approval: CodexApprovalRequest): void => {
         this.approvalId = approval.id;
         this.approvalKind = approval.method;
@@ -553,7 +587,7 @@ struct Index {
         taskNotificationService.publish(
           'Codex 等待审批',
           approval.highRisk ? '高风险操作，请打开 Starly 查看并处理' : '请打开 Starly 查看并处理',
-          `approval-${approval.id}`);
+          `approval-${approval.id}`, approval.threadId);
       },
       (threadId: string): void => {
         if (threadId.length === 0) {
@@ -661,13 +695,15 @@ struct Index {
       clearTimeout(this.codexTaskMenuAnimationTimer);
       this.codexTaskMenuAnimationTimer = -1;
     }
-    if (this.pendingCodexAckTimer >= 0) {
-      clearTimeout(this.pendingCodexAckTimer);
-      this.pendingCodexAckTimer = -1;
+    this.clearAllPendingCodexAcknowledgements();
+    if (this.codexQueueMenuAnimationTimer >= 0) {
+      clearTimeout(this.codexQueueMenuAnimationTimer);
+      this.codexQueueMenuAnimationTimer = -1;
     }
     this.clearApprovalSecondConfirmTimer();
     this.clearGatewaySwitchConfirmTimer();
     this.flushCodexUiState();
+    notificationNavigationService.setListener(null);
     remoteInputClient.setListener(null);
     speechService.setListener(null);
   }
@@ -675,6 +711,10 @@ struct Index {
   onBackPress(): boolean {
     // Close the deepest visible layer first. Returning false is reserved for
     // the real home level, where HarmonyOS may minimize/close the ability.
+    if (this.codexQueueMenuId.length > 0) {
+      this.closeCodexQueueMenu();
+      return true;
+    }
     if (this.codexTaskRenameMode && this.codexTaskMenuId.length > 0) {
       this.codexTaskRenameMode = false;
       this.codexTaskRenameText = '';
@@ -818,6 +858,9 @@ struct Index {
       }
       if (this.codexTaskMenuId.length > 0) {
         this.buildCodexTaskMenuOverlay();
+      }
+      if (this.codexQueueMenuId.length > 0 && !this.isCodexConversationOpen) {
+        this.buildCodexQueueMenuOverlay();
       }
     }
     .width('100%')
@@ -2256,6 +2299,53 @@ struct Index {
   }
 
   @Builder
+  buildCodexQueueMenuOverlay() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor('#08000000')
+        .onClick(() => this.closeCodexQueueMenu())
+      Column() {
+        Row() {
+          Text('取消排队')
+            .fontSize(14)
+            .fontColor('#C4320A')
+        }
+        .width('100%')
+        .height(42)
+        .padding({ left: 13, right: 13 })
+        .backgroundColor(Color.Transparent)
+        .onClick(() => this.cancelCodexQueueFromMenu())
+      }
+      .width(136)
+      .padding(7)
+      .position({ x: this.codexQueueMenuX, y: this.codexQueueMenuY })
+      .backgroundColor('#C8FFFFFF')
+      .backgroundBlurStyle(BlurStyle.COMPONENT_ULTRA_THIN, {
+        colorMode: ThemeColorMode.SYSTEM,
+        adaptiveColor: AdaptiveColor.DEFAULT,
+        scale: 0.92
+      })
+      .border({ width: 1, color: '#A8FFFFFF' })
+      .borderRadius(15)
+      .shadow({ radius: 22, color: '#34000000', offsetY: 7 })
+      .scale({
+        x: this.codexQueueMenuExpanded ? 1 : 0.82,
+        y: this.codexQueueMenuExpanded ? 1 : 0.82,
+        centerX: 0,
+        centerY: 0
+      })
+      .opacity(this.codexQueueMenuExpanded ? 1 : 0)
+      .translate({ y: this.codexQueueMenuExpanded ? 0 : -5 })
+      .animation({ duration: 165, curve: Curve.FastOutSlowIn })
+    }
+    .width('100%')
+    .height('100%')
+    .zIndex(130)
+  }
+
+  @Builder
   buildFixedWideCodexDashboard() {
     Row({ space: 18 }) {
       Column({ space: 16 }) {
@@ -2948,12 +3038,11 @@ struct Index {
           }, (_source: string, imageIndex: number): string => `${message.id}-image-${imageIndex}`)
         }
         if (message.deliveryState.length > 0) {
-          Text(message.deliveryState === 'failed' ? '发送失败' :
-            (message.deliveryState === 'sent' ? '已发送' : '发送中…'))
+          Text(this.codexMessageDeliveryLabel(message))
             .width('100%')
             .textAlign(TextAlign.End)
             .fontSize(9)
-            .fontColor(message.deliveryState === 'failed' ? '#FFD7D3' : '#BFFFFFFF')
+            .fontColor(this.codexMessageDeliveryColor(message, true))
         }
       }
       .width(this.codexChatBubbleWidth())
@@ -2975,11 +3064,16 @@ struct Index {
       }
     }
     .width('100%')
+    .gesture(
+      LongPressGesture({ repeat: false })
+        .onAction((event: GestureEvent) => this.openCodexQueueMenu(message, event))
+    )
   }
 
   @Builder
   buildCodexConversationCover() {
-    Column() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column() {
       Row({ space: 10 }) {
         Button('‹')
           .width(40)
@@ -3150,11 +3244,17 @@ struct Index {
       })
 
       this.buildCodexRemoteComposer()
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ top: 38, bottom: this.keyboardInset })
+      .backgroundColor('#FFF8F8F7')
+      if (this.codexQueueMenuId.length > 0) {
+        this.buildCodexQueueMenuOverlay();
+      }
     }
     .width('100%')
     .height('100%')
-    .padding({ top: 38, bottom: this.keyboardInset })
-    .backgroundColor('#FFF8F8F7')
   }
 
   @Builder
@@ -3183,11 +3283,15 @@ struct Index {
           }, (_source: string, index: number): string => `${message.id}-${index}`)
         }
         if (message.deliveryState.length > 0) {
-          Text(message.deliveryState === 'failed' ? '发送失败' :
-            (message.deliveryState === 'sent' ? '已发送' : '发送中…'))
+          Text(this.codexMessageDeliveryLabel(message))
             .fontSize(9)
-            .fontColor(message.deliveryState === 'failed' ? '#FFD92D20' : '#FF98A2B3')
+            .fontColor(this.codexMessageDeliveryColor(message, false))
         }
+        Text(this.formatMessageTimestamp(message.timestamp))
+          .width('100%')
+          .textAlign(message.role === 'user' ? TextAlign.End : TextAlign.Start)
+          .fontSize(9)
+          .fontColor('#FF98A2B3')
       }
       .width(message.role === 'user' ? '72%' : '100%')
       .alignItems(HorizontalAlign.Start)
@@ -3199,11 +3303,18 @@ struct Index {
       }
     }
     .width('100%')
+    .gesture(
+      LongPressGesture({ repeat: false })
+        .onAction((event: GestureEvent) => this.openCodexQueueMenu(message, event))
+    )
   }
 
   @Builder
   buildCodexRemoteComposer() {
     Column({ space: 6 }) {
+      if (!this.codexNewTaskMode && this.selectedCodexGoal.goalId.length > 0) {
+        this.buildCodexGoalBar()
+      }
       if (this.codexImagePreviewUri.length > 0) {
         Row({ space: 8 }) {
           Image(this.codexImagePreviewUri)
@@ -3313,7 +3424,8 @@ struct Index {
           .borderRadius(16)
           .onClick(() => this.toggleCodexVoiceInput())
         }
-        if (this.selectedCodexActiveTurnId.length > 0 && !this.codexNewTaskMode) {
+        if (this.selectedCodexActiveTurnId.length > 0 && !this.codexNewTaskMode &&
+          !this.canSendRemoteCodexComposer()) {
           Button() {
             Image($r('app.media.stop_button_icon'))
               // The source has slightly more transparent padding than the
@@ -3354,6 +3466,56 @@ struct Index {
     .border({ width: 1, color: '#18000000' })
     .borderRadius(20)
     .margin({ left: 8, right: 8, bottom: 4 })
+  }
+
+  @Builder
+  buildCodexGoalBar() {
+    Column({ space: 5 }) {
+      Row({ space: 6 }) {
+        Text('◎')
+          .fontSize(13)
+          .fontColor('#FF667085')
+        Text('目标')
+          .fontSize(11)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#FF202124')
+        Text(this.codexGoalStatusLabel())
+          .fontSize(10)
+          .fontColor(this.codexGoalStatusColor())
+        if (!this.codexGoalExpanded) {
+          Text(this.selectedCodexGoal.objective)
+            .layoutWeight(1)
+            .fontSize(10)
+            .fontColor('#FF667085')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        } else {
+          Blank()
+        }
+        Text(this.formatCodexGoalElapsed())
+          .fontSize(9)
+          .fontColor('#FF98A2B3')
+        Text(this.codexGoalExpanded ? '⌃' : '›')
+          .fontSize(15)
+          .fontColor('#FF98A2B3')
+      }
+      .width('100%')
+      if (this.codexGoalExpanded) {
+        Text(this.selectedCodexGoal.objective)
+          .width('100%')
+          .fontSize(11)
+          .lineHeight(17)
+          .fontColor('#FF475467')
+          .maxLines(5)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+    }
+    .width('100%')
+    .padding({ left: 10, right: 10, top: 7, bottom: 7 })
+    .backgroundColor('#FFF9FAFB')
+    .border({ width: 1, color: '#FFE4E7EC' })
+    .borderRadius(11)
+    .onClick(() => this.codexGoalExpanded = !this.codexGoalExpanded)
   }
 
   @Builder
@@ -4089,6 +4251,7 @@ struct Index {
       this.codexUiComputerKey = this.codexUiKey(config);
       const state = await codexUiStateStore.load(this.getContext(), this.codexUiComputerKey);
       this.applyCodexUiState(state);
+      this.preparePendingNotificationTask();
       if (config.isComplete()) {
         this.statusText = '正在连接电脑…';
         await remoteInputClient.connect(config);
@@ -4775,6 +4938,13 @@ struct Index {
       if (!this.isConnected || this.mainSection !== 'codex') {
         return;
       }
+      if (this.isCodexConversationOpen && this.selectedCodexGoal.goalId.length > 0 &&
+        this.selectedCodexTaskId.length > 0) {
+        // Goal state is tiny and independent from the full task list. Refresh
+        // the selected detail every tick so pause/limit/completion is reflected
+        // on the phone within roughly five seconds.
+        remoteInputClient.requestCodexThread(this.selectedCodexTaskId, '', 15);
+      }
       this.codexReconcileTick += 1;
       if (this.codexReconcileTick < 6) {
         return;
@@ -4796,7 +4966,7 @@ struct Index {
     if (this.selectedCodexTaskId.length === 0) {
       return false;
     }
-    return this.selectedCodexStatus === 'active' ||
+    return this.isCodexConversationOpen || this.selectedCodexStatus === 'active' ||
       this.selectedCodexActiveTurnId.length > 0 ||
       this.pendingCodexThreadId === this.selectedCodexTaskId;
   }
@@ -4910,6 +5080,7 @@ struct Index {
     }
     this.codexLoading = true;
     await remoteInputClient.requestCodexSnapshot();
+    await remoteInputClient.requestCodexQueueSnapshot();
   }
 
   private async selectCodexTask(threadId: string, pendingText: string = '',
@@ -4925,6 +5096,8 @@ struct Index {
     }
     this.selectedCodexTaskId = threadId;
     this.prepareSelectedCodexTask(threadId);
+    this.selectedCodexGoal = new CodexGoal();
+    this.codexGoalExpanded = false;
     this.selectedCodexMessages = [];
     this.selectedCodexActivities = [];
     this.codexActivityExpanded = false;
@@ -4937,6 +5110,7 @@ struct Index {
     if (pendingText.length > 0 || pendingImage.length > 0) {
       this.appendPendingCodexMessage(pendingText, pendingImage);
     }
+    this.reconcileSelectedCodexQueueMessages();
     this.codexDetailVersion += 1;
     this.codexDetailLoading = false;
     this.codexLoading = false;
@@ -4951,9 +5125,12 @@ struct Index {
     const pendingText = this.codexCommand.trim();
     const pendingImage = this.codexImagePreviewUri;
     const requestId = remoteInputClient.createRequestId();
-    this.pendingCodexSendId = requestId;
-    this.pendingCodexSendText = pendingText;
-    this.pendingCodexSendImage = pendingImage;
+    const pending = new PendingCodexSend();
+    pending.requestId = requestId;
+    pending.threadId = this.selectedCodexTaskId;
+    pending.text = pendingText;
+    pending.image = pendingImage;
+    this.pendingCodexSends.set(requestId, pending);
     const sent = this.codexImageDataUrl.length > 0 ?
       await remoteInputClient.sendImageToCodex(
         this.selectedCodexTaskId, this.codexCommand, this.codexImageDataUrl,
@@ -4966,17 +5143,16 @@ struct Index {
         this.codexDeliveryMode, requestId);
     if (sent) {
       this.appendPendingCodexMessage(pendingText, pendingImage, requestId);
-      this.pendingCodexThreadId = this.selectedCodexTaskId;
-      if (this.pendingCodexSendId === requestId) {
+      if (this.pendingCodexSends.has(requestId)) {
         this.scheduleCodexAcknowledgementCheck(requestId, this.selectedCodexTaskId);
-        this.statusText = '正在恢复任务并发送…';
+        this.statusText = '正在加入电脑队列…';
       } else {
         this.updatePendingCodexMessage(requestId, 'sent');
-        this.statusText = '电脑端已收到并执行';
+        this.statusText = '指令已加入电脑队列';
       }
       this.statusIsError = false;
-    } else if (this.pendingCodexSendId === requestId) {
-      this.clearPendingCodexAcknowledgement();
+    } else if (this.pendingCodexSends.has(requestId)) {
+      this.clearPendingCodexAcknowledgement(requestId);
     }
   }
 
@@ -5126,39 +5302,55 @@ struct Index {
   }
 
   private clearAcknowledgedCodexComposer(requestId: string): void {
-    if (requestId.length === 0 || requestId !== this.pendingCodexSendId) {
+    const pending = this.pendingCodexSends.get(requestId);
+    if (pending === undefined) {
       return;
     }
-    if (this.codexCommand.trim() === this.pendingCodexSendText) {
+    if (this.codexCommand.trim() === pending.text) {
       this.codexCommand = '';
     }
-    if (this.pendingCodexSendImage.length > 0 &&
-      this.codexImagePreviewUri === this.pendingCodexSendImage) {
+    if (pending.image.length > 0 && this.codexImagePreviewUri === pending.image) {
       this.clearCodexImage();
     }
-    this.clearPendingCodexAcknowledgement();
+    this.clearPendingCodexAcknowledgement(requestId);
   }
 
-  private clearPendingCodexAcknowledgement(): void {
-    if (this.pendingCodexAckTimer >= 0) {
-      clearTimeout(this.pendingCodexAckTimer);
-      this.pendingCodexAckTimer = -1;
+  private clearPendingCodexAcknowledgement(requestId: string): void {
+    const pending = this.pendingCodexSends.get(requestId);
+    if (pending === undefined) {
+      return;
     }
-    this.pendingCodexSendId = '';
-    this.pendingCodexSendText = '';
-    this.pendingCodexSendImage = '';
+    if (pending.timer >= 0) {
+      clearTimeout(pending.timer);
+    }
+    this.pendingCodexSends.delete(requestId);
+  }
+
+  private clearAllPendingCodexAcknowledgements(): void {
+    this.pendingCodexSends.forEach((pending: PendingCodexSend): void => {
+      if (pending.timer >= 0) {
+        clearTimeout(pending.timer);
+      }
+    });
+    this.pendingCodexSends.clear();
   }
 
   private scheduleCodexAcknowledgementCheck(requestId: string, threadId: string): void {
-    if (this.pendingCodexAckTimer >= 0) {
-      clearTimeout(this.pendingCodexAckTimer);
+    const pending = this.pendingCodexSends.get(requestId);
+    if (pending === undefined) {
+      return;
     }
-    this.pendingCodexAckTimer = setTimeout((): void => {
-      this.pendingCodexAckTimer = -1;
-      if (requestId !== this.pendingCodexSendId || threadId.length === 0) {
+    if (pending.timer >= 0) {
+      clearTimeout(pending.timer);
+    }
+    pending.timer = setTimeout((): void => {
+      const active = this.pendingCodexSends.get(requestId);
+      if (active === undefined || threadId.length === 0) {
         return;
       }
+      active.timer = -1;
       remoteInputClient.requestCodexThread(threadId);
+      remoteInputClient.requestCodexQueueSnapshot();
       remoteInputClient.requestCodexSnapshot();
       this.statusText = '正在核对电脑端发送结果…';
       this.statusIsError = false;
@@ -5303,6 +5495,65 @@ struct Index {
     return `${Math.floor(elapsed / 86400)}天`;
   }
 
+  private codexGoalStatusLabel(): string {
+    const labels: Record<string, string> = {
+      'active': '进行中',
+      'paused': '已暂停',
+      'blocked': '已阻塞',
+      'usage_limited': '使用受限',
+      'budget_limited': '预算受限',
+      'complete': '已完成'
+    };
+    return labels[this.selectedCodexGoal.status] ?? '目标';
+  }
+
+  private codexGoalStatusColor(): string {
+    if (this.selectedCodexGoal.status === 'complete') {
+      return '#FF067647';
+    }
+    if (this.selectedCodexGoal.status === 'blocked') {
+      return '#FFB42318';
+    }
+    if (this.selectedCodexGoal.status === 'usage_limited' ||
+      this.selectedCodexGoal.status === 'budget_limited') {
+      return '#FFB54708';
+    }
+    if (this.selectedCodexGoal.status === 'active') {
+      return '#FF175CD3';
+    }
+    return '#FF667085';
+  }
+
+  private formatCodexGoalElapsed(): string {
+    let seconds = Math.max(0, this.selectedCodexGoal.timeUsedSeconds);
+    if (this.selectedCodexGoal.status === 'active' && this.selectedCodexGoal.updatedAt > 0) {
+      seconds += Math.max(0, Math.floor(
+        (this.codexRelativeTimeNow - this.selectedCodexGoal.updatedAt) / 1000));
+    }
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (hours > 0) {
+      return `${hours}小时${minutes}分`;
+    }
+    if (minutes > 0) {
+      return `${minutes}分钟`;
+    }
+    return `${seconds}秒`;
+  }
+
+  private cloneCodexGoal(source: CodexGoal): CodexGoal {
+    const goal = new CodexGoal();
+    goal.goalId = source.goalId;
+    goal.objective = source.objective;
+    goal.status = source.status;
+    goal.tokenBudget = source.tokenBudget;
+    goal.tokensUsed = source.tokensUsed;
+    goal.timeUsedSeconds = source.timeUsedSeconds;
+    goal.createdAt = source.createdAt;
+    goal.updatedAt = source.updatedAt;
+    return goal;
+  }
+
   private codexDisplayText(value: string): string {
     return value
       .replace(/^#{1,6}\s+/gm, '')
@@ -5336,6 +5587,37 @@ struct Index {
     }, 520);
   }
 
+  private handleNotificationTaskOpen(threadId: string): void {
+    if (threadId.length === 0) {
+      return;
+    }
+    this.pendingNotificationThreadId = threadId;
+    this.preparePendingNotificationTask();
+    this.openPendingNotificationTask();
+  }
+
+  private preparePendingNotificationTask(): void {
+    if (this.pendingNotificationThreadId.length === 0) {
+      return;
+    }
+    if (this.mainSection !== 'codex') {
+      this.mainSection = 'codex';
+      this.mainSectionDragOffset = 0;
+      this.scheduleCodexUiStateSave();
+    }
+  }
+
+  private openPendingNotificationTask(): void {
+    if (!this.isConnected || this.pendingNotificationThreadId.length === 0) {
+      return;
+    }
+    const threadId = this.pendingNotificationThreadId;
+    this.pendingNotificationThreadId = '';
+    this.openRemoteCodexTask(threadId);
+    remoteInputClient.requestCodexSnapshot();
+    this.startCodexAutoRefresh();
+  }
+
   private openNewCodexTask(): void {
     const selectedProject = this.selectedCodexProject === '__starly_chats__' ? '' :
       this.selectedCodexProject;
@@ -5349,6 +5631,8 @@ struct Index {
     this.selectedCodexTaskId = '';
     this.selectedCodexTitle = '新任务';
     this.selectedCodexCwd = project;
+    this.selectedCodexGoal = new CodexGoal();
+    this.codexGoalExpanded = false;
     this.selectedCodexMessages = [];
     this.codexCommand = '';
     this.codexSettingsMenu = '';
@@ -5580,6 +5864,59 @@ struct Index {
     }, 12);
   }
 
+  private openCodexQueueMenu(message: CodexMessage, event: GestureEvent): void {
+    const item = this.codexQueueItemForMessage(message);
+    if (item === undefined || !this.isCodexQueueItemCancelable(item)) {
+      return;
+    }
+    const menuWidth = 136;
+    const menuHeight = 56;
+    const finger = event.fingerList.length > 0 ? event.fingerList[0] : undefined;
+    const touchX = finger?.globalX ?? this.layoutViewportWidth / 2;
+    const touchY = finger?.globalY ?? this.layoutViewportHeight / 2;
+    this.codexQueueMenuX = touchX + menuWidth + 16 <= this.layoutViewportWidth ?
+      touchX + 8 : Math.max(8, touchX - menuWidth - 8);
+    this.codexQueueMenuY = touchY + menuHeight + 16 <= this.layoutViewportHeight ?
+      touchY + 8 : Math.max(8, touchY - menuHeight - 8);
+    if (this.codexQueueMenuAnimationTimer >= 0) {
+      clearTimeout(this.codexQueueMenuAnimationTimer);
+    }
+    this.codexQueueMenuExpanded = false;
+    this.codexQueueMenuId = item.queueId;
+    this.triggerCodexTaskMenuHaptic();
+    this.codexQueueMenuAnimationTimer = setTimeout((): void => {
+      this.codexQueueMenuAnimationTimer = -1;
+      this.codexQueueMenuExpanded = true;
+    }, 12);
+  }
+
+  private closeCodexQueueMenu(): void {
+    if (this.codexQueueMenuId.length === 0) {
+      return;
+    }
+    if (this.codexQueueMenuAnimationTimer >= 0) {
+      clearTimeout(this.codexQueueMenuAnimationTimer);
+    }
+    this.codexQueueMenuExpanded = false;
+    this.codexQueueMenuAnimationTimer = setTimeout((): void => {
+      this.codexQueueMenuAnimationTimer = -1;
+      this.codexQueueMenuId = '';
+    }, 145);
+  }
+
+  private async cancelCodexQueueFromMenu(): Promise<void> {
+    const queueId = this.codexQueueMenuId;
+    if (queueId.length === 0) {
+      return;
+    }
+    this.closeCodexQueueMenu();
+    const sent = await remoteInputClient.cancelCodexQueueItem(queueId);
+    if (sent) {
+      this.statusText = '正在取消排队任务…';
+      this.statusIsError = false;
+    }
+  }
+
   private closeCodexTaskMenu(): void {
     if (this.codexTaskMenuId.length === 0) {
       return;
@@ -5719,6 +6056,204 @@ struct Index {
     }
   }
 
+  private applyCodexQueueSnapshot(items: CodexQueueItem[]): void {
+    const previous = this.codexQueueItems;
+    this.codexQueueItems = [...items];
+    this.reconcileSelectedCodexQueueMessages(previous);
+  }
+
+  private applyCodexQueueEvent(item: CodexQueueItem): void {
+    const items = [...this.codexQueueItems];
+    const existingIndex = items.findIndex(
+      (current: CodexQueueItem): boolean => current.queueId === item.queueId);
+    if (existingIndex >= 0) {
+      items[existingIndex] = item;
+    } else {
+      items.push(item);
+    }
+    this.codexQueueItems = items;
+    if (item.state === 'running') {
+      this.pendingCodexThreadId = item.threadId;
+      this.rememberCodexTaskStatus(item.threadId, 'active');
+      if (item.threadId === this.selectedCodexTaskId) {
+        this.selectedCodexStatus = 'active';
+      }
+    } else if (item.state === 'completed' || item.state === 'failed' || item.state === 'canceled') {
+      if (!this.hasRunningCodexQueueItem(item.threadId) && this.pendingCodexThreadId === item.threadId) {
+        this.pendingCodexThreadId = '';
+      }
+      if (item.state === 'failed') {
+        this.statusText = item.error.length > 0 ? `排队任务失败：${item.error}` : '排队任务执行失败';
+        this.statusIsError = true;
+      } else if (item.state === 'canceled') {
+        this.statusText = '已取消排队任务';
+        this.statusIsError = false;
+      }
+    }
+    this.reconcileSelectedCodexQueueMessages();
+    if (item.state === 'completed' && item.threadId === this.selectedCodexTaskId) {
+      setTimeout((): void => {
+        if (item.threadId === this.selectedCodexTaskId && this.isConnected) {
+          this.requestSelectedCodexThread(true);
+          remoteInputClient.requestCodexSnapshot();
+        }
+      }, 120);
+    }
+  }
+
+  private hasRunningCodexQueueItem(threadId: string): boolean {
+    return this.codexQueueItems.some(
+      (item: CodexQueueItem): boolean => item.threadId === threadId && item.state === 'running');
+  }
+
+  private isCodexQueueItemVisible(item: CodexQueueItem): boolean {
+    return item.state === 'queued' || item.state === 'running' ||
+      item.state === 'waiting_unlock' || item.state === 'failed' || item.state === 'canceled';
+  }
+
+  private isCodexQueueItemCancelable(item: CodexQueueItem): boolean {
+    return item.state === 'queued' || item.state === 'waiting_unlock';
+  }
+
+  private normalizedCodexQueueTimestamp(item: CodexQueueItem): number {
+    const timestamp = item.enqueuedAt > 0 ? item.enqueuedAt :
+      (item.startedAt > 0 ? item.startedAt : Date.now());
+    return timestamp > 100000000000 ? Math.floor(timestamp / 1000) : timestamp;
+  }
+
+  private codexQueueItemForMessage(message: CodexMessage): CodexQueueItem | undefined {
+    if (message.id.startsWith('local-')) {
+      const queueId = message.id.substring('local-'.length);
+      const exact = this.codexQueueItems.find(
+        (item: CodexQueueItem): boolean => item.queueId === queueId);
+      if (exact !== undefined) {
+        return exact;
+      }
+    }
+    if (message.role !== 'user' || this.selectedCodexTaskId.length === 0) {
+      return undefined;
+    }
+    const messageText = message.text.trim();
+    let closest: CodexQueueItem | undefined = undefined;
+    let closestDistance = Number.MAX_SAFE_INTEGER;
+    for (let index = 0; index < this.codexQueueItems.length; index += 1) {
+      const item = this.codexQueueItems[index];
+      if (item.threadId !== this.selectedCodexTaskId || item.text.trim() !== messageText) {
+        continue;
+      }
+      const distance = Math.abs(this.normalizedCodexQueueTimestamp(item) - message.timestamp);
+      if (distance <= 180 && distance < closestDistance) {
+        closest = item;
+        closestDistance = distance;
+      }
+    }
+    return closest;
+  }
+
+  private cloneCodexMessage(source: CodexMessage): CodexMessage {
+    const message = new CodexMessage();
+    message.id = source.id;
+    message.role = source.role;
+    message.text = source.text;
+    message.images = [...source.images];
+    message.timestamp = source.timestamp;
+    message.turnId = source.turnId;
+    message.deliveryState = source.deliveryState;
+    return message;
+  }
+
+  private queueMessageFromItem(item: CodexQueueItem): CodexMessage {
+    const message = new CodexMessage();
+    message.id = `local-${item.queueId}`;
+    message.role = 'user';
+    message.text = item.text.trim().length > 0 ? item.text : (item.hasImage ? '图片' : '排队指令');
+    message.timestamp = this.normalizedCodexQueueTimestamp(item);
+    message.turnId = message.id;
+    message.deliveryState = item.state;
+    return message;
+  }
+
+  private reconcileSelectedCodexQueueMessages(previousItems: CodexQueueItem[] = []): void {
+    const threadId = this.selectedCodexTaskId;
+    if (threadId.length === 0) {
+      return;
+    }
+    const currentItems = this.codexQueueItems.filter(
+      (item: CodexQueueItem): boolean => item.threadId === threadId);
+    const hasQueueDeliveryState = this.selectedCodexMessages.some((message: CodexMessage): boolean =>
+      message.deliveryState === 'queued' || message.deliveryState === 'running' ||
+        message.deliveryState === 'waiting_unlock' || message.deliveryState === 'canceled');
+    if (currentItems.length === 0 && previousItems.length === 0 && !hasQueueDeliveryState) {
+      return;
+    }
+    const currentIds = new Set<string>();
+    currentItems.forEach((item: CodexQueueItem): void => {
+      currentIds.add(item.queueId);
+    });
+    const previousIds = new Set<string>();
+    previousItems.forEach((item: CodexQueueItem): void => {
+      if (item.threadId === threadId) previousIds.add(item.queueId);
+    });
+    const messages: CodexMessage[] = [];
+    for (let index = 0; index < this.selectedCodexMessages.length; index += 1) {
+      const source = this.selectedCodexMessages[index];
+      const localQueueId = source.id.startsWith('local-') ?
+        source.id.substring('local-'.length) : '';
+      if (localQueueId.length > 0 && previousIds.has(localQueueId) && !currentIds.has(localQueueId)) {
+        continue;
+      }
+      const copy = this.cloneCodexMessage(source);
+      if (!copy.id.startsWith('local-') &&
+        (copy.deliveryState === 'queued' || copy.deliveryState === 'running' ||
+        copy.deliveryState === 'waiting_unlock' || copy.deliveryState === 'canceled')) {
+        copy.deliveryState = '';
+      }
+      messages.push(copy);
+    }
+    const matchedPersistedIndexes = new Set<number>();
+    for (let itemIndex = 0; itemIndex < currentItems.length; itemIndex += 1) {
+      const item = currentItems[itemIndex];
+      let messageIndex = messages.findIndex(
+        (message: CodexMessage): boolean => message.id === `local-${item.queueId}`);
+      if (messageIndex < 0) {
+        messageIndex = messages.findIndex((message: CodexMessage, index: number): boolean => {
+          if (matchedPersistedIndexes.has(index)) {
+            return false;
+          }
+          if (message.role !== 'user' || message.id.startsWith('local-') ||
+            message.text.trim() !== item.text.trim()) {
+            return false;
+          }
+          return Math.abs(message.timestamp - this.normalizedCodexQueueTimestamp(item)) <= 180;
+        });
+        if (messageIndex >= 0) {
+          matchedPersistedIndexes.add(messageIndex);
+        }
+      }
+      if (item.state === 'completed') {
+        if (messageIndex >= 0 && messages[messageIndex].id.startsWith('local-')) {
+          messages.splice(messageIndex, 1);
+        } else if (messageIndex >= 0) {
+          messages[messageIndex].deliveryState = '';
+        }
+        continue;
+      }
+      if (!this.isCodexQueueItemVisible(item)) {
+        continue;
+      }
+      if (messageIndex >= 0) {
+        messages[messageIndex].deliveryState = item.state;
+      } else {
+        messages.push(this.queueMessageFromItem(item));
+      }
+    }
+    this.selectedCodexMessages = messages;
+    this.codexDetailVersion += 1;
+    if (this.codexChatPinnedToBottom) {
+      this.scrollCodexChatToBottom(true);
+    }
+  }
+
   private applyCodexThreadDetail(detail: CodexThreadDetail): void {
     detail.status = normalizeCodexDetailStatus(detail.status, detail.activeTurnId);
     this.applyCodexTaskDelta(detail);
@@ -5732,6 +6267,10 @@ struct Index {
     this.selectedCodexStatus = detail.status;
     this.selectedCodexActiveTurnId = detail.activeTurnId;
     this.selectedCodexUpdatedAt = detail.updatedAt;
+    if (this.selectedCodexGoal.goalId !== detail.goal.goalId) {
+      this.codexGoalExpanded = false;
+    }
+    this.selectedCodexGoal = this.cloneCodexGoal(detail.goal);
     if (detail.model.length > 0) {
       this.selectedCodexModel = detail.model;
     }
@@ -5757,16 +6296,18 @@ struct Index {
         this.codexDetailRetryCount = 0;
       }
       if (detail.updateMode === 'latest' && !this.codexHistoryReady) {
-        if (this.pendingCodexSendId.length > 0) {
+        if (this.pendingCodexSends.size > 0) {
           for (let index = 0; index < detail.messages.length; index += 1) {
             const incoming = detail.messages[index];
-            if (incoming.role === 'user' &&
-              this.matchPendingCodexMessage(this.selectedCodexMessages, incoming) >= 0) {
-              const requestId = this.pendingCodexSendId;
+            const matchedIndex = incoming.role === 'user' ?
+              this.matchPendingCodexMessage(this.selectedCodexMessages, incoming) : -1;
+            if (matchedIndex >= 0) {
+              const localId = this.selectedCodexMessages[matchedIndex].id;
+              const requestId = localId.startsWith('local-') ?
+                localId.substring('local-'.length) : '';
               this.clearAcknowledgedCodexComposer(requestId);
               this.statusText = '电脑端已收到并执行';
               this.statusIsError = false;
-              break;
             }
           }
         }
@@ -5784,6 +6325,7 @@ struct Index {
     } else if (this.pendingCodexThreadId === detail.id) {
       this.pendingCodexThreadId = '';
     }
+    this.reconcileSelectedCodexQueueMessages();
     this.codexDetailLoading = false;
     this.codexLoading = false;
   }
@@ -5848,7 +6390,7 @@ struct Index {
         const matchedLocalId = merged[existingIndex].id;
         if (matchedLocalId.startsWith('local-')) {
           const requestId = matchedLocalId.substring('local-'.length);
-          if (requestId === this.pendingCodexSendId) {
+          if (this.pendingCodexSends.has(requestId)) {
             this.clearAcknowledgedCodexComposer(requestId);
             this.statusText = '电脑端已收到并执行';
             this.statusIsError = false;
@@ -6200,9 +6742,9 @@ struct Index {
     for (let index = 0; index < current.length; index += 1) {
       const left = current[index];
       const right = next[index];
-      if (left.role !== right.role || left.text !== right.text ||
+      if (left.id !== right.id || left.role !== right.role || left.text !== right.text ||
         left.timestamp !== right.timestamp || left.turnId !== right.turnId ||
-        left.images.length !== right.images.length) {
+        left.images.length !== right.images.length || left.deliveryState !== right.deliveryState) {
         return false;
       }
       for (let imageIndex = 0; imageIndex < left.images.length; imageIndex += 1) {
@@ -6272,13 +6814,60 @@ struct Index {
     return '未载入';
   }
 
+  private codexQueuePosition(item: CodexQueueItem): number {
+    if (item.position > 0) {
+      return item.position;
+    }
+    const queued = this.codexQueueItems.filter(
+      (candidate: CodexQueueItem): boolean => candidate.threadId === item.threadId &&
+        candidate.state === 'queued');
+    queued.sort((left: CodexQueueItem, right: CodexQueueItem): number =>
+      this.normalizedCodexQueueTimestamp(left) - this.normalizedCodexQueueTimestamp(right));
+    const index = queued.findIndex(
+      (candidate: CodexQueueItem): boolean => candidate.queueId === item.queueId);
+    return index >= 0 ? index + 1 : 1;
+  }
+
+  private codexMessageDeliveryLabel(message: CodexMessage): string {
+    const item = this.codexQueueItemForMessage(message);
+    const state = item?.state ?? message.deliveryState;
+    if (state === 'queued') return `排队中 · 第 ${item === undefined ? 1 : this.codexQueuePosition(item)} 个`;
+    if (state === 'running') return '正在执行';
+    if (state === 'waiting_unlock') return '等待电脑解锁';
+    if (state === 'failed') return '失败';
+    if (state === 'canceled') return '已取消';
+    if (state === 'sent') return '已发送';
+    return '发送中…';
+  }
+
+  private codexMessageDeliveryColor(message: CodexMessage, darkSurface: boolean): ResourceColor {
+    const item = this.codexQueueItemForMessage(message);
+    const state = item?.state ?? message.deliveryState;
+    if (darkSurface) {
+      if (state === 'failed') return '#FFFFD7D3';
+      if (state === 'canceled') return '#FFD0D5DD';
+      return '#E6FFFFFF';
+    }
+    if (state === 'failed') return '#FFD92D20';
+    if (state === 'waiting_unlock') return '#FFB54708';
+    if (state === 'running') return '#FF067647';
+    if (state === 'queued') return '#FF175CD3';
+    return '#FF98A2B3';
+  }
+
   private effectiveCodexStatus(task: CodexTask): string {
+    if (this.hasRunningCodexQueueItem(task.id)) {
+      return 'active';
+    }
     const currentStatus = task.id === this.selectedCodexTaskId ? this.selectedCodexStatus : task.status;
     const resolvedStatus = this.resolvedCodexStatus(task.id, currentStatus);
     return resolveCodexDisplayStatus(resolvedStatus, task.id === this.pendingCodexThreadId);
   }
 
   private collapsedSelectedCodexStatus(): string {
+    if (this.hasRunningCodexQueueItem(this.selectedCodexTaskId)) {
+      return 'active';
+    }
     const resolvedStatus = this.resolvedCodexStatus(
       this.selectedCodexTaskId, this.selectedCodexStatus);
     return resolveCodexDisplayStatus(
@@ -6305,6 +6894,9 @@ struct Index {
   }
 
   private isSelectedCodexRunning(): boolean {
+    if (this.hasRunningCodexQueueItem(this.selectedCodexTaskId)) {
+      return true;
+    }
     const resolvedStatus = this.resolvedCodexStatus(
       this.selectedCodexTaskId, this.selectedCodexStatus);
     if (isCodexTerminalStatus(resolvedStatus)) {
@@ -6370,7 +6962,27 @@ struct Index {
   }
 
   private formatMessageTimestamp(timestamp: number): string {
-    return timestamp > 0 ? this.formatTimestamp(timestamp) : '时间未知';
+    if (timestamp <= 0) {
+      return '时间未知';
+    }
+    const milliseconds = timestamp > 100000000000 ? timestamp : timestamp * 1000;
+    const date = new Date(milliseconds);
+    const now = new Date();
+    const year = date.getFullYear().toString();
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const day = date.getDate().toString().padStart(2, '0');
+    const hour = date.getHours().toString().padStart(2, '0');
+    const minute = date.getMinutes().toString().padStart(2, '0');
+    const second = date.getSeconds().toString().padStart(2, '0');
+    const time = `${hour}:${minute}:${second}`;
+    if (date.getFullYear() === now.getFullYear() &&
+      date.getMonth() === now.getMonth() && date.getDate() === now.getDate()) {
+      return time;
+    }
+    if (date.getFullYear() === now.getFullYear()) {
+      return `${month}-${day} ${time}`;
+    }
+    return `${year}-${month}-${day} ${time}`;
   }
 
   private visibleCodexActivities(): CodexActivity[] {
@@ -6481,8 +7093,11 @@ struct Index {
     this.selectedCodexArchived = false;
     this.selectedCodexStatus = 'notLoaded';
     this.selectedCodexActiveTurnId = '';
+    this.selectedCodexGoal = new CodexGoal();
+    this.codexGoalExpanded = false;
     this.selectedCodexMessages = [];
     this.selectedCodexActivities = [];
+    this.codexQueueItems = [];
     this.codexActivityExpanded = false;
     this.pendingCodexThreadId = '';
     this.isCodexConversationOpen = false;

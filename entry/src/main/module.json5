@@ -43,6 +43,7 @@
           "split",
           "floating"
         ],
+        "launchType": "singleton",
         "exported": true,
         "skills": [
           {

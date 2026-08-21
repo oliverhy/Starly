@@ -4,6 +4,7 @@ import pairingStore from '../service/PairingStore';
 import speechService from '../service/SpeechService';
 import remoteInputClient from '../service/RemoteInputClient';
 import taskNotificationService from '../service/TaskNotificationService';
+import notificationNavigationService from '../service/NotificationNavigationService';
 
 type AppPermission = 'ohos.permission.MICROPHONE';
 
@@ -11,12 +12,17 @@ export default class EntryAbility extends UIAbility {
   private hasEnteredForeground: boolean = false;
   private isRestoringConnection: boolean = false;
 
-  onCreate(_want: Want, _launchParam: AbilityConstant.LaunchParam): void {
+  onCreate(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (_error) {
     }
+    this.handleNotificationWant(want);
     this.requestMicrophonePermission();
+  }
+
+  onNewWant(want: Want, _launchParam: AbilityConstant.LaunchParam): void {
+    this.handleNotificationWant(want);
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
@@ -69,5 +75,14 @@ export default class EntryAbility extends UIAbility {
       await abilityAccessCtrl.createAtManager().requestPermissionsFromUser(this.context, [permission]);
     } catch (_error) {
     }
+  }
+
+  private handleNotificationWant(want: Want): void {
+    const parameters = want.parameters;
+    if (parameters === undefined) {
+      return;
+    }
+    const threadId = String(parameters['starlyThreadId'] ?? '');
+    notificationNavigationService.openCodexTask(threadId);
   }
 }

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -21,6 +22,43 @@ EventCallback = Callable[[str, JsonObject], Awaitable[None]]
 LOCAL_DETAIL_MESSAGE_LIMIT = 15
 LOCAL_ACTIVITY_LIMIT = 30
 THREAD_ID_PATTERN = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+def read_thread_goal(thread_id: str, database_path: Path | None = None) -> JsonObject:
+    """Read Codex's durable goal for a thread without mutating desktop state."""
+    if not THREAD_ID_PATTERN.fullmatch(thread_id):
+        return {}
+    if database_path is None:
+        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        database_path = codex_home / "goals_1.sqlite"
+    if not database_path.is_file():
+        return {}
+    try:
+        connection = sqlite3.connect(
+            f"{database_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.2)
+        try:
+            row = connection.execute(
+                """SELECT goal_id, objective, status, token_budget, tokens_used,
+                          time_used_seconds, created_at_ms, updated_at_ms
+                   FROM thread_goals WHERE thread_id = ?""",
+                (thread_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return {}
+    if row is None:
+        return {}
+    return {
+        "goalId": str(row[0] or ""),
+        "objective": str(row[1] or ""),
+        "status": str(row[2] or ""),
+        "tokenBudget": int(row[3]) if row[3] is not None else 0,
+        "tokensUsed": int(row[4] or 0),
+        "timeUsedSeconds": int(row[5] or 0),
+        "createdAt": int(row[6] or 0),
+        "updatedAt": int(row[7] or 0),
+    }
 
 
 def find_codex_executable() -> Path | None:
@@ -971,7 +1009,8 @@ class CodexAppServerClient:
 
     async def send_message(self, thread_id: str, text: str, model: str = "",
                            effort: str = "", permission_mode: str = "default",
-                           image_data_url: str = "", service_tier: str = "") -> JsonObject:
+                           image_data_url: str = "", service_tier: str = "",
+                           allow_steer: bool = True) -> JsonObject:
         # thread/list and thread/read can see persisted history without loading
         # it into this app-server process. turn/start only accepts a running or
         # resumed thread, so restore the selected history first.
@@ -987,11 +1026,14 @@ class CodexAppServerClient:
             if image_data_url:
                 input_items.append({"type": "image", "url": image_data_url})
             settings = self._turn_settings(model, effort, permission_mode, service_tier)
+            active_turn_id = str(detail.get("activeTurnId", ""))
+            if active_turn_id and not allow_steer:
+                raise RuntimeError(
+                    f"thread {thread_id} has an active turn; queue must wait")
             if settings:
                 await self.request("thread/settings/update", {
                     "threadId": thread_id, **settings,
                 }, timeout=30)
-            active_turn_id = str(detail.get("activeTurnId", ""))
             if active_turn_id:
                 result = await self.request("turn/steer", {
                     "threadId": thread_id,

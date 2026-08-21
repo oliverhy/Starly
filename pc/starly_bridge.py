@@ -39,12 +39,17 @@ except ImportError:  # Source checkouts can still use the slower polling fallbac
     Observer = None  # type: ignore[assignment,misc]
 
 try:
-    from pc.codex_client import CodexAppServerClient, read_rollout_thread_detail
+    from pc.codex_client import (CodexAppServerClient, read_rollout_thread_detail,
+                                 read_thread_goal)
+    from pc.codex_queue import (ACTIVE_STATES, TERMINAL_STATES, CodexQueueItem,
+                                CodexQueueStore)
     from pc.gateway_client import GatewayBridgeClient, GatewayRelayConnection
     from pc.gateway_crypto import GatewayCrypto, generate_device_identity
     from pc.secret_store import protect_secret, unprotect_secret
 except ImportError:
-    from codex_client import CodexAppServerClient, read_rollout_thread_detail
+    from codex_client import CodexAppServerClient, read_rollout_thread_detail, read_thread_goal
+    from codex_queue import (ACTIVE_STATES, TERMINAL_STATES, CodexQueueItem,
+                             CodexQueueStore)
     from gateway_client import GatewayBridgeClient, GatewayRelayConnection
     from gateway_crypto import GatewayCrypto, generate_device_identity
     from secret_store import protect_secret, unprotect_secret
@@ -558,6 +563,26 @@ def find_available_port(preferred: int = DEFAULT_PORT) -> int:
     raise RuntimeError("未找到可用的局域网监听端口")
 
 
+def is_workstation_locked() -> bool:
+    """Return whether Windows is currently showing its secure lock desktop."""
+    if os.name != "nt":
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    user32.OpenInputDesktop.restype = wintypes.HANDLE
+    user32.SwitchDesktop.argtypes = [wintypes.HANDLE]
+    user32.SwitchDesktop.restype = wintypes.BOOL
+    user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    user32.CloseDesktop.restype = wintypes.BOOL
+    desktop = user32.OpenInputDesktop(0, False, 0x0100)  # DESKTOP_SWITCHDESKTOP
+    if not desktop:
+        return True
+    try:
+        return not bool(user32.SwitchDesktop(desktop))
+    finally:
+        user32.CloseDesktop(desktop)
+
+
 class BridgeConfig:
     def __init__(self, port: int = DEFAULT_PORT, token: str = "",
                  pairing_code: str = "", gateway_url: str = "",
@@ -1065,6 +1090,11 @@ class BridgeServer:
         self.gateway_client: GatewayBridgeClient | None = None
         self.gateway_task: asyncio.Task[None] | None = None
         self.gateway_connections: dict[str, GatewayRelayConnection] = {}
+        self.codex_queue = CodexQueueStore(CONFIG_DIR / "codex_queue.json")
+        self.codex_queue_tasks: dict[str, asyncio.Task[None]] = {}
+        self.codex_queue_wake_events: dict[str, asyncio.Event] = {}
+        self.codex_queue_terminal_events: dict[str, asyncio.Event] = {}
+        self.codex_queue_terminal_results: dict[str, str] = {}
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -1088,6 +1118,7 @@ class BridgeServer:
         self.loop = asyncio.get_running_loop()
         self.stop_event = asyncio.Event()
         self.codex = CodexAppServerClient(self._handle_codex_event)
+        self._start_codex_queue_workers()
         self._start_rollout_observer()
         if self.config.gateway_enabled:
             gateway_crypto = GatewayCrypto(
@@ -1142,6 +1173,10 @@ class BridgeServer:
                 self.event_queue.put(("server", f"正在监听端口 {self.config.port}{discovery_text}"))
                 await self.stop_event.wait()
         finally:
+            for task in self.codex_queue_tasks.values():
+                task.cancel()
+            await asyncio.gather(*self.codex_queue_tasks.values(), return_exceptions=True)
+            self.codex_queue_tasks.clear()
             self._stop_rollout_observer()
             for handle in self.rollout_debounce.values():
                 handle.cancel()
@@ -1279,6 +1314,9 @@ class BridgeServer:
         elif previous_status and status != previous_status:
             phone_event = "turn/started" if status == "active" else "turn/completed"
         if phone_event:
+            if phone_event == "turn/completed":
+                self._signal_codex_queue_terminal(
+                    thread_id, "failed" if status == "systemError" else "completed")
             await self._broadcast({
                 "type": "codex_event", "event": phone_event,
                 "params": {"threadId": thread_id, "updatedAt": updated_at},
@@ -1300,6 +1338,7 @@ class BridgeServer:
                 self.gateway_client, source_device_id)
             self.gateway_connections[source_device_id] = gateway_connection
             self.connections.add(gateway_connection)
+            await self._send_codex_queue_snapshot(gateway_connection)
         await self._handle_message(
             gateway_connection,
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
@@ -1384,6 +1423,7 @@ class BridgeServer:
             "version": "2.0.0",
         })
         await self._send_codex_snapshot(connection)
+        await self._send_codex_queue_snapshot(connection)
         last_action = 0.0
         try:
             async for raw in connection:
@@ -1433,6 +1473,16 @@ class BridgeServer:
         elif message_type == "codex_snapshot_request":
             await self._send_codex_snapshot(
                 connection, bool(message.get("includeArchived", False)))
+            return
+        elif message_type == "codex_queue_snapshot_request":
+            await self._send_codex_queue_snapshot(connection, message_id)
+            return
+        elif message_type == "codex_queue_cancel":
+            queue_id = str(message.get("queueId", "")).strip()
+            if not queue_id:
+                await self._send_error(connection, "缺少排队任务编号", message_id)
+                return
+            await self._cancel_codex_queue_item(connection, queue_id, message_id)
             return
         elif message_type == "codex_thread_request":
             thread_id = str(message.get("threadId", ""))
@@ -1641,42 +1691,13 @@ class BridgeServer:
                                 permission_mode: str = "default",
                                 service_tier: str = "",
                                 delivery_mode: str = "background") -> None:
-        assert self.codex is not None
         try:
-            if delivery_mode not in ("background", "desktop"):
-                raise ValueError("未知的发送方式")
-            if delivery_mode == "background":
-                await self.codex.send_message(
-                    thread_id, text, model, effort, permission_mode,
-                    image_data_url, service_tier)
-                self.pending_desktop_open.add(thread_id)
-                await self._send_json(connection, {
-                    "type": "ack", "id": message_id,
-                    "operation": "codex_image_send", "threadId": thread_id,
-                    "message": "图片和消息已通过默认后台通道发送",
-                })
-                await self._schedule_codex_refresh()
-                return
-
-            before = await self.codex.thread_detail(thread_id)
-            thread_title = str(before.get("title", "")).strip()
-            image_bytes = self._decode_image_data(image_data_url)
-            ok, result = await asyncio.to_thread(
-                self._send_image_to_codex_desktop, thread_id, thread_title,
-                text, submit_mode, image_bytes, model, effort,
-                permission_mode, service_tier)
-            if not ok:
-                raise RuntimeError(result)
-            await self._send_json(connection, {
-                "type": "ack", "id": message_id,
-                "operation": "codex_image_send", "threadId": thread_id,
-                "message": "图片和消息已通过 Codex 桌面输入框发送",
-            })
-            await self._watch_desktop_submission(thread_id, before)
+            await self._enqueue_codex_message(
+                connection, message_id, thread_id, text, image_data_url,
+                submit_mode, model, effort, permission_mode, service_tier,
+                delivery_mode, "codex_image_send")
         except Exception as error:
-            prefix = ("桌面输入框发送失败" if delivery_mode == "desktop"
-                      else "发送图片给 Codex 失败")
-            await self._send_error(connection, f"{prefix}：{error}", message_id)
+            await self._send_error(connection, f"加入 Codex 队列失败：{error}", message_id)
 
     async def _send_codex_snapshot(self, connection: websockets.ServerConnection,
                                    include_archived: bool = False) -> None:
@@ -1715,42 +1736,363 @@ class BridgeServer:
                           permission_mode: str = "default",
                           service_tier: str = "",
                           delivery_mode: str = "background") -> None:
+        try:
+            await self._enqueue_codex_message(
+                connection, message_id, thread_id, text, "", submit_mode,
+                model, effort, permission_mode, service_tier, delivery_mode,
+                "codex_send")
+        except Exception as error:
+            await self._send_error(connection, f"加入 Codex 队列失败：{error}", message_id)
+
+    def _ensure_codex_queue_runtime(self) -> None:
+        if not hasattr(self, "codex_queue"):
+            self.codex_queue = CodexQueueStore(CONFIG_DIR / "codex_queue.json")
+        if not hasattr(self, "codex_queue_tasks"):
+            self.codex_queue_tasks = {}
+        if not hasattr(self, "codex_queue_wake_events"):
+            self.codex_queue_wake_events = {}
+        if not hasattr(self, "codex_queue_terminal_events"):
+            self.codex_queue_terminal_events = {}
+        if not hasattr(self, "codex_queue_terminal_results"):
+            self.codex_queue_terminal_results = {}
+
+    async def _enqueue_codex_message(
+        self,
+        connection: object,
+        queue_id: str,
+        thread_id: str,
+        text: str,
+        image_data: str,
+        submit_mode: str,
+        model: str,
+        effort: str,
+        permission_mode: str,
+        service_tier: str,
+        delivery_mode: str,
+        operation: str,
+    ) -> None:
+        self._ensure_codex_queue_runtime()
+        if not queue_id:
+            raise ValueError("缺少消息编号，无法安全去重")
+        if delivery_mode not in ("background", "desktop"):
+            raise ValueError("未知的发送方式")
+        item, created = self.codex_queue.enqueue(CodexQueueItem(
+            queue_id=queue_id,
+            thread_id=thread_id,
+            text=text,
+            image_data=image_data,
+            submit_mode=submit_mode,
+            model=model,
+            effort=effort,
+            permission_mode=permission_mode,
+            service_tier=service_tier,
+            delivery_mode=delivery_mode,
+        ))
+        public_item = self.codex_queue.public_item(item)
+        try:
+            await self._send_json(connection, {
+                "type": "ack",
+                "id": queue_id,
+                "operation": operation,
+                "threadId": thread_id,
+                "queueId": queue_id,
+                "duplicate": not created,
+                "queueItem": public_item,
+                "message": "任务已加入执行队列" if created else "已恢复原排队任务",
+            })
+            if created:
+                await self._broadcast_codex_queue_thread("enqueued", item)
+        finally:
+            # Delivery acknowledgement and execution are independent. A phone
+            # can disconnect just after enqueueing without stranding the item.
+            if item.state not in TERMINAL_STATES:
+                self._start_codex_queue_worker(thread_id)
+
+    async def _send_codex_queue_snapshot(
+        self, connection: object, message_id: str = "",
+    ) -> None:
+        self._ensure_codex_queue_runtime()
+        await self._send_json(connection, {
+            "type": "codex_queue_snapshot",
+            "id": message_id,
+            "items": self.codex_queue.snapshot(),
+        })
+
+    async def _cancel_codex_queue_item(
+        self, connection: object, queue_id: str, message_id: str,
+    ) -> None:
+        self._ensure_codex_queue_runtime()
+        item, canceled = self.codex_queue.cancel(queue_id)
+        if item is None:
+            await self._send_error(connection, "排队任务不存在", message_id)
+            return
+        if not canceled:
+            message = ("任务正在执行，请使用停止任务功能" if item.state == "running"
+                       else "任务已结束，不能再次取消")
+            await self._send_error(connection, message, message_id)
+            return
+        await self._send_json(connection, {
+            "type": "ack", "id": message_id,
+            "operation": "codex_queue_cancel", "queueId": queue_id,
+            "threadId": item.thread_id, "queueItem": self.codex_queue.public_item(item),
+            "message": "排队任务已取消",
+        })
+        await self._broadcast_codex_queue_thread("canceled", item)
+        self._wake_codex_queue_worker(item.thread_id)
+
+    def _start_codex_queue_workers(self) -> None:
+        self._ensure_codex_queue_runtime()
+        for thread_id in self.codex_queue.threads_with_pending():
+            self._start_codex_queue_worker(thread_id)
+
+    def _start_codex_queue_worker(self, thread_id: str) -> None:
+        self._ensure_codex_queue_runtime()
+        current = self.codex_queue_tasks.get(thread_id)
+        if current is not None and not current.done():
+            self._wake_codex_queue_worker(thread_id)
+            return
+        self.codex_queue_tasks[thread_id] = asyncio.create_task(
+            self._codex_queue_worker(thread_id))
+
+    def _wake_codex_queue_worker(self, thread_id: str) -> None:
+        self._ensure_codex_queue_runtime()
+        self.codex_queue_wake_events.setdefault(thread_id, asyncio.Event()).set()
+
+    async def _wait_codex_queue_worker(self, thread_id: str, timeout: float = 1.5) -> None:
+        event = self.codex_queue_wake_events.setdefault(thread_id, asyncio.Event())
+        event.clear()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _codex_queue_worker(self, thread_id: str) -> None:
+        try:
+            while True:
+                item = self.codex_queue.next_for_thread(thread_id)
+                if item is None:
+                    return
+                if item.state == "running":
+                    await self._recover_running_codex_queue_item(item)
+                    continue
+                if item.state == "waiting_unlock":
+                    await self._wait_codex_queue_worker(thread_id, 2.0)
+                    if item.state != "waiting_unlock":
+                        continue
+                    if await asyncio.to_thread(is_workstation_locked):
+                        continue
+                    await self._transition_codex_queue_item(item, "queued", "", "queued")
+
+                try:
+                    assert self.codex is not None
+                    before = await self.codex.thread_detail(thread_id)
+                except Exception:
+                    await self._wait_codex_queue_worker(thread_id)
+                    continue
+                if not self._codex_thread_is_idle(before):
+                    await self._wait_codex_queue_worker(thread_id)
+                    continue
+                await self._execute_codex_queue_item(item, before)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            current = self.codex_queue_tasks.get(thread_id)
+            if current is asyncio.current_task():
+                self.codex_queue_tasks.pop(thread_id, None)
+
+    async def _execute_codex_queue_item(
+        self, item: CodexQueueItem, before: dict[str, object],
+    ) -> None:
+        assert self.codex is not None
+        terminal_event = self.codex_queue_terminal_events.setdefault(
+            item.thread_id, asyncio.Event())
+        terminal_event.clear()
+        self.codex_queue_terminal_results.pop(item.thread_id, None)
+        used_desktop = item.delivery_mode == "desktop"
+        if used_desktop and await asyncio.to_thread(is_workstation_locked):
+            await self._transition_codex_queue_item(
+                item, "waiting_unlock", "电脑已锁屏，等待解锁", "waiting_unlock")
+            return
+        try:
+            if used_desktop:
+                sent, result = await self._send_codex_queue_item_to_desktop(item, before)
+                if not sent:
+                    await self._transition_codex_queue_item(
+                        item, "waiting_unlock", result, "waiting_unlock")
+                    return
+            else:
+                try:
+                    await self.codex.send_message(
+                        item.thread_id, item.text, item.model, item.effort,
+                        item.permission_mode, item.image_data, item.service_tier,
+                        allow_steer=False)
+                except Exception as error:
+                    if self._is_queue_active_conflict(error):
+                        await self._wait_codex_queue_worker(item.thread_id)
+                        return
+                    if not self._is_active_writer_conflict(error):
+                        raise
+                    if await asyncio.to_thread(is_workstation_locked):
+                        await self._transition_codex_queue_item(
+                            item, "waiting_unlock", "电脑已锁屏，等待解锁",
+                            "waiting_unlock")
+                        return
+                    sent, result = await self._send_codex_queue_item_to_desktop(item, before)
+                    if not sent:
+                        await self._transition_codex_queue_item(
+                            item, "waiting_unlock", result, "waiting_unlock")
+                        return
+                    used_desktop = True
+            await self._transition_codex_queue_item(item, "running", "", "running")
+            if used_desktop:
+                await self._watch_desktop_submission(item.thread_id, before)
+            else:
+                await self._schedule_codex_refresh()
+            result = await self._await_codex_queue_terminal(item, before)
+            await self._transition_codex_queue_item(
+                item, result, "Codex 执行失败" if result == "failed" else "", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self._transition_codex_queue_item(item, "failed", str(error), "failed")
+
+    async def _send_codex_queue_item_to_desktop(
+        self, item: CodexQueueItem, before: dict[str, object],
+    ) -> tuple[bool, str]:
+        thread_title = str(before.get("title", "")).strip()
+        if item.image_data:
+            image_bytes = self._decode_image_data(item.image_data)
+            return await asyncio.to_thread(
+                self._send_image_to_codex_desktop, item.thread_id, thread_title,
+                item.text, item.submit_mode, image_bytes, item.model, item.effort,
+                item.permission_mode, item.service_tier)
+        return await asyncio.to_thread(
+            self._send_to_codex_desktop, item.thread_id, thread_title, item.text,
+            item.submit_mode, item.model, item.effort, item.permission_mode,
+            item.service_tier)
+
+    async def _recover_running_codex_queue_item(self, item: CodexQueueItem) -> None:
         assert self.codex is not None
         try:
-            if delivery_mode not in ("background", "desktop"):
-                raise ValueError("未知的发送方式")
-            if delivery_mode == "background":
-                await self.codex.send_message(
-                    thread_id, text, model, effort, permission_mode, "", service_tier)
-                self.pending_desktop_open.add(thread_id)
-                await self._send_json(connection, {
-                    "type": "ack", "id": message_id,
-                    "operation": "codex_send", "threadId": thread_id,
-                    "message": "消息已通过默认后台通道发送",
-                })
-                await self._schedule_codex_refresh()
-                return
+            detail = await self.codex.thread_detail(item.thread_id)
+        except Exception:
+            await self._wait_codex_queue_worker(item.thread_id)
+            return
+        if str(detail.get("status", "")) == "systemError":
+            await self._transition_codex_queue_item(
+                item, "failed", "Codex 执行失败", "failed")
+            return
+        if self._codex_thread_is_idle(detail):
+            if self._detail_contains_queue_submission(detail, item):
+                await self._transition_codex_queue_item(
+                    item, "completed", "", "completed")
+            else:
+                await self._transition_codex_queue_item(item, "queued", "", "queued")
+            return
+        result = await self._await_codex_queue_terminal(item, detail)
+        await self._transition_codex_queue_item(
+            item, result, "Codex 执行失败" if result == "failed" else "", result)
 
-            before = await self.codex.thread_detail(thread_id)
-            thread_title = str(before.get("title", "")).strip()
-            ok, result = await asyncio.to_thread(
-                self._send_to_codex_desktop, thread_id, thread_title, text,
-                submit_mode, model, effort, permission_mode, service_tier)
-            if not ok:
-                raise RuntimeError(result)
-            await self._send_json(connection, {
-                "type": "ack", "id": message_id,
-                "operation": "codex_send", "threadId": thread_id,
-                "message": "消息已通过 Codex 桌面输入框发送",
+    async def _await_codex_queue_terminal(
+        self, item: CodexQueueItem, before: dict[str, object],
+    ) -> str:
+        assert self.codex is not None
+        event = self.codex_queue_terminal_events.setdefault(item.thread_id, asyncio.Event())
+        baseline = self._latest_message_signature(before)
+        saw_active = not self._codex_thread_is_idle(before)
+        while item.state == "running":
+            try:
+                await asyncio.wait_for(event.wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                pass
+            if event.is_set():
+                event.clear()
+                result = self.codex_queue_terminal_results.pop(item.thread_id, "completed")
+                return "failed" if result == "failed" else "completed"
+            try:
+                detail = await self.codex.thread_detail(item.thread_id)
+            except Exception:
+                continue
+            status = str(detail.get("status", "idle"))
+            if status == "systemError":
+                return "failed"
+            if not self._codex_thread_is_idle(detail):
+                saw_active = True
+                continue
+            changed = self._latest_message_signature(detail) != baseline
+            if saw_active or changed:
+                return "completed"
+        return "canceled" if item.state == "canceled" else "failed"
+
+    async def _transition_codex_queue_item(
+        self, item: CodexQueueItem, state: str, error: str, event: str,
+    ) -> None:
+        self.codex_queue.transition(item.queue_id, state, error)
+        await self._broadcast_codex_queue_thread(event, item)
+        self._wake_codex_queue_worker(item.thread_id)
+
+    async def _broadcast_codex_queue_thread(
+        self, event: str, primary: CodexQueueItem,
+    ) -> None:
+        thread_items = [item for item in self.codex_queue.items
+                        if item.thread_id == primary.thread_id and
+                        (item is primary or item.state not in TERMINAL_STATES)]
+        for item in thread_items:
+            await self._broadcast({
+                "type": "codex_queue_event",
+                "event": event if item is primary else "position_changed",
+                "item": self.codex_queue.public_item(item),
             })
-            await self._watch_desktop_submission(thread_id, before)
-        except Exception as error:
-            error_text = str(error)
-            if "thread not found" in error_text.lower():
-                error_text = "任务暂时无法恢复，请刷新任务列表后重新选择"
-            prefix = ("桌面输入框发送失败" if delivery_mode == "desktop"
-                      else "发送给 Codex 失败")
-            await self._send_error(connection, f"{prefix}：{error_text}", message_id)
+
+    def _signal_codex_queue_terminal(self, thread_id: str, result: str) -> None:
+        if not thread_id:
+            return
+        self._ensure_codex_queue_runtime()
+        # thread/resume may emit an idle status immediately before turn/start.
+        # Treating that stale event as terminal would complete a newly queued
+        # item before its turn has actually begun. Polling still reconciles a
+        # very fast turn that finishes before we enter the running state.
+        active_item = self.codex_queue.next_for_thread(thread_id)
+        if active_item is None or active_item.state != "running":
+            return
+        self.codex_queue_terminal_results[thread_id] = result
+        self.codex_queue_terminal_events.setdefault(thread_id, asyncio.Event()).set()
+        self._wake_codex_queue_worker(thread_id)
+
+    @staticmethod
+    def _codex_thread_is_idle(detail: dict[str, object]) -> bool:
+        return (str(detail.get("status", "idle")) not in ("active", "running") and
+                not str(detail.get("activeTurnId", "")))
+
+    @staticmethod
+    def _detail_contains_queue_submission(
+        detail: dict[str, object], item: CodexQueueItem,
+    ) -> bool:
+        messages = detail.get("messages")
+        if not isinstance(messages, list):
+            return False
+        for message in reversed(messages):
+            if not isinstance(message, dict) or str(message.get("role", "")) != "user":
+                continue
+            timestamp = int(message.get("timestamp", 0) or 0)
+            if item.started_at and timestamp and timestamp + 2 < item.started_at:
+                continue
+            text_matches = not item.text or str(message.get("text", "")).strip() == item.text.strip()
+            images = message.get("images")
+            image_matches = not item.has_image or (isinstance(images, list) and bool(images))
+            if text_matches and image_matches:
+                return True
+        return False
+
+    @staticmethod
+    def _is_queue_active_conflict(error: Exception) -> bool:
+        value = str(error).lower()
+        return "queue must wait" in value or "active turn" in value
+
+    @staticmethod
+    def _is_active_writer_conflict(error: Exception) -> bool:
+        error_text = str(error).lower()
+        return "active writer" in error_text or "已有活动写入" in error_text
 
     async def _watch_desktop_submission(self, thread_id: str,
                                         before: dict[str, object]) -> None:
@@ -1883,6 +2225,8 @@ class BridgeServer:
                 terminal_event = self._terminal_poll_event(
                     status, saw_active_turn or saw_new_message)
                 if not active_turn_id and terminal_event:
+                    self._signal_codex_queue_terminal(
+                        thread_id, "failed" if terminal_event == "turn/failed" else "completed")
                     await self._broadcast({
                         "type": "codex_event", "event": terminal_event,
                         "params": {"threadId": thread_id},
@@ -1980,6 +2324,7 @@ class BridgeServer:
         """Trim only the phone payload; keep the full detail for bridge logic."""
         messages = detail.get("messages")
         payload = dict(detail)
+        payload["goal"] = read_thread_goal(str(payload.get("id", "")))
         payload.setdefault("updateMode", "latest")
         payload.setdefault("hasMoreBefore", False)
         if isinstance(messages, list) and len(messages) > MAX_PHONE_DETAIL_MESSAGES:
@@ -2020,6 +2365,15 @@ class BridgeServer:
                 turn_status = str(turn.get("status", "")) if isinstance(turn, dict) else ""
                 if turn_status == "failed":
                     phone_event = "turn/failed"
+                self._signal_codex_queue_terminal(
+                    str(params.get("threadId", "")),
+                    "failed" if turn_status == "failed" else "completed")
+            elif method == "thread/status/changed":
+                status = str(params.get("status", ""))
+                if status.lower() in ("idle", "notloaded", "systemerror"):
+                    self._signal_codex_queue_terminal(
+                        str(params.get("threadId", "")),
+                        "failed" if status.lower() == "systemerror" else "completed")
             await self._broadcast({"type": "codex_event", "event": phone_event, "params": params})
             if method == "turn/completed":
                 thread_id = str(params.get("threadId", ""))
@@ -2069,16 +2423,17 @@ class BridgeServer:
             })
 
     async def _broadcast(self, message: dict[str, object]) -> None:
-        if not self.connections:
+        connections = getattr(self, "connections", set())
+        if not connections:
             return
         raw = json.dumps(message, ensure_ascii=False)
         async def send_one(connection: websockets.ServerConnection) -> None:
             try:
                 self._log_wire("电脑→手机", connection, message)
                 await asyncio.wait_for(connection.send(raw), timeout=2)
-            except (websockets.ConnectionClosed, asyncio.TimeoutError):
+            except (websockets.ConnectionClosed, asyncio.TimeoutError, OSError):
                 self.connections.discard(connection)
-        await asyncio.gather(*(send_one(connection) for connection in list(self.connections)))
+        await asyncio.gather(*(send_one(connection) for connection in list(connections)))
 
     async def _send_json(self, connection: websockets.ServerConnection,
                          message: dict[str, object]) -> None:
@@ -2112,7 +2467,8 @@ class BridgeServer:
     def _safe_log_value(cls, value: object, key: str = "") -> object:
         key_lower = key.lower()
         if key_lower in ("token", "authorization", "pairingtoken",
-                          "devicecredential", "secret", "sessiontoken"):
+                          "devicecredential", "secret", "sessiontoken",
+                          "text", "imagedata", "objective"):
             return "[已隐藏]"
         if isinstance(value, dict):
             return {str(item_key): cls._safe_log_value(item_value, str(item_key))

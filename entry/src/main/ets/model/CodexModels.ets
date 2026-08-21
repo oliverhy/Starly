@@ -57,6 +57,30 @@ export class CodexActivity {
   turnId: string = '';
 }
 
+export class CodexQueueItem {
+  queueId: string = '';
+  threadId: string = '';
+  text: string = '';
+  hasImage: boolean = false;
+  state: string = 'queued';
+  position: number = 0;
+  enqueuedAt: number = 0;
+  startedAt: number = 0;
+  completedAt: number = 0;
+  error: string = '';
+}
+
+export class CodexGoal {
+  goalId: string = '';
+  objective: string = '';
+  status: string = '';
+  tokenBudget: number = 0;
+  tokensUsed: number = 0;
+  timeUsedSeconds: number = 0;
+  createdAt: number = 0;
+  updatedAt: number = 0;
+}
+
 export class CodexSnapshot {
   available: boolean = false;
   error: string = '';
@@ -75,6 +99,7 @@ export class CodexThreadDetail extends CodexTask {
   effort: string = '';
   permissionMode: string = '';
   serviceTier: string = '';
+  goal: CodexGoal = new CodexGoal();
 }
 
 export function isCodexTerminalStatus(status: string): boolean {
@@ -116,6 +141,28 @@ export function parseCodexTask(value: Object): CodexTask {
   task.updatedAt = numeric(source['updatedAt']);
   task.archived = Boolean(source['archived'] ?? false);
   return task;
+}
+
+export function parseCodexQueueItem(value: Object): CodexQueueItem {
+  const source = recordValue(value);
+  const item = new CodexQueueItem();
+  item.queueId = String(source['queueId'] ?? '');
+  item.threadId = String(source['threadId'] ?? '');
+  item.text = String(source['text'] ?? '');
+  item.hasImage = Boolean(source['hasImage'] ?? false);
+  item.state = String(source['state'] ?? 'queued');
+  item.position = numeric(source['position']);
+  item.enqueuedAt = numeric(source['enqueuedAt']);
+  item.startedAt = numeric(source['startedAt']);
+  item.completedAt = numeric(source['completedAt']);
+  item.error = String(source['error'] ?? '');
+  return item;
+}
+
+export function parseCodexQueueItems(value: Object | undefined): CodexQueueItem[] {
+  const rawItems = (value ?? []) as Object[];
+  return rawItems.map((item: Object): CodexQueueItem => parseCodexQueueItem(item))
+    .filter((item: CodexQueueItem): boolean => item.queueId.length > 0);
 }
 
 export function parseCodexSnapshot(message: Record<string, Object>): CodexSnapshot {
@@ -182,6 +229,15 @@ export function parseCodexThread(value: Object): CodexThreadDetail {
   detail.effort = String(source['effort'] ?? '');
   detail.permissionMode = String(source['permissionMode'] ?? '');
   detail.serviceTier = String(source['serviceTier'] ?? '');
+  const goalSource = recordValue(source['goal']);
+  detail.goal.goalId = String(goalSource['goalId'] ?? '');
+  detail.goal.objective = String(goalSource['objective'] ?? '');
+  detail.goal.status = String(goalSource['status'] ?? '');
+  detail.goal.tokenBudget = numeric(goalSource['tokenBudget']);
+  detail.goal.tokensUsed = numeric(goalSource['tokensUsed']);
+  detail.goal.timeUsedSeconds = numeric(goalSource['timeUsedSeconds']);
+  detail.goal.createdAt = numeric(goalSource['createdAt']);
+  detail.goal.updatedAt = numeric(goalSource['updatedAt']);
   const rawMessages = (source['messages'] ?? []) as Object[];
   detail.messages = rawMessages.map((item: Object, index: number): CodexMessage => {
     const raw = recordValue(item);

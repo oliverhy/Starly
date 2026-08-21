@@ -1,6 +1,14 @@
 import { webSocket } from '@kit.NetworkKit';
 import { PairingConfig } from '../model/PairingConfig';
-import { CodexSnapshot, CodexThreadDetail, parseCodexSnapshot, parseCodexThread } from '../model/CodexModels';
+import {
+  CodexQueueItem,
+  CodexSnapshot,
+  CodexThreadDetail,
+  parseCodexQueueItem,
+  parseCodexQueueItems,
+  parseCodexSnapshot,
+  parseCodexThread
+} from '../model/CodexModels';
 import gatewayCryptoService from './GatewayCryptoService';
 
 class CodexWireMessage {
@@ -26,6 +34,7 @@ class CodexWireMessage {
   permissionMode: string = 'default';
   serviceTier: string = '';
   deliveryMode: string = 'background';
+  queueId: string = '';
 }
 
 class GatewayAuthMessage {
@@ -75,6 +84,8 @@ export interface RemoteClientListener {
   onCodexSnapshot(snapshot: CodexSnapshot): void;
   onCodexThread(detail: CodexThreadDetail): void;
   onCodexEvent(event: string, threadId: string): void;
+  onCodexQueueSnapshot(items: CodexQueueItem[]): void;
+  onCodexQueueEvent(item: CodexQueueItem): void;
   onCodexApproval(approval: CodexApprovalRequest): void;
   onCodexCreated(threadId: string): void;
   onGatewaySequence(lastReceivedSeq: number): void;
@@ -124,7 +135,9 @@ class RemoteInputClient {
 
   createRequestId(): string {
     this.messageSequence = (this.messageSequence + 1) % 1000000;
-    return `${Date.now()}-${this.messageSequence}`;
+    const deviceId = this.currentConfig?.deviceId.trim() ?? '';
+    const source = deviceId.length > 0 ? deviceId : 'phone';
+    return `${source}-${Date.now()}-${this.messageSequence}`;
   }
 
   async connect(config: PairingConfig): Promise<boolean> {
@@ -320,6 +333,26 @@ class RemoteInputClient {
     return true;
   }
 
+  async requestCodexQueueSnapshot(): Promise<boolean> {
+    const message = new CodexWireMessage();
+    message.type = 'codex_queue_snapshot_request';
+    message.id = this.createRequestId();
+    return await this.enqueueCodexRequest(message);
+  }
+
+  async cancelCodexQueueItem(queueId: string): Promise<boolean> {
+    const normalizedQueueId = queueId.trim();
+    if (normalizedQueueId.length === 0) {
+      this.listener?.onError('缺少排队任务编号');
+      return false;
+    }
+    const message = new CodexWireMessage();
+    message.type = 'codex_queue_cancel';
+    message.id = this.createRequestId();
+    message.queueId = normalizedQueueId;
+    return await this.enqueueCodexRequest(message);
+  }
+
   async setCodexArchived(threadId: string, archived: boolean): Promise<boolean> {
     const message = new CodexWireMessage();
     message.type = 'codex_archive';
@@ -475,6 +508,12 @@ class RemoteInputClient {
     this.resetCodexSnapshotRequest();
     config.targetDeviceId = deviceId;
     this.listener?.onGatewayDevices([...this.gatewayDevices], deviceId);
+    const selected = this.gatewayDevices.find(
+      (device: GatewayPeerDevice): boolean => device.deviceId === deviceId);
+    if (selected?.online ?? false) {
+      this.requestCodexSnapshot().catch((): boolean => false);
+      this.requestCodexQueueSnapshot().catch((): boolean => false);
+    }
   }
 
   async renameGatewayDevice(deviceId: string, displayName: string): Promise<boolean> {
@@ -574,6 +613,7 @@ class RemoteInputClient {
         // and repair stale task states without waiting for the UI timer.
         if (peerOnline && config !== null && config.targetDeviceId.length > 0) {
           this.requestCodexSnapshot().catch((): boolean => false);
+          this.requestCodexQueueSnapshot().catch((): boolean => false);
         }
         return;
       }
@@ -654,6 +694,7 @@ class RemoteInputClient {
             // The Bridge may have restarted while the phone stayed connected.
             // Recreate its relay connection and reconcile task terminal states.
             this.requestCodexSnapshot().catch((): boolean => false);
+            this.requestCodexQueueSnapshot().catch((): boolean => false);
           }
         }
         return;
@@ -682,6 +723,12 @@ class RemoteInputClient {
         if (messageId.length > 0) {
           this.pendingRequestOperations.delete(messageId);
         }
+        // Queue support is additive. An older Bridge can reject this automatic
+        // capability probe; ignore that response without disturbing the
+        // existing task synchronization path.
+        if (operation === 'codex_queue_snapshot_request') {
+          return;
+        }
         this.listener?.onError(
           String(message['message'] ?? '电脑执行失败'), messageId, operation);
       } else if (type === 'hello') {
@@ -692,6 +739,7 @@ class RemoteInputClient {
         this.clearTransportReadyTimer();
         this.clearLanProbe();
         this.reconnectAttempt = 0;
+        this.requestCodexQueueSnapshot().catch((): boolean => false);
         this.listener?.onConnectionChanged(true,
           `局域网直连 · ${String(message['computer'] ?? '电脑已连接')}`);
       } else if (type === 'codex_snapshot') {
@@ -710,6 +758,17 @@ class RemoteInputClient {
         const params = (message['params'] ?? {}) as Record<string, Object>;
         this.listener?.onCodexEvent(
           String(message['event'] ?? ''), String(params['threadId'] ?? ''));
+      } else if (type === 'codex_queue_snapshot') {
+        const messageId = String(message['id'] ?? '');
+        if (messageId.length > 0) {
+          this.pendingRequestOperations.delete(messageId);
+        }
+        this.listener?.onCodexQueueSnapshot(parseCodexQueueItems(message['items']));
+      } else if (type === 'codex_queue_event') {
+        const item = parseCodexQueueItem(message['item'] ?? new CodexQueueItem());
+        if (item.queueId.length > 0) {
+          this.listener?.onCodexQueueEvent(item);
+        }
       } else if (type === 'codex_approval') {
         const source = (message['approval'] ?? {}) as Record<string, Object>;
         const approval = new CodexApprovalRequest();
@@ -788,7 +847,8 @@ class RemoteInputClient {
     const operation = String(request['type'] ?? '');
     const trackedOperations = ['input', 'enter', 'codex_send', 'codex_image_send',
       'codex_create', 'codex_interrupt', 'codex_approval_decision',
-      'codex_archive', 'codex_rename'];
+      'codex_archive', 'codex_rename', 'codex_queue_snapshot_request',
+      'codex_queue_cancel'];
     if (requestId.length > 0 && trackedOperations.includes(operation)) {
       this.pendingRequestOperations.set(requestId, operation);
     }

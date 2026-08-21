@@ -5,6 +5,7 @@ import io
 import json
 import os
 import queue
+import sqlite3
 import tempfile
 import unittest
 import urllib.parse
@@ -24,7 +25,9 @@ from pc.starly_bridge import (BridgeApp, BridgeConfig, BridgeServer, CODEX_COMPO
                               format_paired_devices, normalize_approval,
                               normalize_gateway_url)
 from pc.codex_client import (CodexAppServerClient, _item_content, normalize_snapshot,
-                             normalize_thread, read_rollout_thread_detail)
+                             normalize_thread, read_rollout_thread_detail,
+                             read_thread_goal)
+from pc.codex_queue import CodexQueueItem, CodexQueueStore
 
 
 class FakeConnection:
@@ -36,6 +39,50 @@ class FakeConnection:
 
 
 class BridgeProtocolTests(unittest.TestCase):
+    @staticmethod
+    async def _append_async(target: list[dict[str, object]],
+                            message: dict[str, object]) -> None:
+        target.append(message)
+
+    @staticmethod
+    async def _noop_async() -> None:
+        return None
+
+    def test_read_thread_goal_returns_structured_read_only_goal(self) -> None:
+        thread_id = "019fda4e-1111-7222-8333-123456789abc"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "goals_1.sqlite"
+            connection = sqlite3.connect(database_path)
+            connection.execute(
+                """CREATE TABLE thread_goals (
+                    thread_id TEXT PRIMARY KEY, goal_id TEXT, objective TEXT,
+                    status TEXT, token_budget INTEGER, tokens_used INTEGER,
+                    time_used_seconds INTEGER, created_at_ms INTEGER,
+                    updated_at_ms INTEGER)""")
+            connection.execute(
+                "INSERT INTO thread_goals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (thread_id, "goal-1", "完成手机目标同步", "usage_limited",
+                 900000, 12345, 33960, 1000, 2000))
+            connection.commit()
+            connection.close()
+
+            goal = read_thread_goal(thread_id, database_path)
+
+        self.assertEqual(goal["goalId"], "goal-1")
+        self.assertEqual(goal["objective"], "完成手机目标同步")
+        self.assertEqual(goal["status"], "usage_limited")
+        self.assertEqual(goal["timeUsedSeconds"], 33960)
+
+    def test_phone_thread_detail_includes_goal_without_logging_objective(self) -> None:
+        goal = {"goalId": "goal-1", "objective": "敏感目标正文", "status": "active"}
+        with mock.patch("pc.starly_bridge.read_thread_goal", return_value=goal):
+            payload = BridgeServer._phone_thread_detail({
+                "id": "019fda4e-1111-7222-8333-123456789abc", "messages": []})
+
+        self.assertEqual(payload["goal"], goal)
+        safe = BridgeServer._safe_log_value(payload)
+        self.assertEqual(safe["goal"]["objective"], "[已隐藏]")
+
     def test_open_log_location_opens_bridge_config_directory(self) -> None:
         app = BridgeApp.__new__(BridgeApp)
         app.root = object()
@@ -290,122 +337,77 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertIn("Open model picker", CODEX_COMPOSER_SETTINGS_SCRIPT)
 
     def test_codex_send_uses_background_mode_without_desktop_automation(self) -> None:
-        server = BridgeServer.__new__(BridgeServer)
-        sent: list[tuple[str, str]] = []
-        responses: list[dict[str, object]] = []
-        refreshes = 0
+        with tempfile.TemporaryDirectory() as directory:
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(
+                Path(directory) / "queue.json", lambda value: value, lambda value: value)
+            server.connections = set()
+            sent: list[tuple[str, str, bool]] = []
+            responses: list[dict[str, object]] = []
 
-        class FakeCodex:
-            async def thread_detail(self, _thread_id: str) -> dict[str, object]:
-                return {"title": "指定任务"}
+            class FakeCodex:
+                async def thread_detail(self, _thread_id: str) -> dict[str, object]:
+                    return {"title": "指定任务", "status": "idle", "messages": []}
 
-            async def send_message(self, thread_id: str, text: str,
-                                   *_args: object) -> dict[str, object]:
-                sent.append((thread_id, text))
-                return {}
+                async def send_message(self, thread_id: str, text: str, *_args: object,
+                                       allow_steer: bool = True) -> dict[str, object]:
+                    sent.append((thread_id, text, allow_steer))
+                    asyncio.get_running_loop().call_soon(
+                        server._signal_codex_queue_terminal, thread_id, "completed")
+                    return {}
 
-        async def fake_send_json(_connection: object, message: dict[str, object]) -> None:
-            responses.append(message)
+            async def scenario() -> None:
+                server.codex = FakeCodex()
+                server._send_json = lambda _connection, message: self._append_async(
+                    responses, message)
+                server._schedule_codex_refresh = lambda: self._noop_async()
+                await server._codex_send(
+                    object(), "thread-1", "继续处理", "enter", "message-1")
+                await asyncio.gather(*list(server.codex_queue_tasks.values()))
 
-        async def fake_refresh() -> None:
-            nonlocal refreshes
-            refreshes += 1
+            asyncio.run(scenario())
 
-        server.codex = FakeCodex()
-        server.pending_desktop_open = set()
-        server._send_to_codex_desktop = mock.Mock(side_effect=AssertionError(
-            "background mode must not touch desktop UI"))
-        server._send_json = fake_send_json
-        server._schedule_codex_refresh = fake_refresh
-
-        asyncio.run(server._codex_send(
-            object(), "thread-1", "继续处理", "enter", "message-1"))
-
-        self.assertEqual(sent, [("thread-1", "继续处理")])
-        self.assertIn("thread-1", server.pending_desktop_open)
-        self.assertEqual(responses[0]["type"], "ack")
-        self.assertEqual(responses[0]["id"], "message-1")
-        self.assertEqual(responses[0]["operation"], "codex_send")
-        self.assertEqual(responses[0]["threadId"], "thread-1")
-        self.assertIn("默认后台通道", str(responses[0]["message"]))
-        self.assertEqual(refreshes, 1)
+            self.assertEqual(sent, [("thread-1", "继续处理", False)])
+            self.assertEqual(responses[0]["type"], "ack")
+            self.assertEqual(responses[0]["queueId"], "message-1")
+            self.assertEqual(server.codex_queue.get("message-1").state, "completed")
 
     def test_codex_desktop_mode_failure_never_falls_back(self) -> None:
-        server = BridgeServer.__new__(BridgeServer)
-        sent: list[tuple[str, str]] = []
-        responses: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(
+                Path(directory) / "queue.json", lambda value: value, lambda value: value)
+            server.connections = set()
+            responses: list[dict[str, object]] = []
+            server._send_json = lambda _connection, message: self._append_async(
+                responses, message)
 
-        class FakeCodex:
-            async def thread_detail(self, _thread_id: str) -> dict[str, object]:
-                return {"title": "指定任务"}
+            asyncio.run(server._codex_send(
+                object(), "thread-1", "继续处理", "enter", "message-1",
+                delivery_mode="desktop"))
 
-            async def send_message(self, thread_id: str, text: str,
-                                   *_args: object) -> dict[str, object]:
-                sent.append((thread_id, text))
-                return {}
-
-        async def fake_send_json(_connection: object, message: dict[str, object]) -> None:
-            responses.append(message)
-
-        async def fake_send_error(_connection: object, message: str,
-                                  message_id: str = "") -> None:
-            responses.append({"type": "error", "id": message_id, "message": message})
-
-        server.codex = FakeCodex()
-        server._send_to_codex_desktop = lambda *_args: (False, "composer unavailable")
-        server._send_json = fake_send_json
-        server._send_error = fake_send_error
-
-        asyncio.run(server._codex_send(
-            object(), "thread-1", "继续处理", "enter", "message-1",
-            delivery_mode="desktop"))
-
-        self.assertEqual(sent, [])
-        self.assertEqual(responses[0]["type"], "error")
-        self.assertIn("桌面输入框发送失败", str(responses[0]["message"]))
+            self.assertEqual(responses[0]["type"], "ack")
+            self.assertEqual(server.codex_queue.get("message-1").state, "queued")
 
     def test_codex_image_desktop_mode_pastes_image_with_selected_settings(self) -> None:
-        server = BridgeServer.__new__(BridgeServer)
-        responses: list[dict[str, object]] = []
-        desktop_calls: list[tuple[object, ...]] = []
-        watched: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(
+                Path(directory) / "queue.json", lambda value: value, lambda value: value)
+            server.connections = set()
+            responses: list[dict[str, object]] = []
+            image_data = "data:image/jpeg;base64," + base64.b64encode(b"image").decode("ascii")
+            server._send_json = lambda _connection, message: self._append_async(
+                responses, message)
 
-        class FakeCodex:
-            async def thread_detail(self, _thread_id: str) -> dict[str, object]:
-                return {"title": "图片任务"}
+            asyncio.run(server._codex_image_send(
+                object(), "thread-2", "观察图片", "enter", image_data, "message-2",
+                "gpt-5.6-sol", "high", "fullAccess", "fast", "desktop"))
 
-            async def send_message(self, *_args: object) -> dict[str, object]:
-                raise AssertionError("desktop image mode must not use the background server")
-
-        async def fake_send_json(_connection: object, message: dict[str, object]) -> None:
-            responses.append(message)
-
-        async def fake_watch(thread_id: str, _before: dict[str, object]) -> None:
-            watched.append(thread_id)
-
-        def fake_desktop(*args: object) -> tuple[bool, str]:
-            desktop_calls.append(args)
-            return True, "submitted"
-
-        server.codex = FakeCodex()
-        server._send_image_to_codex_desktop = fake_desktop
-        server._send_json = fake_send_json
-        server._watch_desktop_submission = fake_watch
-        image_data = "data:image/jpeg;base64," + base64.b64encode(b"image").decode("ascii")
-
-        asyncio.run(server._codex_image_send(
-            object(), "thread-2", "观察图片", "enter", image_data, "message-2",
-            "gpt-5.6-sol", "high", "fullAccess", "fast", "desktop"))
-
-        self.assertEqual(desktop_calls[0][0:5],
-                         ("thread-2", "图片任务", "观察图片", "enter", b"image"))
-        self.assertEqual(desktop_calls[0][5:],
-                         ("gpt-5.6-sol", "high", "fullAccess", "fast"))
-        self.assertEqual(watched, ["thread-2"])
-        self.assertEqual(responses[0]["type"], "ack")
-        self.assertEqual(responses[0]["id"], "message-2")
-        self.assertEqual(responses[0]["operation"], "codex_image_send")
-        self.assertEqual(responses[0]["threadId"], "thread-2")
+            item = server.codex_queue.get("message-2")
+            self.assertTrue(item.has_image)
+            self.assertEqual(item.model, "gpt-5.6-sol")
+            self.assertEqual(responses[0]["operation"], "codex_image_send")
 
     def test_protocol_rejects_non_object_json(self) -> None:
         server = BridgeServer.__new__(BridgeServer)
@@ -542,6 +544,27 @@ class BridgeProtocolTests(unittest.TestCase):
         asyncio.run(client.send_message("thread-1", "继续处理"))
 
         self.assertEqual(calls, ["thread/resume", "turn/start"])
+
+    def test_queue_send_refuses_to_steer_an_active_turn(self) -> None:
+        client = CodexAppServerClient()
+        calls: list[str] = []
+
+        async def fake_request(method: str, _params: dict[str, object] | None = None,
+                               timeout: float = 15) -> dict[str, object]:
+            _ = timeout
+            calls.append(method)
+            if method == "thread/resume":
+                return {"thread": {"id": "thread-1", "turns": [
+                    {"id": "turn-active", "status": "inProgress", "items": []},
+                ]}}
+            return {}
+
+        client.request = fake_request
+        with self.assertRaisesRegex(RuntimeError, "queue must wait"):
+            asyncio.run(client.send_message(
+                "thread-1", "第二条", allow_steer=False))
+
+        self.assertEqual(calls, ["thread/resume"])
 
     def test_codex_message_applies_remote_model_effort_and_read_only_mode(self) -> None:
         client = CodexAppServerClient()
@@ -1377,6 +1400,227 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(writes, [{"id": 7, "result": {"decision": "accept"}}])
         with self.assertRaisesRegex(RuntimeError, "已失效"):
             asyncio.run(client.resolve_approval("approval-7", "accept"))
+
+    def test_background_send_falls_back_when_desktop_owns_thread_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(
+                Path(directory) / "queue.json", lambda value: value, lambda value: value)
+            server.connections = set()
+            sent: list[dict[str, object]] = []
+            server._send_json = lambda _connection, message: self._append_async(sent, message)
+
+            async def scenario() -> None:
+                await server._codex_send(
+                    object(), "thread-1", "你好", "enter", "message-1")
+                await server._codex_send(
+                    object(), "thread-1", "你好", "enter", "message-1")
+
+            asyncio.run(scenario())
+
+            self.assertEqual(len(server.codex_queue.items), 1)
+            self.assertFalse(bool(sent[0]["duplicate"]))
+            self.assertTrue(bool(sent[1]["duplicate"]))
+
+    def test_background_image_send_falls_back_on_active_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            protect = lambda value: base64.b64encode(value.encode("utf-8")).decode("ascii")
+            unprotect = lambda value: base64.b64decode(value).decode("utf-8")
+            store = CodexQueueStore(
+                Path(directory) / "queue.json", protect, unprotect)
+            image = "data:image/png;base64," + base64.b64encode(b"image").decode("ascii")
+            store.enqueue(CodexQueueItem(
+                queue_id="message-2", thread_id="thread-2", text="秘密图片任务",
+                image_data=image))
+            raw = store.path.read_text(encoding="utf-8")
+            loaded = CodexQueueStore(
+                store.path, protect, unprotect)
+
+            self.assertNotIn("秘密图片任务", raw)
+            self.assertNotIn(image, raw)
+            self.assertEqual(loaded.get("message-2").text, "秘密图片任务")
+            self.assertTrue(loaded.get("message-2").has_image)
+
+    def test_queue_runs_same_thread_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(
+                Path(directory) / "queue.json", lambda value: value, lambda value: value)
+            server.connections = set()
+            sent: list[str] = []
+
+            class FakeCodex:
+                async def thread_detail(self, _thread_id: str) -> dict[str, object]:
+                    return {"status": "idle", "messages": []}
+
+                async def send_message(self, thread_id: str, text: str, *_args: object,
+                                       allow_steer: bool = True) -> dict[str, object]:
+                    self_outer.assertFalse(allow_steer)
+                    sent.append(text)
+                    asyncio.get_running_loop().call_soon(
+                        server._signal_codex_queue_terminal, thread_id, "completed")
+                    return {}
+
+            self_outer = self
+
+            async def scenario() -> None:
+                server.codex = FakeCodex()
+                server._send_json = lambda _connection, _message: self._noop_async()
+                server._schedule_codex_refresh = self._noop_async
+                await server._codex_send(
+                    object(), "thread-1", "第一条", "enter", "queue-1")
+                await server._codex_send(
+                    object(), "thread-1", "第二条", "enter", "queue-2")
+                await asyncio.gather(*list(server.codex_queue_tasks.values()))
+
+            asyncio.run(scenario())
+
+            self.assertEqual(sent, ["第一条", "第二条"])
+            self.assertEqual([item.state for item in server.codex_queue.items],
+                             ["completed", "completed"])
+
+    def test_queue_runs_different_threads_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(
+                Path(directory) / "queue.json", lambda value: value, lambda value: value)
+            server.connections = set()
+            started: list[str] = []
+            both_started = asyncio.Event()
+
+            class FakeCodex:
+                async def thread_detail(self, _thread_id: str) -> dict[str, object]:
+                    return {"status": "idle", "messages": []}
+
+                async def send_message(self, thread_id: str, _text: str, *_args: object,
+                                       **_kwargs: object) -> dict[str, object]:
+                    started.append(thread_id)
+                    if len(started) == 2:
+                        both_started.set()
+                    await asyncio.wait_for(both_started.wait(), timeout=1)
+                    asyncio.get_running_loop().call_soon(
+                        server._signal_codex_queue_terminal, thread_id, "completed")
+                    return {}
+
+            async def scenario() -> None:
+                server.codex = FakeCodex()
+                server._send_json = lambda _connection, _message: self._noop_async()
+                server._schedule_codex_refresh = self._noop_async
+                await server._codex_send(object(), "thread-a", "A", "enter", "queue-a")
+                await server._codex_send(object(), "thread-b", "B", "enter", "queue-b")
+                await asyncio.gather(*list(server.codex_queue_tasks.values()))
+
+            asyncio.run(scenario())
+
+            self.assertCountEqual(started, ["thread-a", "thread-b"])
+
+    def test_active_thread_stays_queued_and_never_calls_steer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(
+                Path(directory) / "queue.json", lambda value: value, lambda value: value)
+            server.connections = set()
+            sends = 0
+
+            class FakeCodex:
+                async def thread_detail(self, _thread_id: str) -> dict[str, object]:
+                    return {"status": "active", "activeTurnId": "turn-1", "messages": []}
+
+                async def send_message(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                    nonlocal sends
+                    sends += 1
+                    return {}
+
+            async def scenario() -> None:
+                server.codex = FakeCodex()
+                server._send_json = lambda _connection, _message: self._noop_async()
+                await server._codex_send(
+                    object(), "thread-1", "排队内容", "enter", "queue-active")
+                await asyncio.sleep(0.05)
+                for task in server.codex_queue_tasks.values():
+                    task.cancel()
+                await asyncio.gather(*server.codex_queue_tasks.values(), return_exceptions=True)
+
+            asyncio.run(scenario())
+
+            self.assertEqual(sends, 0)
+            self.assertEqual(server.codex_queue.get("queue-active").state, "queued")
+
+    def test_restart_preserves_running_item_without_resending(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            store = CodexQueueStore(path, lambda value: value, lambda value: value)
+            store.enqueue(CodexQueueItem(
+                queue_id="queue-running", thread_id="thread-1", text="只执行一次"))
+            store.transition("queue-running", "running")
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(path, lambda value: value, lambda value: value)
+            server.connections = set()
+            sends = 0
+
+            class FakeCodex:
+                async def thread_detail(self, _thread_id: str) -> dict[str, object]:
+                    return {"status": "active", "activeTurnId": "turn-1", "messages": []}
+
+                async def send_message(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                    nonlocal sends
+                    sends += 1
+                    return {}
+
+            async def scenario() -> None:
+                server.codex = FakeCodex()
+                server._start_codex_queue_workers()
+                await asyncio.sleep(0)
+                server._signal_codex_queue_terminal("thread-1", "completed")
+                await asyncio.gather(*list(server.codex_queue_tasks.values()))
+
+            asyncio.run(scenario())
+
+            self.assertEqual(sends, 0)
+            self.assertEqual(server.codex_queue.get("queue-running").state, "completed")
+
+    def test_queued_item_ignores_stale_idle_terminal_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(
+                Path(directory) / "queue.json", lambda value: value, lambda value: value)
+            item, _created = server.codex_queue.enqueue(CodexQueueItem(
+                queue_id="queue-stale", thread_id="thread-1", text="第二条"))
+
+            server._signal_codex_queue_terminal("thread-1", "completed")
+
+            self.assertNotIn("thread-1", server.codex_queue_terminal_results)
+            self.assertNotIn("thread-1", server.codex_queue_terminal_events)
+            server.codex_queue.transition(item.queue_id, "running")
+            server._signal_codex_queue_terminal("thread-1", "completed")
+            self.assertEqual(server.codex_queue_terminal_results["thread-1"], "completed")
+            self.assertTrue(server.codex_queue_terminal_events["thread-1"].is_set())
+
+    def test_queue_snapshot_and_cancel_protocol(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = BridgeServer.__new__(BridgeServer)
+            server.codex_queue = CodexQueueStore(
+                Path(directory) / "queue.json", lambda value: value, lambda value: value)
+            server.codex_queue.enqueue(CodexQueueItem(
+                queue_id="queue-1", thread_id="thread-1", text="稍后执行"))
+            server.connections = set()
+            server.event_queue = queue.Queue()
+            connection = FakeConnection()
+
+            async def scenario() -> None:
+                await server._handle_message(connection, json.dumps({
+                    "type": "codex_queue_cancel", "id": "cancel-1", "queueId": "queue-1",
+                }))
+                await server._handle_message(connection, json.dumps({
+                    "type": "codex_queue_snapshot_request", "id": "snapshot-1",
+                }))
+
+            asyncio.run(scenario())
+            messages = [json.loads(value) for value in connection.messages]
+
+            self.assertEqual(messages[0]["operation"], "codex_queue_cancel")
+            self.assertEqual(messages[1]["type"], "codex_queue_snapshot")
+            self.assertEqual(messages[1]["items"][0]["state"], "canceled")
 
 
 if __name__ == "__main__":
