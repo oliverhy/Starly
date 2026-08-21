@@ -12,6 +12,8 @@ Starly 是一套自建的 HarmonyOS → Windows 远程输入与 Codex Remote 方
 
 > 仓库只包含源码和无敏感信息的示例配置，不包含 HAP、EXE、证书、签名口令、设备密钥、配对凭证、服务器数据库或本机 SDK 路径。
 
+当前最新测试版本为 [v2.1.0](https://github.com/oliverhy/Starly/releases/tag/v2.1.0)，可直接下载 [HarmonyOS HAP](https://github.com/oliverhy/Starly/releases/download/v2.1.0/Starly.hap)、[Windows Bridge](https://github.com/oliverhy/Starly/releases/download/v2.1.0/StarlyBridge.exe) 和 [使用说明](https://github.com/oliverhy/Starly/releases/download/v2.1.0/Starly-README.md)。该版本用于真机调试，不代表 AppGallery 正式发布版本。
+
 ## 主要功能
 
 ### HarmonyOS 客户端
@@ -21,6 +23,8 @@ Starly 是一套自建的 HarmonyOS → Windows 远程输入与 Codex Remote 方
 - 文字和图片发送，发送成功回执到达后再清空输入框。
 - Remote 首页显示电脑在线状态、项目、最近任务、执行状态和相对更新时间。
 - 查看 Codex 对话、任务活动、模型、推理强度、速度、权限和账户额度。
+- 任务发送队列：同一任务按顺序执行，不同任务可并行；显示排队位置、运行状态、失败原因并支持取消排队。
+- 显示 Codex 目标条：同步目标正文、目标状态和累计耗时，点击可展开完整目标内容。
 - 查看 Codex 工具读取的图片和生成图片；PC 会先生成适合公网传输的缩略图。
 - 新建任务、继续任务、停止任务、搜索、置顶、未读、重命名、归档和恢复。
 - 将 Codex 命令、文件修改和权限审批转发到手机，高风险操作要求二次确认。
@@ -39,6 +43,7 @@ Starly 是一套自建的 HarmonyOS → Windows 远程输入与 Codex Remote 方
   - 桌面输入框模式：定位 Codex 桌面端的真实输入框，可选择 Enter 或 Ctrl+Enter。
 - 监听 Codex 本地任务事件，主动推送开始、回复、审批和完成状态；完整快照仅用于校准。
 - Windows DPAPI 保护局域网密钥、公网凭证、会话令牌和设备私钥。
+- 持久化 Codex 发送队列，Bridge 重启后恢复排队状态，避免同一请求重复执行。
 - PC 运行日志可在界面中直接打开所在目录。
 
 ### Starly Gateway
@@ -258,4 +263,4 @@ HarmonyOS 客户端可以在 DevEco Studio 中构建，并使用 `hdc install -r
 
 ## 当前状态
 
-手机端、PC Bridge 和 Gateway 源码均位于本仓库。项目已完成局域网和公网真机联调，目前仍处于开发测试阶段，暂未发布正式 Release 或 AppGallery 版本。
+手机端、PC Bridge 和 Gateway 源码均位于本仓库。项目已完成局域网和公网真机联调，并发布了用于测试的 v2.1.0 Release；当前仍处于开发测试阶段，尚未发布 AppGallery 正式版本。
